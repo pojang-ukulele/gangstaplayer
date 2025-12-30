@@ -14,9 +14,8 @@ jobs:
         include:
           - os: windows-latest
             platform: windows
-          - os: macos-15-intel   # This is the Intel x64 runner — gives pure x64 DMG
-            platform: mac
-            arch: x64
+          - os: macos-15-intel      # This forces pure x64 Intel Mac build
+            platform: mac-x64
 
     steps:
     - name: Checkout code
