@@ -27,7 +27,7 @@
     "win": {
       "target": "nsis",
       "icon": "icon.png",
-      "artifactName": "${productName} Setup ${version} (30-12-2025 15-28).${ext}"
+      "artifactName": "${productName} Setup ${version}.${ext}"
     },
     "mac": {
       "target": [
@@ -37,7 +37,7 @@
         }
       ],
       "icon": "icon.png",
-      "artifactName": "${productName} Mac Installer ${version} (30-12-2025).${ext}"
+      "artifactName": "${productName} Mac Installer ${version}.${ext}"
     },
     "nsis": {
       "oneClick": false,
