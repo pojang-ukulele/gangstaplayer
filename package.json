@@ -30,7 +30,12 @@
       "artifactName": "${productName} Setup ${version} (30-12-2025 15-28).${ext}"
     },
     "mac": {
-      "target": "dmg",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": ["universal"]
+        }
+      ],
       "icon": "icon.png",
       "artifactName": "${productName} Mac Installer ${version} (30-12-2025).${ext}"
     },
