@@ -771,6 +771,13 @@ input[type=range].progress-slider:hover::-webkit-slider-thumb {
     border-top: 1px solid #111;
 }
 
+.btn.loop-active {
+    color: var(--neon-purple);
+    box-shadow: 0 0 10px var(--neon-purple), inset 0 0 5px var(--neon-purple);
+    text-shadow: 0 0 5px var(--neon-purple);
+    border-color: var(--neon-purple);
+}
+
 /* Master Rec Button */
 /* Master Rec Button */
 .master-rec-btn {

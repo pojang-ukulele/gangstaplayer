@@ -248,6 +248,7 @@ function startPad(index) {
     }
     const source = audioCtx.createBufferSource();
     source.buffer = padBuffers[index];
+    source.loop = true;
     const gainNode = audioCtx.createGain();
     gainNode.gain.setValueAtTime(padVolumes[index], audioCtx.currentTime);
 
@@ -512,6 +513,7 @@ let isDraggingProgress = false;
 // NEW: BPM Global Vars
 let masterBPM = 0;
 let padBPMs = {};
+let isPlaylistLooping = false;
 let padSyncState = {};
 function toggleSync(index, btn) {
     padSyncState[index] = !padSyncState[index];
@@ -1197,6 +1199,14 @@ document.getElementById('prevBtn').addEventListener('click', () => {
     }
 });
 playerAudio.addEventListener('ended', async () => {
+    // 1. CHECK LOOP FIRST (Highest Priority)
+    if (isPlaylistLooping) {
+        console.log('[Player] Looping Track...');
+        playerAudio.currentTime = 0;
+        playerAudio.play().catch(e => console.error("Loop Play Error:", e));
+        return;
+    }
+
     // Check if AUTO MIX is enabled
     if (typeof isAutoMixEnabled !== 'undefined' && isAutoMixEnabled && playlist.length > 1) {
         console.log('[AutoMix] Track ended, transitioning with mix...');
@@ -1211,6 +1221,19 @@ playerAudio.addEventListener('ended', async () => {
         playTrack();
     }
 });
+
+// Loop Button Logic
+const loopBtn = document.getElementById('loopBtn');
+if (loopBtn) {
+    loopBtn.addEventListener('click', () => {
+        isPlaylistLooping = !isPlaylistLooping;
+        if (isPlaylistLooping) {
+            loopBtn.classList.add('loop-active');
+        } else {
+            loopBtn.classList.remove('loop-active');
+        }
+    });
+}
 // NEW: Master Volume & Visual Knob Logic (75% Scale)
 function updateVolKnob() {
     const volInput = document.getElementById('masterVol');
@@ -1240,6 +1263,13 @@ document.getElementById('masterVol').addEventListener('input', (e) => {
 window.addEventListener('resize', updateVolKnob);
 // Initial call after a short delay to ensure layout is done
 setTimeout(updateVolKnob, 100);
+
+// Startup Optimization: Wait for Fonts
+document.fonts.ready.then(() => {
+    console.log('[Startup] Fonts loaded, showing window.');
+    // Small extra buffer for repaint
+    setTimeout(() => bridge.appReadyToShow(), 100);
+});
 tempoSlider.addEventListener('input', (e) => {
     // NEW: Magnetic Snap
     let val = parseFloat(e.target.value);

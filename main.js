@@ -36,7 +36,13 @@ function createWindow() {
       // For now, let's keep it simple.
     },
     autoHideMenuBar: true,
-    icon: 'icon.png'
+    icon: 'icon.png',
+    show: false // Wait for ready-to-show
+  })
+
+  // Avoid "wacky" FOUC by waiting for explicit signal from renderer (fonts loaded)
+  ipcMain.on('app:ready-to-show', () => {
+    win.show()
   })
 
   win.loadFile('index.html')
