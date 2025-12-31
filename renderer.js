@@ -203,21 +203,24 @@ for (let i = 0; i < 16; i++) {
 // Kept for Drag & Drop support
 async function loadSampleFile(file, index, padElement) {
     try {
-        // Use exposed API instead of webUtils directly
         const filePath = bridge.getPathForFile(file);
-        // Reuse load logic via path if possible to unify, but file object is already here
-        // We can just proceed as before for D&D
         const arrayBuffer = await file.arrayBuffer();
         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
         padBuffers[index] = audioBuffer;
         padPaths[index] = filePath;
         padElement.classList.add('loaded');
-        // Detect BPM
+        // Detect BPM and show buttons
         padBPMs[index] = detectBPM(audioBuffer);
-        if (padBPMs[index] > 0) padElement.querySelector('.sync-btn').style.display = 'block';
-        else padElement.querySelector('.sync-btn').style.display = 'block'; // Force show for now
+        padElement.querySelector('.sync-btn').style.display = 'block';
         padElement.querySelector('.load-btn').style.display = 'block'; 
-    } catch (err) { console.error(err); }
+    } catch (err) { 
+        console.error('Failed to load sample:', err);
+        // Still try to show buttons if we got an error partway through
+        try {
+            padElement.querySelector('.sync-btn').style.display = 'block';
+            padElement.querySelector('.load-btn').style.display = 'block';
+        } catch (e) { /* ignore */ }
+    }
 }
 
 async function loadSampleFromPath(path, index) {
@@ -232,7 +235,11 @@ async function loadSampleFromPath(path, index) {
         padGrid.children[index].querySelector('.pad').classList.add('loaded');
         // Detect BPM
         padBPMs[index] = detectBPM(audioBuffer);
-        if (padBPMs[index] > 0) padGrid.children[index].querySelector('.sync-btn').style.display = 'block';
+        // Show buttons (matching loadSampleFile behavior)
+        const padElement = padGrid.children[index].querySelector('.pad');
+        if (padBPMs[index] > 0) padElement.querySelector('.sync-btn').style.display = 'block';
+        else padElement.querySelector('.sync-btn').style.display = 'block'; // Force show for now
+        padElement.querySelector('.load-btn').style.display = 'block';
     } catch (e) { console.log(e); }
 }
 
@@ -589,6 +596,7 @@ let draggedElement = null;
 let isDragging = false;
 let dragStartY = 0;
 let dragThreshold = 8; // Pixels moved before drag starts
+let originalDragIndex = -1; // Track original position for drag operations
 
 function renderPlaylist() {
     playlistEl.innerHTML = '';
@@ -896,74 +904,9 @@ playlistEl.addEventListener('drop', (e) => {
     if (playlist.length > 0 && !playerAudio.src) loadTrack(0);
 });
 
-// Pad drop zones - defer setup until pads exist
-function setupPadDropZones() {
-    const pads = document.querySelectorAll('.pad');
-    
-    pads.forEach((pad, index) => {
-        pad.addEventListener('dragover', (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            if (e.dataTransfer.types.includes('Files')) {
-                pad.classList.add('drop-target');
-                e.dataTransfer.dropEffect = 'copy';
-            }
-        });
-        
-        pad.addEventListener('dragleave', (e) => {
-            e.preventDefault();
-            pad.classList.remove('drop-target');
-        });
-        
-        pad.addEventListener('drop', (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            pad.classList.remove('drop-target');
-            
-            const files = Array.from(e.dataTransfer.files).filter(isValidAudioFile);
-            if (files.length === 0) return;
-            
-            // Load the first valid audio file into this pad
-            const file = files[0];
-            console.log('[Pad', index, '] Dropped:', file.name);
-            
-            // Create URL and load into pad
-            const url = URL.createObjectURL(file);
-            loadPadAudio(index, url, file.name);
-        });
-    });
-}
+// NOTE: Pad drop zones are already set up in the pad creation loop (lines 175-181)
+// DO NOT add duplicate handlers here - they would conflict and destroy buttons
 
-// Helper to load audio onto a pad
-async function loadPadAudio(index, url, name) {
-    try {
-        const res = await fetch(url);
-        const arrayBuffer = await res.arrayBuffer();
-        const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-        
-        padBuffers[index] = audioBuffer;
-        
-        // Update pad visuals
-        const pad = document.querySelectorAll('.pad')[index];
-        if (pad) {
-            // Clean filename for display (max 6 chars + ...)
-            const shortName = name.length > 6 ? name.substring(0, 6) + '…' : name.split('.')[0];
-            pad.innerText = shortName.toUpperCase();
-            pad.classList.add('loaded');
-        }
-        
-        // Detect BPM if possible
-        const bpm = detectBPM(audioBuffer);
-        if (bpm > 0) padBPMs[index] = bpm;
-        
-        console.log('[Pad', index, '] Loaded:', name, bpm > 0 ? `(${Math.round(bpm)} BPM)` : '');
-    } catch (err) {
-        console.error('[Pad', index, '] Load failed:', err);
-    }
-}
-
-// Setup drop zones after DOM is ready
-setTimeout(setupPadDropZones, 100);
 
 // Click on empty playlist area to deselect
 playlistEl.addEventListener('click', (e) => {
