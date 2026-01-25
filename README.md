@@ -1,14 +1,8 @@
-# UG GANGSTA PLAYER PRO 3 [CRACKED EDITION]
-
-**Cracked by:** OG RAJIZ  
-**Status:** FULLY WORKING  
-**Version:** 3.0.0
-
----
+# GANGSTA PLAYER PRO
 
 ## 💀 ABOUT DA SOFTWARE
 
-This is the ultimate **ghetto-tech sampler and tape deck** for the streets. **UG Gangsta Player Pro 3** turns your PC into a beat-making, chopper-screwing powerhouse. Whether you're laying down tracks or just slowing down the classics, this tool has the grit you need.
+This is the ultimate **ghetto-tech sampler and tape deck** for the streets. **Gangsta Player Pro 3** turns your PC into a beat-making, chopper-screwing powerhouse. Whether you're laying down tracks or just slowing down the classics, this tool has the grit you need. It also works flawlessly as a basic music audio player for your daily listening.
 
 ---
 
@@ -17,10 +11,11 @@ This is the ultimate **ghetto-tech sampler and tape deck** for the streets. **UG
 ### 🎹 16-PAD SAMPLER
 
 - **Drag & Drop:** Drop any audio file onto a pad to load it.
+- **Right-Click Menu:** Right-click any pad to load samples or enable sync.
 - **Keyboard Mapped:** Play pads with your keyboard (1-4, Q-R, A-F, Z-V).
 - **MIDI Support:** Plug in your MIDI controller and start finger drumming instantly.
 - **Pad Recording:** Hold `CTRL + Pad Key` or click the small [REC] button to record directly from your mic.
-- **Sync Mode:** Auto-match pad BPM to the master tempo (if BPM is detected).
+- **Sync Mode:** Right-click a loaded pad and select SYNC to match its tempo to the master track.
 
 ### 📼 TAPE DECK PLAYER
 
@@ -102,10 +97,10 @@ This is the ultimate **ghetto-tech sampler and tape deck** for the streets. **UG
 
 ### Using the Sampler Pads
 
-1. **Load a Sample:** Click an empty pad or drag & drop an audio file onto it.
-2. **Play:** Press the corresponding key (`1-4`, `Q-R`, `A-F`, `Z-V`) or click the pad.
+1. **Load a Sample:** Right-click any pad and select "LOAD SAMPLE", or drag & drop an audio file onto it.
+2. **Play:** Press the corresponding key (`1-4`, `Q-R`, `A-F`, `Z-V`) or click/hold the pad.
 3. **Record:** Hold `CTRL` + pad key or click the [REC] button on a pad to record from your mic.
-4. **Sync:** Click the SYNC button on a pad to match its tempo to the master track.
+4. **Sync:** Right-click a loaded pad and select "SYNC" to match its tempo to the master track. A checkmark (✓) indicates SYNC is active.
 
 ### Auto-Mix Mode
 
@@ -146,8 +141,20 @@ You need **Node.js** installed to run this source code.
 
 ---
 
-## ⚠️ DISCLAIMER
+## 📜 LICENSE & CREDITS
 
-This software is for educational and entertainment purposes only. OG RAJIZ is not responsible if your speakers blow out from too much bass.
+**Gangsta Player Pro 3** is proprietary software.
 
-**STAY LOW AND KEEP THE LOW PROFILE BROHAS.**
+### Third-Party Software
+
+This software uses components from **Sonetra AI** (Sonetra-AI-Mixer), which is licensed under the **MIT License**.
+
+> Copyright (c) Sonetra AI Contributors
+>
+> Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+>
+> The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+>
+> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+---

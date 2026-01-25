@@ -1,10 +1,10 @@
 {
-  "name": "ug-gangsta-player-pro-3",
-  "productName": "UG Gangsta Player Pro 3",
+  "name": "gangsta-player-pro-3",
+  "productName": "Gangsta Player Pro 3",
   "version": "3.0.0",
-  "description": "Cracked by OG RAJIZ",
+  "description": "Gangsta Player Pro 3 - The Ultimate Sampler",
   "main": "main.js",
-  "author": "OG RAJIZ",
+  "author": "Gangsta Player Pro 3",
   "license": "ISC",
   "scripts": {
     "start": "electron .",
@@ -16,11 +16,12 @@
   },
   "devDependencies": {
     "electron": "^30.0.0",
-    "electron-builder": "^26.0.12"
+    "electron-builder": "^26.0.12",
+    "esbuild": "^0.27.2"
   },
   "build": {
-    "appId": "com.ograjiz.uggangstaplayerpro3",
-    "productName": "UG Gangsta Player Pro 3",
+    "appId": "com.gangsta.playerpro3",
+    "productName": "Gangsta Player Pro 3",
     "directories": {
       "output": "dist"
     },
@@ -33,7 +34,9 @@
       "target": [
         {
           "target": "dmg",
-          "arch": ["universal"]
+          "arch": [
+            "universal"
+          ]
         }
       ],
       "icon": "icon.png",
@@ -44,7 +47,7 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "UG Gangsta Player Pro 3"
+      "shortcutName": "Gangsta Player Pro 3"
     },
     "files": [
       "**/*",
@@ -61,15 +64,6 @@
       "!**/.git/**",
       "!**/*.zip",
       "!**/*.7z"
-    ],
-    "extraResources": [
-      {
-        "from": "soundpacks",
-        "to": "soundpacks",
-        "filter": [
-          "**/*"
-        ]
-      }
     ]
   }
 }

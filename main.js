@@ -132,19 +132,8 @@ function createWindow() {
 
   // NEW: Soundpack Helper
   ipcMain.handle('dialog:open-sample', async () => {
-    // Determine soundpacks path (bundled vs dev)
-    let resourcesPath = process.resourcesPath;
-    if (!app.isPackaged) {
-      resourcesPath = __dirname; // In dev, soundpacks is in root
-    }
-    
-    // In built app: resources/soundpacks
-    // In dev: ./soundpacks
-    const soundpacksPath = path.join(resourcesPath, 'soundpacks');
-
     const { canceled, filePaths } = await dialog.showOpenDialog(win, {
       title: 'Load Audio Sample',
-      defaultPath: fs.existsSync(soundpacksPath) ? soundpacksPath : undefined,
       properties: ['openFile'],
       filters: [{ name: 'Audio Files', extensions: ['wav', 'mp3', 'ogg', 'flac'] }]
     })

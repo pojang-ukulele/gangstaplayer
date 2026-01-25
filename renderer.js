@@ -1,35 +1,77 @@
-// --- SECURE IMPORTS VIA BRIDGE ---
+// === CONSTANTS ===
+const KEYBOARD_MAP = ['1', '2', '3', '4', 'q', 'w', 'e', 'r', 'a', 's', 'd', 'f', 'z', 'x', 'c', 'v'];
+const MIDI_NOTE_TO_PAD = { 36: 0, 37: 1, 38: 2, 39: 3, 40: 4, 41: 5, 42: 6, 43: 7, 44: 8, 45: 9, 46: 10, 47: 11, 48: 12, 49: 13, 50: 14, 51: 15 };
+const BPM_DETECTION_THRESHOLD = 0.6;
+const BPM_MIN_STEP_SECONDS = 0.25;
+const DRAG_THRESHOLD_PX = 5;
+const DEFAULT_PAD_VOLUME = 0.75;
+const DEFAULT_TRACK_FADE_SECONDS = 10;
+const DEFAULT_BUTTON_FADE_SECONDS = 4;
+const VISUALIZER_FFT_SIZE = 256;
+const VISUALIZER_BARS = 16;
+const SLIDER_DEBOUNCE_MS = 16; // ~60fps for smooth visual updates
+
+// === UTILITY FUNCTIONS ===
+/**
+ * Debounce function - delays execution until after wait ms have elapsed since last call
+ * @param {Function} fn - Function to debounce
+ * @param {number} wait - Milliseconds to wait
+ * @returns {Function} Debounced function
+ */
+function debounce(fn, wait) {
+    let timeout;
+    return function(...args) {
+        clearTimeout(timeout);
+        timeout = setTimeout(() => fn.apply(this, args), wait);
+    };
+}
+
+/**
+ * Throttle function - ensures function is called at most once per wait ms
+ * @param {Function} fn - Function to throttle
+ * @param {number} wait - Minimum ms between calls
+ * @returns {Function} Throttled function
+ */
+function throttle(fn, wait) {
+    let lastTime = 0;
+    return function(...args) {
+        const now = Date.now();
+        if (now - lastTime >= wait) {
+            lastTime = now;
+            fn.apply(this, args);
+        }
+    };
+}
+// === SECURE IMPORTS VIA BRIDGE ===
 const bridge = window.electronAPI;
 const fsBridge = window.fileSystem;
 // WebMIDI is loaded via script tag globally
 
-// Window controls
+// === WINDOW CONTROLS ===
 document.getElementById('minBtn').addEventListener('click', () => bridge.minimize());
 document.getElementById('maxBtn').addEventListener('click', () => bridge.maximize());
 document.getElementById('closeBtn').addEventListener('click', () => bridge.close());
 
-// Audio Context
+// === AUDIO CONTEXT ===
 const AudioContext = window.AudioContext || window.webkitAudioContext;
 const audioCtx = new AudioContext();
 const masterGain = audioCtx.createGain();
 const analyser = audioCtx.createAnalyser();
-analyser.fftSize = 256;
+analyser.fftSize = VISUALIZER_FFT_SIZE;
 masterGain.connect(analyser);
 analyser.connect(audioCtx.destination);
 
-// State
+// === STATE ===
 const padBuffers = {};
 const padPaths = {};
 const activeVoices = {};
-const padVolumes = new Array(16).fill(0.75);
-const keyMap = ['1', '2', '3', '4', 'q', 'w', 'e', 'r', 'a', 's', 'd', 'f', 'z', 'x', 'c', 'v'];
+const padVolumes = new Array(16).fill(DEFAULT_PAD_VOLUME);
+const keyMap = KEYBOARD_MAP; // Alias for backwards compatibility
 const padGrid = document.getElementById('padGrid');
 
-
-
-// ==================== MIDI SUPPORT ====================
+// === MIDI SUPPORT ===
 const midiStatusEl = document.getElementById('midiStatus');
-const midiNoteToPad = { 36: 0, 37: 1, 38: 2, 39: 3, 40: 4, 41: 5, 42: 6, 43: 7, 44: 8, 45: 9, 46: 10, 47: 11, 48: 12, 49: 13, 50: 14, 51: 15 };
+const midiNoteToPad = MIDI_NOTE_TO_PAD; // Alias for backwards compatibility
 
 function enableMIDI() {
     if (!navigator.requestMIDIAccess) {
@@ -135,21 +177,13 @@ for (let i = 0; i < 16; i++) {
     pad.className = 'pad';
     pad.dataset.key = keyMap[i];
     pad.innerHTML = `<span>${keyMap[i].toUpperCase()}</span>`;
+    
+    // ARIA attributes for accessibility
+    pad.setAttribute('role', 'button');
+    pad.setAttribute('aria-label', `Sampler Pad ${i + 1} (Key: ${keyMap[i].toUpperCase()})`);
+    pad.setAttribute('aria-pressed', 'false');
+    pad.setAttribute('tabindex', '0');
 
-    // NEW: Sync Button
-    const syncBtn = document.createElement('div');
-    syncBtn.className = 'sync-btn';
-    syncBtn.innerText = 'SYNC';
-    syncBtn.style.display = 'none';
-    syncBtn.onclick = (e) => { e.stopPropagation(); toggleSync(i, syncBtn); };
-    pad.appendChild(syncBtn);
-
-    // NEW: Load Button
-    const loadBtn = document.createElement('div');
-    loadBtn.className = 'load-btn';
-    loadBtn.innerText = 'LOAD';
-    loadBtn.style.display = 'none'; // Hidden by default
-    pad.appendChild(loadBtn);
 
     // NEW: Rec Button
     const recBtn = document.createElement('div');
@@ -163,14 +197,35 @@ for (let i = 0; i < 16; i++) {
     recBtn.onclick = (e) => e.stopPropagation(); // Stop click from bubbling to pad (which opens Load Dialog)
     pad.appendChild(recBtn);
 
-    // REMOVED: Hidden Input logic in favor of Native Dialog
-    
-    // Wire up Load Button
-    loadBtn.onclick = async (e) => { 
-        e.stopPropagation(); 
-        const filePath = await bridge.openSampleDialog();
-        if (filePath) loadSampleFromPath(filePath, i);
-    };
+    // Right-click context menu for pads
+    pad.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const menu = document.getElementById('padContextMenu');
+        const syncItem = document.getElementById('ctxSync');
+        const syncDivider = document.getElementById('padCtxDivider');
+        
+        // Show SYNC option only if sample is loaded
+        if (padBuffers[i]) {
+            syncItem.classList.remove('hidden');
+            syncDivider.classList.remove('hidden');
+            // Update visual state
+            if (padSyncState[i]) {
+                syncItem.classList.add('sync-active');
+            } else {
+                syncItem.classList.remove('sync-active');
+            }
+        } else {
+            syncItem.classList.add('hidden');
+            syncDivider.classList.add('hidden');
+        }
+        
+        menu.classList.remove('hidden');
+        menu.setAttribute('aria-hidden', 'false');
+        menu.style.left = e.pageX + 'px';
+        menu.style.top = e.pageY + 'px';
+        menu.dataset.padIndex = i;
+    });
 
     pad.addEventListener('dragover', (e) => { e.preventDefault(); pad.style.borderColor = '#fff'; });
     pad.addEventListener('dragleave', (e) => { e.preventDefault(); pad.style.borderColor = 'rgba(255,255,255,0.1)'; });
@@ -203,24 +258,18 @@ for (let i = 0; i < 16; i++) {
 // Kept for Drag & Drop support
 async function loadSampleFile(file, index, padElement) {
     try {
+        // Use exposed API instead of webUtils directly
         const filePath = bridge.getPathForFile(file);
+        // Reuse load logic via path if possible to unify, but file object is already here
+        // We can just proceed as before for D&D
         const arrayBuffer = await file.arrayBuffer();
         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
         padBuffers[index] = audioBuffer;
         padPaths[index] = filePath;
         padElement.classList.add('loaded');
-        // Detect BPM and show buttons
+        // Detect BPM
         padBPMs[index] = detectBPM(audioBuffer);
-        padElement.querySelector('.sync-btn').style.display = 'block';
-        padElement.querySelector('.load-btn').style.display = 'block'; 
-    } catch (err) { 
-        console.error('Failed to load sample:', err);
-        // Still try to show buttons if we got an error partway through
-        try {
-            padElement.querySelector('.sync-btn').style.display = 'block';
-            padElement.querySelector('.load-btn').style.display = 'block';
-        } catch (e) { /* ignore */ }
-    }
+    } catch (err) { console.error(err); }
 }
 
 async function loadSampleFromPath(path, index) {
@@ -235,11 +284,6 @@ async function loadSampleFromPath(path, index) {
         padGrid.children[index].querySelector('.pad').classList.add('loaded');
         // Detect BPM
         padBPMs[index] = detectBPM(audioBuffer);
-        // Show buttons (matching loadSampleFile behavior)
-        const padElement = padGrid.children[index].querySelector('.pad');
-        if (padBPMs[index] > 0) padElement.querySelector('.sync-btn').style.display = 'block';
-        else padElement.querySelector('.sync-btn').style.display = 'block'; // Force show for now
-        padElement.querySelector('.load-btn').style.display = 'block';
     } catch (e) { console.log(e); }
 }
 
@@ -249,6 +293,7 @@ function startPad(index) {
 
     const pad = padGrid.children[index].querySelector('.pad');
     pad.classList.add('active');
+    pad.setAttribute('aria-pressed', 'true');
 
     if (activeVoices[index]) {
         try { activeVoices[index].source.stop(); } catch (e) { }
@@ -282,7 +327,10 @@ function stopPad(index) {
         activeVoices[index] = null;
     }
     const pad = padGrid.children[index].querySelector('.pad');
-    if (pad) pad.classList.remove('active');
+    if (pad) {
+        pad.classList.remove('active');
+        pad.setAttribute('aria-pressed', 'false');
+    }
 }
 
 document.addEventListener('keydown', (e) => {
@@ -522,17 +570,15 @@ let masterBPM = 0;
 let padBPMs = {};
 let isPlaylistLooping = false;
 let padSyncState = {};
-function toggleSync(index, btn) {
+function toggleSync(index) {
     padSyncState[index] = !padSyncState[index];
-    if (padSyncState[index]) btn.classList.add('active'); else btn.classList.remove('active');
 }
 function detectBPM(buffer) {
     const data = buffer.getChannelData(0);
     const peaks = [];
-    const threshold = 0.6;
-    // Minimum 0.25s between beats (avoids counting the same kick drum twice)
-    // 0.25s * 44100 = ~11000 samples
-    const minStep = Math.floor(0.25 * buffer.sampleRate);
+    const threshold = BPM_DETECTION_THRESHOLD;
+    // Minimum time between beats to avoid counting the same kick drum twice
+    const minStep = Math.floor(BPM_MIN_STEP_SECONDS * buffer.sampleRate);
 
     for (let i = 0; i < data.length; i++) {
         if (Math.abs(data[i]) > threshold) {
@@ -596,7 +642,6 @@ let draggedElement = null;
 let isDragging = false;
 let dragStartY = 0;
 let dragThreshold = 8; // Pixels moved before drag starts
-let originalDragIndex = -1; // Track original position for drag operations
 
 function renderPlaylist() {
     playlistEl.innerHTML = '';
@@ -689,7 +734,8 @@ function renderPlaylist() {
             renderPlaylist();
 
             const menu = document.getElementById('contextMenu');
-            menu.style.display = 'block';
+            menu.classList.remove('hidden');
+            menu.setAttribute('aria-hidden', 'false');
             menu.style.left = e.pageX + 'px';
             menu.style.top = e.pageY + 'px';
 
@@ -904,9 +950,74 @@ playlistEl.addEventListener('drop', (e) => {
     if (playlist.length > 0 && !playerAudio.src) loadTrack(0);
 });
 
-// NOTE: Pad drop zones are already set up in the pad creation loop (lines 175-181)
-// DO NOT add duplicate handlers here - they would conflict and destroy buttons
+// Pad drop zones - defer setup until pads exist
+function setupPadDropZones() {
+    const pads = document.querySelectorAll('.pad');
+    
+    pads.forEach((pad, index) => {
+        pad.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (e.dataTransfer.types.includes('Files')) {
+                pad.classList.add('drop-target');
+                e.dataTransfer.dropEffect = 'copy';
+            }
+        });
+        
+        pad.addEventListener('dragleave', (e) => {
+            e.preventDefault();
+            pad.classList.remove('drop-target');
+        });
+        
+        pad.addEventListener('drop', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            pad.classList.remove('drop-target');
+            
+            const files = Array.from(e.dataTransfer.files).filter(isValidAudioFile);
+            if (files.length === 0) return;
+            
+            // Load the first valid audio file into this pad
+            const file = files[0];
+            console.log('[Pad', index, '] Dropped:', file.name);
+            
+            // Create URL and load into pad
+            const url = URL.createObjectURL(file);
+            loadPadAudio(index, url, file.name);
+        });
+    });
+}
 
+// Helper to load audio onto a pad
+async function loadPadAudio(index, url, name) {
+    try {
+        const res = await fetch(url);
+        const arrayBuffer = await res.arrayBuffer();
+        const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+        
+        padBuffers[index] = audioBuffer;
+        
+        // Update pad visuals
+        const pad = document.querySelectorAll('.pad')[index];
+        if (pad) {
+            // Clean filename for display (max 6 chars + ...)
+            const shortName = name.length > 6 ? name.substring(0, 6) + '…' : name.split('.')[0];
+            pad.innerText = shortName.toUpperCase();
+            pad.classList.add('loaded');
+        }
+        
+        // Detect BPM if possible
+        const bpm = detectBPM(audioBuffer);
+        if (bpm > 0) padBPMs[index] = bpm;
+        
+        console.log('[Pad', index, '] Loaded:', name, bpm > 0 ? `(${Math.round(bpm)} BPM)` : '');
+    } catch (err) {
+        console.error('[Pad', index, '] Load failed:', err);
+    }
+}
+
+// Setup drop zones after DOM is ready
+setTimeout(setupPadDropZones, 100);
 
 // Click on empty playlist area to deselect
 playlistEl.addEventListener('click', (e) => {
@@ -919,11 +1030,33 @@ playlistEl.addEventListener('click', (e) => {
 
 // GLOBAL CLICK TO CLOSE MENU
 document.addEventListener('click', (e) => {
-    document.getElementById('contextMenu').style.display = 'none';
+    const ctxMenu = document.getElementById('contextMenu');
+    const padCtxMenu = document.getElementById('padContextMenu');
+    ctxMenu.classList.add('hidden');
+    ctxMenu.setAttribute('aria-hidden', 'true');
+    padCtxMenu.classList.add('hidden');
+    padCtxMenu.setAttribute('aria-hidden', 'true');
 });
 
 // CONTEXT MENU ACTIONS
 const ctxMenu = document.getElementById('contextMenu');
+
+// PAD CONTEXT MENU ACTIONS
+const padCtxMenu = document.getElementById('padContextMenu');
+document.getElementById('ctxLoadSample').addEventListener('click', async () => {
+    const padIndex = parseInt(padCtxMenu.dataset.padIndex);
+    if (!isNaN(padIndex)) {
+        const filePath = await bridge.openSampleDialog();
+        if (filePath) loadSampleFromPath(filePath, padIndex);
+    }
+});
+
+document.getElementById('ctxSync').addEventListener('click', () => {
+    const padIndex = parseInt(padCtxMenu.dataset.padIndex);
+    if (!isNaN(padIndex)) {
+        toggleSync(padIndex);
+    }
+});
 
 document.getElementById('ctxPlay').addEventListener('click', () => {
     const index = parseInt(ctxMenu.dataset.removeIndex);
