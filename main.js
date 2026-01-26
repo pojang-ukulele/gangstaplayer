@@ -24,38 +24,33 @@ function createWindow() {
     frame: false,
     backgroundColor: '#111',
     webPreferences: {
-      nodeIntegration: false, // SECURITY FIX
-      contextIsolation: true, // SECURITY FIX
-      autoplayPolicy: 'no-user-gesture-required', // Allow boot sound
-      preload: path.join(__dirname, 'preload.js'), // BRIDGE
-      sandbox: false, // Necessary for some file access patterns in this simple refactor, though true is better long term.
-      webSecurity: true // Re-enabling web security is good practice, but might block local resource loading if not careful. 
-      // However, we are loading file:// protocol so usually fine. 
-      // If users drag-drop files, webUtils/File object works.
-      // For loading samples from unknown paths via kit load, we might need to bypass csp or use custom protocol.
-      // For now, let's keep it simple.
+      nodeIntegration: false,
+      contextIsolation: true,
+      autoplayPolicy: 'no-user-gesture-required',
+      preload: path.join(__dirname, 'preload.js'),
+      sandbox: false,
+      webSecurity: true
     },
     autoHideMenuBar: true,
     icon: 'icon.png',
-    show: false // Wait for ready-to-show
-  })
+    show: false, 
+  });
 
-  // Avoid "wacky" FOUC by waiting for explicit signal from renderer (fonts loaded)
   ipcMain.on('app:ready-to-show', () => {
-    win.show()
-  })
+    win.show();
+  });
 
-  win.loadFile('index.html')
+  win.loadFile('index.html');
 
-  ipcMain.on('app:minimize', () => { win.minimize() })
+  ipcMain.on('app:minimize', () => { win.minimize(); });
   ipcMain.on('app:maximize', () => { 
     if (win.isMaximized()) {
       win.unmaximize();
     } else {
       win.maximize();
     }
-  })
-  ipcMain.on('app:close', () => { win.close() })
+  });
+  ipcMain.on('app:close', () => { win.close(); });
   ipcMain.on('app:set-fullscreen', (event, flag) => { win.setFullScreen(flag); })
 
   ipcMain.handle('dialog:save-kit', async () => {

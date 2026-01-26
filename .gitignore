@@ -1,26 +1,29 @@
 # Dependencies
 node_modules/
 
-# Build output
+# Build Output
 dist/
+app-build/
+release/
 build/
-out/
 
-# Logs and caches
+# Logs
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
-.pnpm-debug.log*
+
+# OS Files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Environment
+.env
+.env.local
 
 # Editor directories
 .vscode/
 .idea/
-
-# OS crap
-.DS_Store
-Thumbs.db
-
-# Backups and temp
-*.bak
-*.tmp
-*~
+*.swp
+*.swo
