@@ -32,12 +32,12 @@ jobs:
 
     - name: Build Windows Installer
       if: matrix.os == 'windows-latest'
-      run: npx electron-builder build --win --x64 --config.directories.app=app-build
+      run: npx electron-builder build --win --x64 --config.directories.app=app-build --config.electronVersion=30.5.1
 
     - name: Build Mac Universal Installer
       if: matrix.os == 'macos-latest'
       # --universal builds for both arm64 and x64 in one dmg
-      run: npx electron-builder build --mac --universal --config.directories.app=app-build
+      run: npx electron-builder build --mac --universal --config.directories.app=app-build --config.electronVersion=30.5.1
 
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
