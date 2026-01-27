@@ -50,7 +50,8 @@ async function build() {
         'preload.js', // Forgot this in check!
         'package.json',
         'sonetra-bridge.js', // Optional bridge
-        'gun-load.wav'
+        'gun-load.wav',
+        'wallpaper.jpg'
     ];
 
     for (const file of filesToCopy) {
