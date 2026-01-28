@@ -108,18 +108,7 @@ async function initApp() {
         }
     }
 
-    // Global Click Handler to hide menus
-    document.addEventListener('click', () => {
-        const playlistCtxMenu = document.getElementById('contextMenu');
-        if (playlistCtxMenu) {
-            playlistCtxMenu.classList.add('hidden');
-            playlistCtxMenu.setAttribute('aria-hidden', 'true');
-        }
-        if (padContextMenu) {
-            padContextMenu.classList.add('hidden');
-            padContextMenu.setAttribute('aria-hidden', 'true');
-        }
-    });
+    // Global Click Handler to hide menus (handled later with unified logic)
 
     if (ctxLoadSample) {
         ctxLoadSample.addEventListener('click', async () => {
@@ -222,7 +211,158 @@ async function initApp() {
             }
         });
     }
-}
+    }
+
+    // Manual Button
+    const btnOpenManual = document.getElementById('btnOpenManual');
+    if (btnOpenManual) {
+        btnOpenManual.addEventListener('click', () => {
+             bridge.openExternal('README.txt');
+        });
+    }
+    // === PLAY BUTTON CONTEXT MENU ===
+    const playPauseBtn = document.getElementById('playPauseBtn');
+    const playContextMenu = document.getElementById('playContextMenu');
+    const ctxPlayContinuous = document.getElementById('ctxPlayContinuous');
+    const ctxPlaySingle = document.getElementById('ctxPlaySingle');
+    const { getPlaybackMode, setPlaybackMode } = await import('./player.js');
+
+    if (playPauseBtn && playContextMenu) {
+        playPauseBtn.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+
+            // Hide others
+            if (padContextMenu) padContextMenu.classList.add('hidden');
+            const playlistCtxMenu = document.getElementById('contextMenu');
+            if (playlistCtxMenu) playlistCtxMenu.classList.add('hidden');
+
+            // Update Checks
+            const mode = getPlaybackMode();
+            if (ctxPlayContinuous) ctxPlayContinuous.innerText = `CONTINUOUS PLAYBACK ${mode === 'continuous' ? '✓' : ''}`;
+            if (ctxPlaySingle) ctxPlaySingle.innerText = `STOP AFTER CURRENT ${mode === 'single' ? '✓' : ''}`;
+
+            // Show
+            playContextMenu.classList.remove('hidden');
+            playContextMenu.setAttribute('aria-hidden', 'false');
+            playContextMenu.style.left = e.pageX + 'px';
+            playContextMenu.style.top = e.pageY + 'px';
+        });
+    }
+
+    if (ctxPlayContinuous) {
+        ctxPlayContinuous.addEventListener('click', () => {
+            setPlaybackMode('continuous');
+            playContextMenu.classList.add('hidden');
+        });
+    }
+    if (ctxPlaySingle) {
+        ctxPlaySingle.addEventListener('click', () => {
+            setPlaybackMode('single');
+            playContextMenu.classList.add('hidden');
+        });
+    }
+
+
+
+    // === LOOP BUTTON CONTEXT MENU ===
+    const loopBtn = document.getElementById('loopBtn');
+    const loopContextMenu = document.getElementById('loopContextMenu');
+    const ctxLoopOff = document.getElementById('ctxLoopOff');
+    const ctxLoopOne = document.getElementById('ctxLoopOne');
+    const ctxLoopAll = document.getElementById('ctxLoopAll');
+    const { getLoopMode, setLoopMode } = await import('./player.js');
+
+    if (loopBtn && loopContextMenu) {
+        // Right Click: Show Menu
+        loopBtn.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+
+            // Hide others
+            if (padContextMenu) padContextMenu.classList.add('hidden');
+            if (playContextMenu) playContextMenu.classList.add('hidden');
+            const playlistCtxMenu = document.getElementById('contextMenu');
+            if (playlistCtxMenu) playlistCtxMenu.classList.add('hidden');
+
+            // Update Checks
+            const mode = getLoopMode();
+            if (ctxLoopOff) ctxLoopOff.innerText = `LOOP OFF ${mode === 'off' ? '✓' : ''}`;
+            if (ctxLoopOne) ctxLoopOne.innerText = `LOOP CURRENT TRACK ${mode === 'one' ? '✓' : ''}`;
+            if (ctxLoopAll) ctxLoopAll.innerText = `LOOP PLAYLIST ${mode === 'all' ? '✓' : ''}`;
+
+            // Show
+            loopContextMenu.classList.remove('hidden');
+            loopContextMenu.setAttribute('aria-hidden', 'false');
+            loopContextMenu.style.left = e.pageX + 'px';
+            loopContextMenu.style.top = e.pageY + 'px';
+        });
+
+        // Left Click: Toggle (Off -> One -> All -> Off) or (Off <-> Last Selected)?
+        // User request: "select to loop current song, or loop the playlist... and same kind of visual feedback when selected"
+        // Let's make Left Click cycle through modes for convenience, or just toggle One/Off?
+        // Standard behavior for Loop button: Toggle Off/One/All.
+        loopBtn.addEventListener('click', () => {
+             const current = getLoopMode();
+             let next = 'off';
+             if (current === 'off') next = 'one';
+             else if (current === 'one') next = 'all';
+             else if (current === 'all') next = 'off';
+             
+             setLoopMode(next);
+             
+             // Update Visual Feedback on Button? 
+             // Maybe add active class if not off?
+             if (next !== 'off') loopBtn.classList.add('active-loop');
+             else loopBtn.classList.remove('active-loop');
+
+             // Optional: Show brief toast or log?
+        });
+    }
+
+    if (ctxLoopOff) {
+        ctxLoopOff.addEventListener('click', () => {
+            setLoopMode('off');
+            loopBtn.classList.remove('active-loop');
+            loopContextMenu.classList.add('hidden');
+        });
+    }
+    if (ctxLoopOne) {
+        ctxLoopOne.addEventListener('click', () => {
+            setLoopMode('one');
+            loopBtn.classList.add('active-loop');
+            loopContextMenu.classList.add('hidden');
+        });
+    }
+    if (ctxLoopAll) {
+        ctxLoopAll.addEventListener('click', () => {
+            setLoopMode('all');
+            loopBtn.classList.add('active-loop');
+            loopContextMenu.classList.add('hidden');
+        });
+    }
+
+
+    // Global Click Handler (Update existing one to include loopContextMenu)
+    document.addEventListener('click', () => {
+        const playlistCtxMenu = document.getElementById('contextMenu');
+        if (playlistCtxMenu) {
+            playlistCtxMenu.classList.add('hidden');
+            playlistCtxMenu.setAttribute('aria-hidden', 'true');
+        }
+        if (padContextMenu) {
+            padContextMenu.classList.add('hidden');
+            padContextMenu.setAttribute('aria-hidden', 'true');
+        }
+        if (playContextMenu) {
+            playContextMenu.classList.add('hidden');
+            playContextMenu.setAttribute('aria-hidden', 'true');
+        }
+        if (loopContextMenu) {
+            loopContextMenu.classList.add('hidden');
+            loopContextMenu.setAttribute('aria-hidden', 'true');
+        }
+    });
 
 if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', initApp);

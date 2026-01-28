@@ -85,7 +85,14 @@ This is the ultimate **ghetto-tech sampler and tape deck** for the streets. **Ga
 
 1. **Load Audio:** Click `[+] LOAD AUDIO` or drag & drop audio files into the playlist.
 2. **Play a Track:** Double-click a track to play it, or select with arrows and press `ENTER`.
-3. **Adjust Speed:** Use the Chopper & Screwer slider to slow down or speed up playback.
+3. **Playback Modes:** Right-click the **PLAY** button to toggle between:
+   - **Continuous Playback:** Automatically plays the next song.
+   - **Stop After Current:** Stops after the song finishes.
+4. **Loop Modes:** Right-click the **LOOP** button to toggle between:
+   - **Loop Off:** Plays normally (Default).
+   - **Loop Current:** Repeats the current track.
+   - **Loop Playlist:** Wraps around to the start after the last track.
+5. **Adjust Speed:** Use the Chopper & Screwer slider to slow down or speed up playback.
 
 ### Multi-Select Tracks
 
@@ -117,29 +124,6 @@ This is the ultimate **ghetto-tech sampler and tape deck** for the streets. **Ga
 
 ---
 
-## 🛠️ INSTALLATION & RUNNING
-
-You need **Node.js** installed to run this source code.
-
-1. **Install Dependencies:**
-
-   ```bash
-   npm install
-   ```
-
-2. **Start the App:**
-
-   ```bash
-   npm start
-   ```
-
-3. **Build Installer (Distribute to the homies):**
-
-   ```bash
-   npm run dist
-   ```
-
----
 
 ## 📜 LICENSE & CREDITS
 

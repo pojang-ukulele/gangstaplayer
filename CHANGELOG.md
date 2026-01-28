@@ -10,6 +10,13 @@
 - **Magnetic Sliders**:
     - **Tempo Slider** snaps to 100% (1.0x) speed.
     - **Pad Vol Sliders** snap to Default (75%) level.
+- **Play Button Context Menu**: Right-click the Play button to switch between:
+  - **Continuous Playback**: Plays the next track automatically (Default).
+  - **Stop After Current**: Stops playback after the current track finishes.
+- **Loop Button Context Menu**: Right-click the Loop button to separate loop logic:
+  - **Loop Off**: Normal playback.
+  - **Loop Current**: Repeats the active song (Standard).
+  - **Loop Playlist**: Wraps back to the first song after the last one finishes.
 
 ### 💅 UI/UX Improvements
 - **Pad Tooltips**: Context-aware help text ("Click to Load" vs "Right-Click for Options").

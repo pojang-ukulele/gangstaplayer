@@ -10,7 +10,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getPathForFile: (file) => webUtils.getPathForFile(file),
   setFullScreen: (flag) => ipcRenderer.send('app:set-fullscreen', flag),
   openSampleDialog: () => ipcRenderer.invoke('dialog:open-sample'),
-  appReadyToShow: () => ipcRenderer.send('app:ready-to-show')
+  appReadyToShow: () => ipcRenderer.send('app:ready-to-show'),
+  openExternal: (path) => ipcRenderer.invoke('app:open-external', path)
 });
 
 // We also need to expose 'fs' functionality but securely.

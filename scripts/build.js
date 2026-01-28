@@ -51,7 +51,8 @@ async function build() {
         'package.json',
         'sonetra-bridge.js', // Optional bridge
         'gun-load.wav',
-        'wallpaper.jpg'
+        'wallpaper.jpg',
+        'README.txt'
     ];
 
     for (const file of filesToCopy) {

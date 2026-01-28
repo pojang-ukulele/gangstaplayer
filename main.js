@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog } = require('electron')
+const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron')
 const path = require('path')
 const fs = require('fs')
 
@@ -52,6 +52,21 @@ function createWindow() {
   });
   ipcMain.on('app:close', () => { win.close(); });
   ipcMain.on('app:set-fullscreen', (event, flag) => { win.setFullScreen(flag); })
+  
+  ipcMain.handle('app:open-external', async (event, relativePath) => {
+    let fullPath;
+    if (app.isPackaged) {
+        // Production: File is in 'resources' folder via extraResources
+        fullPath = path.join(process.resourcesPath, relativePath);
+    } else {
+        // Development: File is in app root
+        fullPath = path.join(app.getAppPath(), relativePath);
+    }
+    
+    // Check if exists for better debug?
+    // console.log("Opening external:", fullPath);
+    await shell.openPath(fullPath);
+  });
 
   ipcMain.handle('dialog:save-kit', async () => {
     const { canceled, filePath } = await dialog.showSaveDialog(win, {

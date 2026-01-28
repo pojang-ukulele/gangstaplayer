@@ -61,9 +61,11 @@
       "!ugplayer backup files/**",
       "!dist/**",
       "!Sonetra-AI-Mixer-main/**",
-      "!**/.git/**",
       "!**/*.zip",
       "!**/*.7z"
+    ],
+    "extraResources": [
+      "README.txt"
     ]
   }
 }

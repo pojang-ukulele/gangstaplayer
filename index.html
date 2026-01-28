@@ -118,6 +118,7 @@
                         <li><span class="key">DELETE</span> : Remove Track(s) from Playlist</li>
                         <li><span class="key">PAD KEYS</span> : Trigger Pad (Hold to Play)</li>
                         <li><span class="key">CTRL + PAD KEY</span> : Hold to Record (Input Audio)</li>
+                        <li style="margin-top: 10px; list-style: none;"><button id="btnOpenManual" class="btn btn-manual-txt" title="Open full manual in text editor" style="width: 100%;">OPEN FULL MANUAL (TXT)</button></li>
                     </ul>
                 </div>
 
@@ -142,9 +143,8 @@
                 </div>
                 
 
+
             </div>
-
-
         </div>
     </div>
 
@@ -281,6 +281,19 @@
         <div class="context-item" id="ctxLoadSample" role="menuitem" tabindex="-1">LOAD SAMPLE</div>
         <div id="padCtxDivider" class="context-divider hidden" role="separator"></div>
         <div class="context-item hidden" id="ctxSync" role="menuitem" tabindex="-1">SYNC</div>
+    </div>
+
+    <!-- NEW: Play Button Context Menu -->
+    <div id="playContextMenu" class="context-menu hidden" role="menu" aria-hidden="true" aria-label="Playback Options Menu">
+        <div class="context-item" id="ctxPlayContinuous" role="menuitem" tabindex="-1">CONTINUOUS PLAYBACK ✓</div>
+        <div class="context-item" id="ctxPlaySingle" role="menuitem" tabindex="-1">STOP AFTER CURRENT</div>
+    </div>
+
+    <!-- NEW: Loop Context Menu -->
+    <div id="loopContextMenu" class="context-menu hidden" role="menu" aria-hidden="true" aria-label="Loop Options Menu">
+        <div class="context-item" id="ctxLoopOff" role="menuitem" tabindex="-1">LOOP OFF ✓</div>
+        <div class="context-item" id="ctxLoopOne" role="menuitem" tabindex="-1">LOOP CURRENT TRACK</div>
+        <div class="context-item" id="ctxLoopAll" role="menuitem" tabindex="-1">LOOP PLAYLIST</div>
     </div>
 
     <!-- FOOTER CONTROLS -->

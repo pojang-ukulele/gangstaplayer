@@ -35,7 +35,13 @@ function updatePadVisuals(index, pathOrFile) {
         // Extract filename and truncate for premium fit
         const fileName = fullName.split(/[\\/]/).pop().split('.')[0];
         const shortName = fileName.length > 10 ? fileName.substring(0, 10) + '…' : fileName;
-        padElement.innerHTML = `<span>${shortName.toUpperCase()}</span>`;
+        
+        let span = padElement.querySelector('span');
+        if (!span) {
+            span = document.createElement('span');
+            padElement.appendChild(span);
+        }
+        span.innerText = shortName.toUpperCase();
     }
 }
 
@@ -151,7 +157,7 @@ export function createPadGrid() {
             if (activeVoices[i]) activeVoices[i].gain.gain.setValueAtTime(padVolumes[i], audioCtx.currentTime);
         });
         
-        wrapper.appendChild(recBtn); // Add Rec Button
+        pad.appendChild(recBtn); // Move Rec Button INSIDE Pad so they animate together
         wrapper.appendChild(pad);
         wrapper.appendChild(volSlider);
         padGrid.appendChild(wrapper);

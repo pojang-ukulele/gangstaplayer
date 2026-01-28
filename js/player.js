@@ -29,6 +29,17 @@ let setBlendingIndexFn = null;
 // Core state
 let isAutoMixEnabled = false;
 let isCrossfadeInProgress = false;
+let playbackMode = 'continuous'; // 'continuous' | 'single'
+let loopMode = 'off'; // 'off' | 'one' | 'all'
+
+export function setPlaybackMode(mode) { playbackMode = mode; }
+export function getPlaybackMode() { return playbackMode; }
+export function setLoopMode(mode) { 
+    loopMode = mode; 
+    // Sync actual audio element for 'one'
+    if (playerAudio) playerAudio.loop = (mode === 'one');
+}
+export function getLoopMode() { return loopMode; }
 
 // === TWO CHANNEL SIGNAL PATH ===
 // Main Player Chain (Track 1)
@@ -410,11 +421,43 @@ export function setupPlayerHandlers() {
         }
     });
 
+    // Playback Mode Logic
     playerAudio.addEventListener('ended', () => {
         if (!isAutoMixEnabled && !isCrossfadeInProgress) {
-            const nextIndex = (currentTrackIndex + 1) % (playlistRef?.length || 1);
-            loadTrack(nextIndex).then(() => playTrack());
+            // Priority 1: Browser Loop (Loop One)
+            // If playerAudio.loop is true, 'ended' might not fire depending on browser, 
+            // but if it does, the browser handles the seeking. 
+            // However, we rely on our loopMode state now.
+            
+            if (loopMode === 'one') {
+                // Should be handled by playerAudio.loop = true, but just in case:
+                playerAudio.currentTime = 0;
+                playerAudio.play();
+                return;
+            }
+
+            // Mode Logic
+            if (playbackMode === 'single') {
+                stopPlayback();
+            } else {
+                // Continuous Mode
+                let nextIndex = currentTrackIndex + 1;
+                
+                // Priority 2: Loop All (Playlist Wrap)
+                if (nextIndex >= (playlistRef?.length || 0)) {
+                    if (loopMode === 'all') {
+                        nextIndex = 0; // Wrap to start
+                    } else {
+                        // End of playlist, stop.
+                        stopPlayback(); // Or pause?
+                        return;
+                    }
+                }
+
+                loadTrack(nextIndex).then(() => playTrack());
+            }
         }
+        // If AutoMix enabled, logic is handled by timeupdate trigger causing startCrossfade BEFORE end.
     });
     
     playerAudio.addEventListener('loadedmetadata', () => {
