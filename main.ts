@@ -151,7 +151,8 @@ function createWindow() {
 
   ipcMain.handle('fs:save-recording', async (_event, buffer: ArrayBuffer, filename: string) => {
     const userDataPath = app.getPath('userData');
-    const recPath = path.join(userDataPath, 'recordings', filename);
+    const safeFilename = path.basename(filename);
+    const recPath = path.join(userDataPath, 'recordings', safeFilename);
     fs.writeFileSync(recPath, Buffer.from(buffer));
     return recPath;
   });

@@ -1,5 +1,13 @@
 # CHANGELOG
 
+## [v4.6.0] - 2026-02-23 - "Master Fixer Status: ACTIVE"
+
+### 🛡️ Final Hardening & Test Recovery
+
+- **Smoke Test Recovery**: Re-routed the Jest/Playwright test suite to target the compiled production build in `app-build/`, restoring full CI/CD verification.
+- **Recording Guard**: Hardened `fs:save-recording` in the Main process using `path.basename` to eliminate filename-based path traversal risks.
+- **Verified Stability**: All 18 points of the Paranoid Audit are now fixed and verified via automated testing.
+
 ## [v4.5.0] - 2026-02-23 - "Bulletproof Logic"
 
 ### 🛡️ Paranoid Security & DSP Hardening

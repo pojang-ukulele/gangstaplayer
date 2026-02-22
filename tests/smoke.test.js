@@ -9,7 +9,7 @@ describe('Gangsta Player Pro 3 Smoke Test', () => {
 
     beforeAll(async () => {
         electronApp = await electron.launch({
-            args: [path.join(__dirname, '../main.js')],
+            args: [path.join(__dirname, '../app-build/main.js')],
         });
         window = await electronApp.firstWindow();
         window.on('console', msg => console.log('PAGE LOG:', msg.text()));
