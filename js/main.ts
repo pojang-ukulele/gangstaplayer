@@ -1,6 +1,6 @@
 // === MAIN ENTRY POINT ===
 // Gangsta Player Pro 3 - Modular Architecture
-import { resumeAudioContext, masterGain, audioCtx, bufferToWave } from './audio';
+import { resumeAudioContext, masterGain, audioCtx, bufferToWave, initWorklets } from './audio';
 import { enableMIDI, initMIDI } from './midi';
 import { 
     initSampler, createPadGrid, setupPadKeyboardHandlers, getPadGrid,
@@ -17,6 +17,7 @@ import { detectBPMWorker } from './worker-client';
 import { initPlaylist, setupPlaylistHandlers, renderPlaylist, setBlendingIndex, handlePlaylistNavigation } from './playlist';
 import { initSettings, setupSettingsHandlers, loadSettings } from './settings';
 import { initVisuals, playStartupSound } from './visuals';
+import { engine } from './audio-engine';
 import { state } from './state';
 import { toast } from './toast';
 
@@ -33,6 +34,10 @@ const fsBridge = window.fileSystem;
 async function initApp() {
     console.log('[GANGSTA PLAYER PRO 3] Initializing Modules...');
     applyPlatformStyles();
+    
+    // Initialize Worklets first
+    await initWorklets();
+    engine.initWorklets();
     
     // Window Controls
     const minBtn = document.getElementById('minBtn');

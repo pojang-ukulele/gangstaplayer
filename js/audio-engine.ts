@@ -9,6 +9,7 @@ export class AudioChannel {
     lpFilter: BiquadFilterNode;
     hpFilter: BiquadFilterNode;
     source: MediaElementAudioSourceNode;
+    workletNode: AudioWorkletNode | null = null;
 
     constructor() {
         this.audio = new Audio();
@@ -34,6 +35,19 @@ export class AudioChannel {
         this.lpFilter.connect(this.hpFilter);
         this.hpFilter.connect(this.gain);
         this.gain.connect(masterGain);
+
+        // Try to initialize worklet if module is already loaded
+        try {
+            this.workletNode = new AudioWorkletNode(audioCtx, 'gangsta-processor');
+            // Re-route chain through worklet
+            this.hpFilter.disconnect(this.gain);
+            this.hpFilter.connect(this.workletNode);
+            this.workletNode.connect(this.gain);
+            console.log("[AudioEngine] Worklet connected to channel");
+        } catch (e) {
+            // Worklet module might not be loaded yet, we can retry later or ignore
+            console.warn("[AudioEngine] Worklet not ready yet or failed to load");
+        }
     }
 
     reset(): void {
@@ -55,6 +69,19 @@ export class AudioChannel {
     load(url: string): void {
         this.audio.src = url;
     }
+
+    initWorklet(): void {
+        if (this.workletNode) return;
+        try {
+            this.workletNode = new AudioWorkletNode(audioCtx, 'gangsta-processor');
+            this.hpFilter.disconnect(this.gain);
+            this.hpFilter.connect(this.workletNode);
+            this.workletNode.connect(this.gain);
+            console.log("[AudioChannel] Worklet initialized");
+        } catch (e) {
+            console.warn("[AudioChannel] Worklet failed to initialize", e);
+        }
+    }
 }
 
 class AudioEngine {
@@ -66,6 +93,11 @@ class AudioEngine {
         this.crossfade = new AudioChannel();
         // Crossfade channel starts at 0 gain
         this.crossfade.gain.gain.value = 0.001;
+    }
+
+    initWorklets(): void {
+        this.main.initWorklet();
+        this.crossfade.initWorklet();
     }
 
     swapChannels(): void {

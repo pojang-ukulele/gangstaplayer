@@ -83,6 +83,17 @@ async function build() {
         });
     }
 
+    const processorEntry = resolveEntry('js/workers/gangsta-processor.js');
+    if (fs.existsSync(processorEntry)) {
+        await esbuild.build({
+            entryPoints: [processorEntry],
+            bundle: true,
+            platform: 'browser',
+            outfile: path.join(BUILD_DIR, 'js', 'workers', 'gangsta-processor.js'),
+            minify: true,
+        });
+    }
+
     console.log('Copying Assets...');
     // 7. Copy Assets
     const filesToCopy = [

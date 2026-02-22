@@ -33,3 +33,16 @@ export function resumeAudioContext(): Promise<void> {
 export async function bufferToWave(ab: AudioBuffer): Promise<Blob> {
     return await bufferToWaveWorker(ab, ab.length);
 }
+
+/**
+ * Initialize AudioWorklets
+ */
+export async function initWorklets(): Promise<void> {
+    try {
+        // Path matches the bundled location in app-build
+        await audioCtx.audioWorklet.addModule('js/workers/gangsta-processor.js');
+        console.log('[Audio] GangstaWorklet Registered');
+    } catch (e) {
+        console.error('[Audio] Worklet registration failed', e);
+    }
+}

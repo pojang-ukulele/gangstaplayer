@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## [v4.2.0] - 2026-02-23 - "Worklet Warrior"
+
+### ⚡ Audio Architecture Upgrade
+
+- **AudioWorklet Integration**: Moved real-time DSP logic into a dedicated, high-priority audio thread.
+- **Gangsta Processor**: Implemented a custom `AudioWorkletProcessor` featuring:
+  - **24dB Moog-style Ladder Filter**: More characterful, aggressive filtering for that modular feel.
+  - **Saturation & Grit**: Soft-clipping saturation stage for analog warmth.
+  - **Bit-Crushing**: Real-time signal quantization for Lo-Fi aesthetics.
+- **Low-Latency Signal Chain**: Re-routed `AudioEngine` channels through the new Worklet node, ensuring glitch-free audio processing even under heavy UI load.
+
 ## [v4.1.0] - 2026-02-23 - "The Hardened Core"
 
 ### 🛡️ Paranoid Logic Hardening
