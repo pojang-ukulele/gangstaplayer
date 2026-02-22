@@ -125,10 +125,32 @@ This is the ultimate **ghetto-tech sampler and tape deck** for the streets. **Ga
 
 ---
 
+## 🛠️ DEVELOPMENT & INSTALLATION
+
+### Prerequisites
+
+- **Node.js**: v18+ Recommended
+- **Python**: v3.10+ (for Sonetra AI bridge functionality)
+
+### Setup
+
+1. `git clone https://github.com/coreyshearwater/gangstaplayer-mod.git`
+2. `npm install`
+3. `npm start`
+
+### Production Build
+
+To generate a minified, obfuscated build:
+`node scripts/build.js`
+
+To bundle into an installer:
+`npm run dist`
+
+---
 
 ## 📜 LICENSE & CREDITS
 
-**Gangsta Player Pro 3** is proprietary software.
+**Gangsta Player Pro 3** is proprietary software. See the [LICENSE](LICENSE) file for full details.
 
 ### Third-Party Software
 
