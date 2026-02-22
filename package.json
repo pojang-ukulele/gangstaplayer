@@ -7,7 +7,7 @@
   "author": "Gangsta Player Pro 3",
   "license": "MIT",
   "scripts": {
-    "start": "electron .",
+    "start": "node scripts/build.js && electron app-build",
     "dist": "electron-builder",
     "test": "jest",
     "audit": "npm audit --audit-level=high",

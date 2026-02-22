@@ -7,6 +7,7 @@
 - **Smoke Test Recovery**: Re-routed the Jest/Playwright test suite to target the compiled production build in `app-build/`, restoring full CI/CD verification.
 - **Recording Guard**: Hardened `fs:save-recording` in the Main process using `path.basename` to eliminate filename-based path traversal risks.
 - **Verified Stability**: All 18 points of the Paranoid Audit are now fixed and verified via automated testing.
+- **Startup Recovery**: Updated the `npm start` script to correctly build and launch the application from the `app-build/` directory, resolving failures caused by the root `main.js` which was migrated to TypeScript.
 
 ## [v4.5.0] - 2026-02-23 - "Bulletproof Logic"
 
