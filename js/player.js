@@ -1,14 +1,13 @@
 // === PLAYER MODULE ===
 import { BPM_DETECTION_THRESHOLD, BPM_MIN_STEP_SECONDS } from './constants.js';
-import { audioCtx, masterGain, resumeAudioContext } from './audio.js';
+import { audioCtx, resumeAudioContext } from './audio.js';
 import { settings } from './settings.js';
+import { state } from './state.js';
+import { detectBPMWorker } from './worker-client.js';
+import { toast } from './toast.js';
+import { engine } from './audio-engine.js';
 
-export let masterBPM = 0;
-export let isPlaying = false;
-export let currentTrackIndex = 0;
-export let playerAudio = new Audio();
-playerAudio.crossOrigin = "anonymous";
-
+// Local UI references
 let isDraggingProgress = false;
 let playPauseBtn = null;
 let stopBtn = null;
@@ -26,61 +25,31 @@ let playlistRef = null;
 let renderPlaylistFn = null;
 let setBlendingIndexFn = null;
 
-// Core state
-let isAutoMixEnabled = false;
-let isCrossfadeInProgress = false;
-let playbackMode = 'continuous'; // 'continuous' | 'single'
-let loopMode = 'off'; // 'off' | 'one' | 'all'
+// UI Helper for Confirmation
+function showConfirm(title, message, onYes) {
+    const modal = document.getElementById('confirmModal');
+    const titleEl = document.getElementById('confirmTitle');
+    const msgEl = document.getElementById('confirmMessage');
+    const yesBtn = document.getElementById('confirmYes');
+    const noBtn = document.getElementById('confirmNo');
 
-export function setPlaybackMode(mode) { playbackMode = mode; }
-export function getPlaybackMode() { return playbackMode; }
-export function setLoopMode(mode) { 
-    loopMode = mode; 
-    // Sync actual audio element for 'one'
-    if (playerAudio) playerAudio.loop = (mode === 'one');
+    if (titleEl) titleEl.innerText = title;
+    if (msgEl) msgEl.innerText = message;
+    
+    const close = () => { modal.style.display = 'none'; };
+    
+    yesBtn.onclick = () => { onYes(); close(); };
+    noBtn.onclick = close;
+    modal.style.display = 'block';
 }
-export function getLoopMode() { return loopMode; }
 
-// === TWO CHANNEL SIGNAL PATH ===
-// Main Player Chain (Track 1)
-const playerGain = audioCtx.createGain();
-const player_lowEQ = audioCtx.createBiquadFilter();
-const player_midEQ = audioCtx.createBiquadFilter();
-const player_highEQ = audioCtx.createBiquadFilter();
-const player_lpf = audioCtx.createBiquadFilter();
-
-player_lowEQ.type = 'lowshelf'; player_lowEQ.frequency.value = 320;
-player_midEQ.type = 'peaking'; player_midEQ.frequency.value = 1000; player_midEQ.Q.value = 0.5;
-player_highEQ.type = 'highshelf'; player_highEQ.frequency.value = 3200;
-player_lpf.type = 'lowpass'; player_lpf.frequency.value = 20000;
-
-let currentSource = audioCtx.createMediaElementSource(playerAudio);
-currentSource.connect(player_lowEQ);
-player_lowEQ.connect(player_midEQ);
-player_midEQ.connect(player_highEQ);
-player_highEQ.connect(player_lpf);
-player_lpf.connect(playerGain);
-playerGain.connect(masterGain);
-
-// Crossfade Player Chain (Track 2)
-let crossfadeAudio = null;
-let crossfadeSource = null;
-const crossfadeGain = audioCtx.createGain();
-const cf_lowEQ = audioCtx.createBiquadFilter();
-const cf_midEQ = audioCtx.createBiquadFilter();
-const cf_highEQ = audioCtx.createBiquadFilter();
-const cf_hpf = audioCtx.createBiquadFilter();
-
-cf_lowEQ.type = 'lowshelf'; cf_lowEQ.frequency.value = 320;
-cf_midEQ.type = 'peaking'; cf_midEQ.frequency.value = 1000; cf_midEQ.Q.value = 0.5;
-cf_highEQ.type = 'highshelf'; cf_highEQ.frequency.value = 3200;
-cf_hpf.type = 'highpass'; cf_hpf.frequency.value = 30;
-
-cf_lowEQ.connect(cf_midEQ);
-cf_midEQ.connect(cf_highEQ);
-cf_highEQ.connect(cf_hpf);
-cf_hpf.connect(crossfadeGain);
-crossfadeGain.connect(masterGain);
+export function setPlaybackMode(mode) { state.update({ playbackMode: mode }); }
+export function getPlaybackMode() { return state.playbackMode; }
+export function setLoopMode(mode) { 
+    state.update({ loopMode: mode }); 
+    engine.main.audio.loop = (mode === 'one');
+}
+export function getLoopMode() { return state.loopMode; }
 
 export function initPlayer(deps) {
     playlistRef = deps.playlist;
@@ -103,102 +72,70 @@ export function initPlayer(deps) {
     const loopBtn = document.getElementById('loopBtn');
     if (loopBtn) {
         loopBtn.addEventListener('click', () => {
-             // Disable AutoMix if enabling Loop
-             if (!playerAudio.loop && isAutoMixEnabled) {
+             if (!engine.main.audio.loop && state.isAutoMixEnabled) {
                  setAutoMixEnabled(false);
              }
              
-             playerAudio.loop = !playerAudio.loop;
-             if (playerAudio.loop) {
-                 loopBtn.classList.add('loop-active');
-             } else {
-                 loopBtn.classList.remove('loop-active');
-             }
+             engine.main.audio.loop = !engine.main.audio.loop;
+             loopBtn.classList.toggle('loop-active', engine.main.audio.loop);
         });
     }
 }
 
-export function setDependentState(deps) {
-   // Kept for consistency if main calls it, or we rely on init
-}
-
 export function setAutoMixEnabled(val) {
-    isAutoMixEnabled = val;
+    state.update({ isAutoMixEnabled: val });
     if (autoMixBtn) {
-        if (isAutoMixEnabled) {
+        if (state.isAutoMixEnabled) {
             autoMixBtn.classList.add('active');
-            // Disable Loop if AutoMix enabled
-            if (playerAudio.loop) {
-                 playerAudio.loop = false;
+            if (engine.main.audio.loop) {
+                 engine.main.audio.loop = false;
                  const loopBtn = document.getElementById('loopBtn');
                  if (loopBtn) loopBtn.classList.remove('loop-active');
+                 state.update({ loopMode: 'off' });
             }
         }
         else autoMixBtn.classList.remove('active');
     }
 }
 
-export function toggleAutoMix() { setAutoMixEnabled(!isAutoMixEnabled); }
-export function getMasterBPMRef() { return { get value() { return masterBPM; }, set value(v) { masterBPM = v; } }; }
+export function toggleAutoMix() { setAutoMixEnabled(!state.isAutoMixEnabled); }
+export function getMasterBPMRef() { return { get value() { return state.masterBPM; }, set value(v) { state.update({ masterBPM: v }); } }; }
 export function getTempoSlider() { return tempoSlider; }
-export function getPlayerAudio() { return playerAudio; }
-
-export function detectBPM(buffer) {
-    const data = buffer.getChannelData(0);
-    const peaks = [];
-    const minStep = Math.floor(BPM_MIN_STEP_SECONDS * buffer.sampleRate);
-    for (let i = 0; i < data.length; i++) {
-        if (Math.abs(data[i]) > BPM_DETECTION_THRESHOLD) {
-            peaks.push(i); i += minStep;
-        }
-    }
-    if (peaks.length < 2) return 0;
-    const intervals = [];
-    for (let i = 1; i < peaks.length; i++) intervals.push(peaks[i] - peaks[i - 1]);
-    const avgInterval = intervals.reduce((a, b) => a + b, 0) / intervals.length;
-    const bpmValue = (buffer.sampleRate * 60) / avgInterval;
-    return (bpmValue < 60 || bpmValue > 200) ? 0 : Math.round(bpmValue);
-}
+export function getPlayerAudio() { return engine.main.audio; }
 
 export async function loadTrack(index) {
     if (!playlistRef || index < 0 || index >= playlistRef.length) return;
     const track = playlistRef[index];
-    currentTrackIndex = index;
+    state.update({ currentTrackIndex: index });
     if (renderPlaylistFn) renderPlaylistFn();
     
-    // Ensure volumes are reset
-    playerGain.gain.cancelScheduledValues(audioCtx.currentTime);
-    playerGain.gain.value = 1;
-    player_lpf.frequency.cancelScheduledValues(audioCtx.currentTime);
-    player_lpf.frequency.value = 20000;
-    player_lowEQ.gain.value = 0;
+    engine.main.reset();
+    engine.main.load(track.url);
+    engine.main.audio.playbackRate = tempoSlider ? parseFloat(tempoSlider.value) : 1;
     
-    playerAudio.src = track.url;
-    playerAudio.playbackRate = tempoSlider ? parseFloat(tempoSlider.value) : 1;
-    
-    // Fix: Check strictly for NULL to allow 0 (failed/no bpm) to skip analysis
     if (track.bpm !== null && track.bpm !== undefined) {
-        masterBPM = track.bpm;
-        const bpmText = masterBPM > 0 ? `[${masterBPM} BPM]` : "[BPM: --]";
+        state.update({ masterBPM: track.bpm });
+        const bpmText = state.masterBPM > 0 ? `[${state.masterBPM} BPM]` : "[BPM: --]";
         if (trackTitle) trackTitle.innerText = `${track.name} ${bpmText}`;
     } else {
-        masterBPM = 0;
+        state.update({ masterBPM: 0 });
         if (trackTitle) trackTitle.innerText = `${track.name} [Analyzing...]`;
         try {
             const response = await fetch(track.url);
             const arrayBuffer = await response.arrayBuffer();
             const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-            const detectedValue = detectBPM(audioBuffer);
-            track.bpm = detectedValue; // Can be 0
-            masterBPM = detectedValue;
-            if (trackTitle && currentTrackIndex === index) {
-                const bpmTxt = masterBPM > 0 ? `[${masterBPM} BPM]` : "[BPM: --]";
+            const detectedValue = await detectBPMWorker(audioBuffer);
+            track.bpm = detectedValue;
+            state.update({ masterBPM: detectedValue });
+            if (trackTitle && state.currentTrackIndex === index) {
+                const bpmTxt = state.masterBPM > 0 ? `[${state.masterBPM} BPM]` : "[BPM: --]";
                 trackTitle.innerText = `${track.name} ${bpmTxt}`;
             }
         } catch (e) {
             console.error("[Player] Analysis failed", e);
-            track.bpm = 0; // Mark as analyzed (failed)
-            if (trackTitle && currentTrackIndex === index) {
+            toast.error("BPM ANALYSIS FAILED");
+            track.bpm = 0;
+            if (trackTitle && state.currentTrackIndex === index) {
                 trackTitle.innerText = track.name + " [BPM: Error]";
             }
         }
@@ -206,55 +143,42 @@ export async function loadTrack(index) {
 }
 
 function updateControlsLock(locked) {
-    if (progressBar) {
-        progressBar.disabled = locked;
-        progressBar.style.opacity = locked ? '0.5' : '1';
-        progressBar.style.cursor = locked ? 'not-allowed' : 'pointer';
-    }
-    if (playPauseBtn) {
-        playPauseBtn.disabled = locked;
-        playPauseBtn.style.opacity = locked ? '0.5' : '1';
-        playPauseBtn.style.cursor = locked ? 'not-allowed' : 'pointer';
-    }
-    // Note: Stop button remains active
+    const lockable = [progressBar, playPauseBtn];
+    lockable.forEach(el => {
+        if (el) {
+            el.disabled = locked;
+            el.style.opacity = locked ? '0.5' : '1';
+            el.style.cursor = locked ? 'not-allowed' : 'pointer';
+        }
+    });
 }
 
-// === ADVANCED AUTO-MIX ENGINE ===
-
 export async function startCrossfade(targetIndex = null, customDuration = null) {
-    if (isCrossfadeInProgress || !playlistRef?.length) return;
+    if (state.isCrossfadeInProgress || !playlistRef?.length) return;
     
     resumeAudioContext();
-    const nextIdx = targetIndex !== null ? targetIndex : ((currentTrackIndex + 1) % playlistRef.length);
-    if (playlistRef[nextIdx].url === playerAudio.src && !targetIndex) return; 
+    const nextIdx = targetIndex !== null ? targetIndex : ((state.currentTrackIndex + 1) % playlistRef.length);
+    if (playlistRef[nextIdx].url === engine.main.audio.src && !targetIndex) return; 
 
-    isCrossfadeInProgress = true;
-    updateControlsLock(true); // LOCK UI
+    state.update({ isCrossfadeInProgress: true });
+    updateControlsLock(true);
 
-    console.log(`[AutoMix] Starting transition to: ${playlistRef[nextIdx].name}`);
-    
     if (setBlendingIndexFn) setBlendingIndexFn(nextIdx);
     if (autoMixBtn) autoMixBtn.classList.add('blending');
 
-    crossfadeAudio = new Audio();
-    crossfadeAudio.crossOrigin = "anonymous";
-    crossfadeAudio.src = playlistRef[nextIdx].url;
+    engine.crossfade.reset();
+    engine.crossfade.load(playlistRef[nextIdx].url);
     
-    crossfadeSource = audioCtx.createMediaElementSource(crossfadeAudio);
-    crossfadeSource.connect(cf_lowEQ);
-    
-    cf_lowEQ.gain.value = settings.autoMix.eqCrossfade ? -24 : 0;
-    cf_midEQ.gain.value = settings.autoMix.eqCrossfade ? -6 : 0;
-    crossfadeGain.gain.value = 0.001;
-
-    // Match rate
-    crossfadeAudio.playbackRate = playerAudio.playbackRate;
+    engine.crossfade.lowEQ.gain.value = settings.autoMix.eqCrossfade ? -24 : 0;
+    engine.crossfade.midEQ.gain.value = settings.autoMix.eqCrossfade ? -6 : 0;
+    engine.crossfade.gain.gain.value = 0.001;
+    engine.crossfade.audio.playbackRate = engine.main.audio.playbackRate;
 
     try {
-        await crossfadeAudio.play();
+        await engine.crossfade.audio.play();
     } catch (e) {
         console.error("AutoMix Playback Failed", e);
-        isCrossfadeInProgress = false;
+        state.update({ isCrossfadeInProgress: false });
         updateControlsLock(false);
         if (setBlendingIndexFn) setBlendingIndexFn(-1);
         if (autoMixBtn) autoMixBtn.classList.remove('blending');
@@ -264,47 +188,44 @@ export async function startCrossfade(targetIndex = null, customDuration = null) 
     const duration = customDuration !== null ? customDuration : settings.autoMix.trackDuration;
     const now = audioCtx.currentTime;
 
-    // --- AUTOMATION: OUTGOING (Track 1) ---
-    // Balanced Mix: Linear Fade Out (prevents "blasting" overlap while staying audible)
+    // --- AUTOMATION: OUTGOING (Main) ---
     if (settings.autoMix.eqCrossfade) {
-        player_lowEQ.gain.cancelScheduledValues(now);
-        player_lowEQ.gain.setValueAtTime(0, now);
-        player_lowEQ.gain.linearRampToValueAtTime(-24, now + duration * 0.8);
-        player_midEQ.gain.linearRampToValueAtTime(-12, now + duration);
+        engine.main.lowEQ.gain.cancelScheduledValues(now);
+        engine.main.lowEQ.gain.setValueAtTime(0, now);
+        engine.main.lowEQ.gain.linearRampToValueAtTime(-24, now + duration * 0.8);
+        engine.main.midEQ.gain.linearRampToValueAtTime(-12, now + duration);
     }
     if (settings.autoMix.filterSweep) {
-        player_lpf.frequency.cancelScheduledValues(now);
-        player_lpf.frequency.setValueAtTime(20000, now);
-        player_lpf.frequency.exponentialRampToValueAtTime(600, now + duration);
+        engine.main.lpFilter.frequency.cancelScheduledValues(now);
+        engine.main.lpFilter.frequency.setValueAtTime(20000, now);
+        engine.main.lpFilter.frequency.exponentialRampToValueAtTime(600, now + duration);
     }
-    playerGain.gain.cancelScheduledValues(now);
-    playerGain.gain.setValueAtTime(playerGain.gain.value, now);
-    // Restoration: Linear fade out to 0 to prevent clipping (1+1=2 is too loud)
-    playerGain.gain.linearRampToValueAtTime(0.001, now + duration);
+    engine.main.gain.gain.cancelScheduledValues(now);
+    engine.main.gain.gain.setValueAtTime(engine.main.gain.gain.value, now);
+    engine.main.gain.gain.linearRampToValueAtTime(0.001, now + duration);
 
-    // --- AUTOMATION: INCOMING (Track 2) ---
+    // --- AUTOMATION: INCOMING (Crossfade) ---
     if (settings.autoMix.eqCrossfade) {
-        cf_lowEQ.gain.cancelScheduledValues(now);
-        cf_lowEQ.gain.setValueAtTime(-24, now);
-        cf_lowEQ.gain.linearRampToValueAtTime(0, now + duration * 0.8); 
-        cf_midEQ.gain.linearRampToValueAtTime(0, now + duration);
+        engine.crossfade.lowEQ.gain.cancelScheduledValues(now);
+        engine.crossfade.lowEQ.gain.setValueAtTime(-24, now);
+        engine.crossfade.lowEQ.gain.linearRampToValueAtTime(0, now + duration * 0.8); 
+        engine.crossfade.midEQ.gain.linearRampToValueAtTime(0, now + duration);
     }
     if (settings.autoMix.hpfSweep) {
-        cf_hpf.frequency.cancelScheduledValues(now);
-        cf_hpf.frequency.setValueAtTime(2000, now);
-        cf_hpf.frequency.exponentialRampToValueAtTime(30, now + duration * 0.8);
+        engine.crossfade.hpFilter.frequency.cancelScheduledValues(now);
+        engine.crossfade.hpFilter.frequency.setValueAtTime(2000, now);
+        engine.crossfade.hpFilter.frequency.exponentialRampToValueAtTime(30, now + duration * 0.8);
     }
-    crossfadeGain.gain.cancelScheduledValues(now);
-    crossfadeGain.gain.setValueAtTime(0.001, now);
-    // Restoration: Linear fade in from 0
-    crossfadeGain.gain.linearRampToValueAtTime(1, now + duration);
+    engine.crossfade.gain.gain.cancelScheduledValues(now);
+    engine.crossfade.gain.gain.setValueAtTime(0.001, now);
+    engine.crossfade.gain.gain.linearRampToValueAtTime(1, now + duration);
 
     setTimeout(() => { finishCrossfade(nextIdx); }, duration * 1000);
 }
 
 function finishCrossfade(nextIndex) {
-    if (!crossfadeAudio) {
-        isCrossfadeInProgress = false;
+    if (!engine.crossfade.audio.src) {
+        state.update({ isCrossfadeInProgress: false });
         updateControlsLock(false);
         if (setBlendingIndexFn) setBlendingIndexFn(-1);
         if (autoMixBtn) autoMixBtn.classList.remove('blending');
@@ -312,237 +233,161 @@ function finishCrossfade(nextIndex) {
         return;
     }
     
-    // --- SEAMLESS HANDOFF (OBJECT SWAP) ---
-    // Instead of pausing and seeking (which causes glitches), we PROMOTE the 
-    // running crossfadeAudio to become the new playerAudio.
-    
-    const oldPlayer = playerAudio;
-    const oldSource = currentSource;
-    
-    // 1. Reset Main Chain Params (Instantly) so the new track sounds right
-    const now = audioCtx.currentTime;
-    playerGain.gain.cancelScheduledValues(now);
-    playerGain.gain.setValueAtTime(1, now);
-    player_lowEQ.gain.cancelScheduledValues(now);
-    player_lowEQ.gain.setValueAtTime(0, now);
-    player_midEQ.gain.setValueAtTime(0, now);
-    player_lpf.frequency.cancelScheduledValues(now);
-    player_lpf.frequency.setValueAtTime(20000, now);
-
-    // 2. Disconnect Source Nodes to swap chains
-    // Disconnect playing crossfade source from Crossfade Chain
-    crossfadeSource.disconnect();
-    // Disconnect old main source from Main Chain
-    if (oldSource) oldSource.disconnect();
-
-    // 3. Connect New Source to Main Chain
-    crossfadeSource.connect(player_lowEQ);
-    currentSource = crossfadeSource; // Update reference
-
-    // 4. Update Global Player Object
-    playerAudio = crossfadeAudio; // Promote
-    currentTrackIndex = nextIndex;
-    
-    // 5. Cleanup Old Object
-    oldPlayer.pause();
-    oldPlayer.src = "";
-    
-    // 6. Reset State
-    crossfadeAudio = null;
-    crossfadeSource = null;
-    isCrossfadeInProgress = false;
+    // PROMOTE channel
+    engine.swapChannels();
+    state.update({ currentTrackIndex: nextIndex, isCrossfadeInProgress: false });
     updateControlsLock(false);
     
     if (setBlendingIndexFn) setBlendingIndexFn(-1);
     if (autoMixBtn) autoMixBtn.classList.remove('blending');
     
-    // 7. Re-bind Events to new object
     setupPlayerHandlers();
     
-    // 8. Update UI
     if (renderPlaylistFn) renderPlaylistFn();
     if (trackTitle) {
          const t = playlistRef[nextIndex];
-         if (t.bpm !== null && t.bpm !== undefined) {
-             const txt = t.bpm > 0 ? `[${t.bpm} BPM]` : "[BPM: --]";
-             trackTitle.innerText = `${t.name} ${txt}`;
-         }
+         const txt = (t.bpm && t.bpm > 0) ? `[${t.bpm} BPM]` : "[BPM: --]";
+         trackTitle.innerText = `${t.name} ${txt}`;
     }
 }
 
 export function playTrack() {
-    if (isCrossfadeInProgress) return; // Ignore if mixing
-    if (!playlistRef?.length || !playerAudio) return;
+    if (state.isCrossfadeInProgress || !playlistRef?.length || !engine.main.audio) return;
     resumeAudioContext();
-    playerAudio.play().then(() => {
-        isPlaying = true;
+    engine.main.audio.play().then(() => {
+        state.update({ isPlaying: true });
         if (playPauseBtn) playPauseBtn.innerText = "PAUSE";
         updateControlsLock(false);
     }).catch(console.error);
 }
 
 export function pauseTrack() {
-    if (isCrossfadeInProgress) return; // Ignore if mixing
-    if (playerAudio) playerAudio.pause();
-    isPlaying = false;
+    if (state.isCrossfadeInProgress) return;
+    if (engine.main.audio) engine.main.audio.pause();
+    state.update({ isPlaying: false });
     if (playPauseBtn) playPauseBtn.innerText = "PLAY";
 }
 
 export function stopPlayback() {
-    if (playerAudio) { playerAudio.pause(); playerAudio.currentTime = 0; }
-    if (crossfadeAudio) { crossfadeAudio.pause(); crossfadeAudio.src = ""; crossfadeAudio = null; }
-    isPlaying = false;
-    isCrossfadeInProgress = false;
-    updateControlsLock(false); // Force unlock
+    engine.main.audio.pause();
+    engine.main.audio.currentTime = 0;
+    engine.crossfade.audio.pause();
+    engine.crossfade.audio.src = "";
+    
+    state.update({ isPlaying: false, isCrossfadeInProgress: false });
+    updateControlsLock(false);
     
     if (playPauseBtn) playPauseBtn.innerText = "PLAY";
     if (progressBar) progressBar.value = 0;
-    
     if (setBlendingIndexFn) setBlendingIndexFn(-1);
     if (autoMixBtn) autoMixBtn.classList.remove('blending');
 }
 
 export function setupPlayerHandlers() {
-    if (!playerAudio) return;
+    if (!engine.main.audio) return;
     
-    // ... existing timeupdate ...
-    playerAudio.addEventListener('timeupdate', () => {
-        if (!isDraggingProgress && playerAudio.duration) {
-            const progress = (playerAudio.currentTime / playerAudio.duration) * 100;
+    engine.main.audio.addEventListener('timeupdate', () => {
+        if (!isDraggingProgress && engine.main.audio.duration) {
+            const progress = (engine.main.audio.currentTime / engine.main.audio.duration) * 100;
             if (progressBar) progressBar.value = progress;
-            if (timeDisplay) timeDisplay.innerText = formatTime(playerAudio.currentTime);
+            if (timeDisplay) timeDisplay.innerText = formatTime(engine.main.audio.currentTime);
 
-            // Auto-Mix Trigger logic
-            if (isAutoMixEnabled && !isCrossfadeInProgress && playerAudio.duration > settings.autoMix.trackDuration * 2) {
-                if (playerAudio.currentTime >= playerAudio.duration - settings.autoMix.trackDuration) {
+            if (state.isAutoMixEnabled && !state.isCrossfadeInProgress && engine.main.audio.duration > settings.autoMix.trackDuration * 2) {
+                if (engine.main.audio.currentTime >= engine.main.audio.duration - settings.autoMix.trackDuration) {
                     startCrossfade();
                 }
             }
         }
     });
 
-    // Playback Mode Logic
-    playerAudio.addEventListener('ended', () => {
-        if (!isAutoMixEnabled && !isCrossfadeInProgress) {
-            // Priority 1: Browser Loop (Loop One)
-            // If playerAudio.loop is true, 'ended' might not fire depending on browser, 
-            // but if it does, the browser handles the seeking. 
-            // However, we rely on our loopMode state now.
-            
-            if (loopMode === 'one') {
-                // Should be handled by playerAudio.loop = true, but just in case:
-                playerAudio.currentTime = 0;
-                playerAudio.play();
+    engine.main.audio.addEventListener('ended', () => {
+        if (!state.isAutoMixEnabled && !state.isCrossfadeInProgress) {
+            if (state.loopMode === 'one') {
+                engine.main.audio.currentTime = 0;
+                engine.main.audio.play();
                 return;
             }
 
-            // Mode Logic
-            if (playbackMode === 'single') {
-                stopPlayback();
-            } else {
-                // Continuous Mode
-                let nextIndex = currentTrackIndex + 1;
-                
-                // Priority 2: Loop All (Playlist Wrap)
+            if (state.playbackMode === 'single') stopPlayback();
+            else {
+                let nextIndex = state.currentTrackIndex + 1;
                 if (nextIndex >= (playlistRef?.length || 0)) {
-                    if (loopMode === 'all') {
-                        nextIndex = 0; // Wrap to start
-                    } else {
-                        // End of playlist, stop.
-                        stopPlayback(); // Or pause?
-                        return;
-                    }
+                    if (state.loopMode === 'all') nextIndex = 0;
+                    else { stopPlayback(); return; }
                 }
-
                 loadTrack(nextIndex).then(() => playTrack());
             }
         }
-        // If AutoMix enabled, logic is handled by timeupdate trigger causing startCrossfade BEFORE end.
     });
     
-    playerAudio.addEventListener('loadedmetadata', () => {
-        if (totalTimeDisplay && playerAudio.duration) {
-            totalTimeDisplay.innerText = formatTime(playerAudio.duration);
+    engine.main.audio.addEventListener('loadedmetadata', () => {
+        if (totalTimeDisplay && engine.main.audio.duration) {
+            totalTimeDisplay.innerText = formatTime(engine.main.audio.duration);
         }
     });
 
     if (progressBar) {
         progressBar.addEventListener('input', (e) => {
             isDraggingProgress = true;
-            if (playerAudio.duration && timeDisplay) {
-                 const val = parseFloat(e.target.value);
-                 const seekTime = (val / 100) * playerAudio.duration;
+            if (engine.main.audio.duration && timeDisplay) {
+                 const seekTime = (parseFloat(e.target.value) / 100) * engine.main.audio.duration;
                  timeDisplay.innerText = formatTime(seekTime);
             }
         });
         progressBar.addEventListener('change', (e) => {
-            if (isCrossfadeInProgress) return; // Block seeking 
-            if (playerAudio.duration) {
-                playerAudio.currentTime = (parseFloat(e.target.value) / 100) * playerAudio.duration;
+            if (state.isCrossfadeInProgress) return;
+            if (engine.main.audio.duration) {
+                engine.main.audio.currentTime = (parseFloat(e.target.value) / 100) * engine.main.audio.duration;
             }
             isDraggingProgress = false;
         });
     }
 
-    if (masterVol) {
-        // Initial set
-        if (volKnob) {
-             const v = parseFloat(masterVol.value);
-             // Knob is 45px wide. Center is at 22.5px.
-             // Range logic: 22.5px ... (100% - 22.5px)
-             volKnob.style.left = `calc(22.5px + (100% - 45px) * ${v})`;
-             volKnob.innerText = Math.round(v * 100) + '%';
-        }
-
-        masterVol.addEventListener('input', () => {
-            const val = parseFloat(masterVol.value);
-            masterGain.gain.value = val;
-            if (volKnob) {
-                volKnob.innerText = Math.round(val * 100) + '%';
-                volKnob.style.left = `calc(22.5px + (100% - 45px) * ${val})`;
-            }
-        });
-    }
-    
-    if (playPauseBtn) playPauseBtn.addEventListener('click', () => {
-        if (isCrossfadeInProgress) return; // Block
-        isPlaying ? pauseTrack() : playTrack();
-    });
-    
-    if (stopBtn) stopBtn.addEventListener('click', stopPlayback);
-    if (autoMixBtn) autoMixBtn.addEventListener('click', toggleAutoMix);
-
     const nextBtn = document.getElementById('nextBtn');
     if (nextBtn) nextBtn.addEventListener('click', () => {
-        if (isCrossfadeInProgress) return;
-        if (isAutoMixEnabled) startCrossfade(null, settings.autoMix.btnDuration);
-        else { currentTrackIndex = (currentTrackIndex + 1) % playlistRef.length; loadTrack(currentTrackIndex).then(playTrack); }
+        if (state.isCrossfadeInProgress) return;
+        if (state.isAutoMixEnabled) startCrossfade(null, settings.autoMix.btnDuration);
+        else loadTrack((state.currentTrackIndex + 1) % playlistRef.length).then(playTrack);
     });
 
     const prevBtn = document.getElementById('prevBtn');
     if (prevBtn) prevBtn.addEventListener('click', () => {
-        if (isCrossfadeInProgress) return;
-        if (isAutoMixEnabled) startCrossfade((currentTrackIndex - 1 + playlistRef.length) % playlistRef.length, settings.autoMix.btnDuration);
-        else { currentTrackIndex = (currentTrackIndex - 1 + playlistRef.length) % playlistRef.length; loadTrack(currentTrackIndex).then(playTrack); }
+        if (state.isCrossfadeInProgress) return;
+        if (state.isAutoMixEnabled) startCrossfade((state.currentTrackIndex - 1 + playlistRef.length) % playlistRef.length, settings.autoMix.btnDuration);
+        else loadTrack((state.currentTrackIndex - 1 + playlistRef.length) % playlistRef.length).then(playTrack);
     });
     
     if (tempoSlider) {
         tempoSlider.addEventListener('input', (e) => {
             let val = parseFloat(e.target.value);
-            
-            // MAGNETIC SNAP TO 1.0
-            if (Math.abs(val - 1.0) < 0.05) {
-                val = 1.0;
-                tempoSlider.value = 1.0; // Visual snap
-            }
-
-            playerAudio.playbackRate = val;
+            if (Math.abs(val - 1.0) < 0.05) { val = 1.0; tempoSlider.value = 1.0; }
+            engine.main.audio.playbackRate = val;
             if (tempoVal) {
-                let displayBPM = "---";
-                if (masterBPM > 0) displayBPM = Math.round(masterBPM * val);
+                const displayBPM = state.masterBPM > 0 ? Math.round(state.masterBPM * val) : "---";
                 tempoVal.innerText = `SPEED: ${Math.round(val * 100)}% (BPM: ${displayBPM})`;
             }
         });
+    }
+
+    if (playPauseBtn) playPauseBtn.onclick = () => {
+        if (state.isCrossfadeInProgress) return;
+        state.isPlaying ? pauseTrack() : playTrack();
+    };
+    if (stopBtn) stopBtn.onclick = stopPlayback;
+    if (autoMixBtn) autoMixBtn.onclick = toggleAutoMix;
+    
+    // Master Volume linking
+    const masterVol = document.getElementById('masterVol');
+    if (masterVol) {
+        masterVol.oninput = () => {
+            const val = parseFloat(masterVol.value);
+            engine.main.gain.gain.value = 1.0; // Audio node internal
+            import('./audio.js').then(a => a.masterGain.gain.value = val);
+            if (volKnob) {
+                volKnob.innerText = Math.round(val * 100) + '%';
+                volKnob.style.left = `calc(22.5px + (100% - 45px) * ${val})`;
+            }
+        };
     }
 }
 
@@ -552,3 +397,6 @@ function formatTime(seconds) {
     const s = Math.floor(seconds % 60);
     return `${m}:${s.toString().padStart(2, '0')}`;
 }
+
+// Export for confirm usage in other modules
+export { showConfirm };

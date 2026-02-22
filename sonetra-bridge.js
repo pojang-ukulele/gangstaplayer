@@ -14,12 +14,29 @@ class SonetraBridge {
         this.serverHost = 'localhost';
         this.isRunning = false;
         this.sonetraPath = null;
+        this.config = this._loadConfig();
+    }
+
+    _loadConfig() {
+        try {
+            const configPath = path.join(__dirname, 'config.json');
+            if (fs.existsSync(configPath)) {
+                return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+            }
+        } catch (e) {
+            console.error('[Sonetra] Failed to load config.json', e);
+        }
+        return {};
     }
 
     /**
      * Find the Sonetra directory path
      */
     _findSonetraPath() {
+        if (this.config.sonetraPath && fs.existsSync(this.config.sonetraPath)) {
+            return this.config.sonetraPath;
+        }
+
         const possiblePaths = [
             path.join(__dirname, 'Sonetra-AI-Mixer-main'),
             path.join(process.resourcesPath || '', 'Sonetra-AI-Mixer-main'),
@@ -66,14 +83,19 @@ class SonetraBridge {
                 path.join(__dirname, 'python', 'python.exe'),
             ];
             
-            let pythonCmd = null;
-            
+            if (this.config.pythonPath && fs.existsSync(this.config.pythonPath)) {
+                pythonCmd = this.config.pythonPath;
+                console.log(`[Sonetra] Using config Python: ${pythonCmd}`);
+            }
+
             // Check venv first
-            for (const p of venvPythonPaths) {
-                if (fs.existsSync(p)) {
-                    pythonCmd = p;
-                    console.log(`[Sonetra] Using venv Python: ${p}`);
-                    break;
+            if (!pythonCmd) {
+                for (const p of venvPythonPaths) {
+                    if (fs.existsSync(p)) {
+                        pythonCmd = p;
+                        console.log(`[Sonetra] Using venv Python: ${p}`);
+                        break;
+                    }
                 }
             }
             
@@ -111,7 +133,7 @@ class SonetraBridge {
             try {
                 this.serverProcess = spawn(pythonCmd, args, {
                     cwd: srcPath,
-                    shell: true,
+                    shell: false,
                     stdio: ['pipe', 'pipe', 'pipe'],
                     env: { ...process.env, PYTHONUNBUFFERED: '1' }
                 });

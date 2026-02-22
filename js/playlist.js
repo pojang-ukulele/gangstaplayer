@@ -1,10 +1,7 @@
-// === PLAYLIST MODULE ===
 import { DRAG_THRESHOLD_PX } from './constants.js';
 import { audioCtx } from './audio.js';
-import { detectBPM } from './player.js';
-
-export let playlist = [];
-export let selectedIndices = [];
+import { detectBPMWorker } from './worker-client.js';
+import { state } from './state.js';
 let anchorIndex = -1;
 let pivotIndex = -1; // Start of selection range
 let draggedIndex = -1;
@@ -18,20 +15,17 @@ let contextMenu = null;
 
 let loadTrackFn = null;
 let playTrackFn = null;
-let currentTrackIndexRef = { value: 0 };
-let blendingIndex = -1; 
 
 export function initPlaylist(deps) {
     loadTrackFn = deps.loadTrack;
     playTrackFn = deps.playTrack;
-    currentTrackIndexRef = deps.currentTrackIndexRef;
     playlistEl = document.getElementById('playlist');
     playlistInput = document.getElementById('playlistInput');
     contextMenu = document.getElementById('contextMenu');
 }
 
 export function setBlendingIndex(index) {
-    blendingIndex = index;
+    state.update({ blendingIndex: index });
     renderPlaylist();
 }
 
@@ -43,7 +37,7 @@ async function analyzeTrackInBackground(track) {
         const response = await fetch(track.url);
         const arrayBuffer = await response.arrayBuffer();
         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-        const bpm = detectBPM(audioBuffer);
+        const bpm = await detectBPMWorker(audioBuffer);
         track.bpm = bpm; 
         renderPlaylist();
     } catch (e) {
@@ -53,22 +47,26 @@ async function analyzeTrackInBackground(track) {
 }
 
 export function addTracksToPlaylist(files) {
-    const startIdx = playlist.length;
-    files.forEach((file, i) => {
+    const currentPlaylist = [...state.playlist];
+    const startIdx = currentPlaylist.length;
+    files.forEach((file) => {
         const track = { 
             name: file.name, 
             url: URL.createObjectURL(file),
             bpm: null 
         };
-        playlist.push(track);
+        currentPlaylist.push(track);
         analyzeTrackInBackground(track);
     });
 
+    state.update({ playlist: currentPlaylist });
     renderPlaylist();
-    if (startIdx === 0 && playlist.length > 0 && loadTrackFn) {
+    if (startIdx === 0 && state.playlist.length > 0 && loadTrackFn) {
         loadTrackFn(0);
         // Auto select first
-        selectedIndices = [0];
+        state.update({
+            selectedIndices: [0]
+        });
         anchorIndex = 0;
         pivotIndex = 0;
         renderPlaylist();
@@ -78,7 +76,7 @@ export function addTracksToPlaylist(files) {
 export function renderPlaylist() {
     if (!playlistEl) return;
     playlistEl.innerHTML = '';
-    playlist.forEach((track, index) => {
+    state.playlist.forEach((track, index) => {
         const li = document.createElement('li');
         
         let bpmSuffix = " [...]";
@@ -87,34 +85,37 @@ export function renderPlaylist() {
         }
         
         let blendSuffix = "";
-        if (index === blendingIndex) {
+        if (index === state.blendingIndex) {
             blendSuffix = " [MIXING IN...]";
             li.classList.add('blending');
         }
 
         li.innerText = track.name + bpmSuffix + blendSuffix;
         
-        if (selectedIndices.includes(index)) li.classList.add('selected');
-        if (index === currentTrackIndexRef.value) li.classList.add('playing');
+        if (state.selectedIndices.includes(index)) li.classList.add('selected');
+        if (index === state.currentTrackIndex) li.classList.add('playing');
         
         li.addEventListener('click', (e) => {
             e.stopPropagation(); // Prevent background click from deselecting
             
+            const currentSelected = [...state.selectedIndices];
             if (e.ctrlKey || e.metaKey) {
-                const i = selectedIndices.indexOf(index);
-                if (i !== -1) selectedIndices.splice(i, 1); 
-                else selectedIndices.push(index);
+                const i = currentSelected.indexOf(index);
+                if (i !== -1) currentSelected.splice(i, 1); 
+                else currentSelected.push(index);
                 anchorIndex = index;
                 pivotIndex = index;
+                state.update({ selectedIndices: currentSelected });
             } else if (e.shiftKey) {
                 if (pivotIndex === -1) pivotIndex = anchorIndex !== -1 ? anchorIndex : index;
                 
                 const s = Math.min(pivotIndex, index);
                 const e_ = Math.max(pivotIndex, index);
-                selectedIndices = Array.from({length: e_ - s + 1}, (_, i) => s + i);
+                const range = Array.from({length: e_ - s + 1}, (_, i) => s + i);
+                state.update({ selectedIndices: range });
                 anchorIndex = index;
             } else {
-                selectedIndices = [index];
+                state.update({ selectedIndices: [index] });
                 anchorIndex = index;
                 pivotIndex = index;
             }
@@ -142,8 +143,8 @@ export function renderPlaylist() {
              e.preventDefault();
              e.stopPropagation();
              // 1. Select if not selected
-             if (!selectedIndices.includes(index)) {
-                 selectedIndices = [index];
+             if (!state.selectedIndices.includes(index)) {
+                 state.update({ selectedIndices: [index] });
                  anchorIndex = index;
                  pivotIndex = index;
                  renderPlaylist();
@@ -176,7 +177,7 @@ export function renderPlaylist() {
 
 // === NEW: KEYBOARD NAVIGATION ===
 export function handlePlaylistNavigation(e) {
-    if (!playlist.length) return;
+    if (!state.playlist.length) return;
     
     // Ensure valid anchor/pivot if coming from empty state
     if (anchorIndex === -1) anchorIndex = 0;
@@ -188,12 +189,12 @@ export function handlePlaylistNavigation(e) {
     if (e.key === 'ArrowUp') {
         e.preventDefault();
         newAnchor = Math.max(0, anchorIndex - 1);
-        if (anchorIndex === -1 && playlist.length > 0) newAnchor = playlist.length - 1; 
+        if (anchorIndex === -1 && state.playlist.length > 0) newAnchor = state.playlist.length - 1; 
     } else if (e.key === 'ArrowDown') {
         e.preventDefault();
-        newAnchor = Math.min(playlist.length - 1, anchorIndex + 1);
+        newAnchor = Math.min(state.playlist.length - 1, anchorIndex + 1);
     } else if (e.key === 'Delete' || e.key === 'Backspace') {
-         if (selectedIndices.length > 0) {
+         if (state.selectedIndices.length > 0) {
              e.preventDefault();
              removeSelectedTracks();
          }
@@ -208,10 +209,11 @@ export function handlePlaylistNavigation(e) {
         // Range Selection: pivot -> newAnchor
         const s = Math.min(pivotIndex, newAnchor);
         const e_ = Math.max(pivotIndex, newAnchor);
-        selectedIndices = Array.from({length: e_ - s + 1}, (_, i) => s + i);
+        const range = Array.from({length: e_ - s + 1}, (_, i) => s + i);
+        state.update({ selectedIndices: range });
     } else {
         // Single Selection
-        selectedIndices = [newAnchor];
+        state.update({ selectedIndices: [newAnchor] });
         pivotIndex = newAnchor;
     }
     
@@ -223,32 +225,39 @@ export function handlePlaylistNavigation(e) {
 }
 
 export function removeSelectedTracks() {
-    if (!selectedIndices.length) return;
+    if (!state.selectedIndices.length) return;
+    
+    const currentPlaylist = [...state.playlist];
+    const currentSelected = [...state.selectedIndices];
     
     // Sort descending to remove safe
-    selectedIndices.sort((a, b) => b - a);
+    currentSelected.sort((a, b) => b - a);
     
-    let isPlayingRemoved = false;
-    
-    selectedIndices.forEach(idx => {
-        if (idx === currentTrackIndexRef.value) isPlayingRemoved = true;
-        playlist.splice(idx, 1);
+    currentSelected.forEach(idx => {
+        currentPlaylist.splice(idx, 1);
     });
     
-    selectedIndices = [];
-    anchorIndex = Math.min(anchorIndex, playlist.length - 1);
-    pivotIndex = anchorIndex; 
+    let newAnchor = Math.min(anchorIndex, currentPlaylist.length - 1);
+    let newPivot = newAnchor; 
 
-    if (anchorIndex < 0 && playlist.length > 0) {
-        anchorIndex = 0;
-        pivotIndex = 0;
+    const newSelected = [];
+    if (newAnchor >= 0 && currentPlaylist.length > 0) {
+        newSelected.push(newAnchor);
+    } else if (currentPlaylist.length > 0) {
+        newAnchor = 0;
+        newPivot = 0;
+        newSelected.push(0);
+    } else {
+        newAnchor = -1;
+        newPivot = -1;
     }
     
-    if (playlist.length > 0) selectedIndices = [anchorIndex];
-    else {
-        anchorIndex = -1;
-        pivotIndex = -1;
-    }
+    anchorIndex = newAnchor;
+    pivotIndex = newPivot;
+    state.update({ 
+        playlist: currentPlaylist, 
+        selectedIndices: newSelected 
+    });
     
     renderPlaylist();
 }
@@ -266,10 +275,32 @@ export function setupPlaylistHandlers() {
         playlistEl.addEventListener('click', (e) => {
             // Only if directly clicking the container (empty space)
             if (e.target === playlistEl) {
-                selectedIndices = [];
+                state.update({ selectedIndices: [] });
                 pivotIndex = -1;
                 anchorIndex = -1;
                 renderPlaylist();
+            }
+        });
+
+        // DRAG & DROP
+        playlistEl.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            playlistEl.classList.add('drag-over');
+        });
+
+        playlistEl.addEventListener('dragleave', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            playlistEl.classList.remove('drag-over');
+        });
+
+        playlistEl.addEventListener('drop', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            playlistEl.classList.remove('drag-over');
+            if (e.dataTransfer && e.dataTransfer.files.length > 0) {
+                addTracksToPlaylist(Array.from(e.dataTransfer.files));
             }
         });
     }
@@ -283,42 +314,41 @@ export function setupPlaylistHandlers() {
     const ctxPlay = document.getElementById('ctxPlay');
 
     if (ctxRemove) ctxRemove.addEventListener('click', () => {
-        // Use removeIndex if single click (or just use selection if multi)
-        // Usually context menu acts on selection if target IS in selection.
-        // Or if target is outside, it selects target first (which we implemented in contextmenu handler).
-        // So relying on 'selectedIndices' is robust.
         removeSelectedTracks();
     });
 
     if (ctxMoveUp) ctxMoveUp.addEventListener('click', () => {
-        const e = { key: 'ArrowUp', shiftKey: false, preventDefault: () => {} }; // Simulating move logic? 
-        // No, ArrowUp changes SELECTION. We want to MOVE ITEMS.
-        // We lack specific moveUp logic export, but we can reuse the logic from render.js or implement here.
-        // Let's implement Move Up/Down simple logic here.
-        if (!selectedIndices.length) return;
-        const sorted = [...selectedIndices].sort((a,b) => a-b);
+        if (!state.selectedIndices.length) return;
+        const currentPlaylist = [...state.playlist];
+        const sorted = [...state.selectedIndices].sort((a,b) => a-b);
         if (sorted[0] > 0) {
-            // Swap bubble up
             sorted.forEach(idx => {
-                const temp = playlist[idx];
-                playlist[idx] = playlist[idx-1];
-                playlist[idx-1] = temp;
+                const temp = currentPlaylist[idx];
+                currentPlaylist[idx] = currentPlaylist[idx-1];
+                currentPlaylist[idx-1] = temp;
             });
-            selectedIndices = sorted.map(i => i-1);
+            state.update({ 
+                playlist: currentPlaylist,
+                selectedIndices: sorted.map(i => i-1) 
+            });
             renderPlaylist();
         }
     });
 
     if (ctxMoveDown) ctxMoveDown.addEventListener('click', () => {
-        if (!selectedIndices.length) return;
-        const sorted = [...selectedIndices].sort((a,b) => b-a);
-        if (sorted[0] < playlist.length - 1) {
+        if (!state.selectedIndices.length) return;
+        const currentPlaylist = [...state.playlist];
+        const sorted = [...state.selectedIndices].sort((a,b) => b-a);
+        if (sorted[0] < currentPlaylist.length - 1) {
              sorted.forEach(idx => {
-                const temp = playlist[idx];
-                playlist[idx] = playlist[idx+1];
-                playlist[idx+1] = temp;
+                const temp = currentPlaylist[idx];
+                currentPlaylist[idx] = currentPlaylist[idx+1];
+                currentPlaylist[idx+1] = temp;
             });
-            selectedIndices = sorted.map(i => i+1);
+            state.update({ 
+                playlist: currentPlaylist,
+                selectedIndices: sorted.map(i => i+1) 
+            });
             renderPlaylist();
         }
     });

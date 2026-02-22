@@ -1,4 +1,7 @@
 // === SETTINGS MODULE ===
+import { toast } from './toast.js';
+import { showConfirm } from './player.js';
+
 const bridge = window.electronAPI;
 
 export const settings = {
@@ -132,7 +135,7 @@ export function setupSettingsHandlers() {
     const restoreBtn = document.getElementById('restoreDefaultsBtn');
     if (restoreBtn) {
         restoreBtn.addEventListener('click', () => {
-            if(confirm("Are you sure you want to restore default settings?")) {
+            showConfirm("RESTORE DEFAULTS?", "This will reset all your audio and Auto-Mix preferences.", () => {
                 settings.fullScreen = false;
                 settings.inputDevice = 'default';
                 settings.outputDevice = 'default';
@@ -147,8 +150,8 @@ export function setupSettingsHandlers() {
                 };
                 saveSettings();
                 applySettingsToUI();
-                alert("Settings restored to defaults.");
-            }
+                toast.success("SETTINGS RESTORED TO DEFAULTS");
+            });
         });
     }
 

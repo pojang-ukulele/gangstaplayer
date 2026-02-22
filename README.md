@@ -19,6 +19,7 @@ This is the ultimate **ghetto-tech sampler and tape deck** for the streets. **Ga
 
 ### 📼 TAPE DECK PLAYER
 
+- **Drag & Drop:** Drag audio files directly into the playlist to add them.
 - **Playlist System:** Load up your MP3s/WAVs and keep the vibe going.
 - **Multi-Select:** Hold `SHIFT` and press `↑/↓` (or Click) to select multiple tracks. Use `CTRL`+Click to toggle.
 - **Master Chopper & Screwer:** Use the global tempo slider to slow that track down. **Real-time screw.**

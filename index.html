@@ -118,7 +118,7 @@
                         <li><span class="key">DELETE</span> : Remove Track(s) from Playlist</li>
                         <li><span class="key">PAD KEYS</span> : Trigger Pad (Hold to Play)</li>
                         <li><span class="key">CTRL + PAD KEY</span> : Hold to Record (Input Audio)</li>
-                        <li style="margin-top: 10px; list-style: none;"><button id="btnOpenManual" class="btn btn-manual-txt" title="Open full manual in text editor" style="width: 100%;">OPEN FULL MANUAL (TXT)</button></li>
+                        <li class="mt-10 list-none"><button id="btnOpenManual" class="btn btn-manual-txt w-full" title="Open full manual in text editor">OPEN FULL MANUAL (TXT)</button></li>
                     </ul>
                 </div>
 
@@ -168,31 +168,6 @@
                 </select>
 
                 <div class="settings-checkbox-row">
-                    <style>
-                        /* Custom Gangsta Checkbox */
-                        .gangsta-check { display:none; }
-                        .gangsta-check + label {
-                            position: relative;
-                            padding-left: 30px;
-                            cursor: pointer;
-                            color: #aaa;
-                            font-family: inherit;
-                        }
-                        .gangsta-check + label::before {
-                            content:'';
-                            position:absolute;
-                            left:0; top:0;
-                            width:18px; height:18px;
-                            border: 2px solid #555;
-                            background: #111;
-                        }
-                        .gangsta-check:checked + label::before {
-                            background: var(--neon-purple);
-                            border-color: #fff;
-                            box-shadow: 0 0 5px var(--neon-purple);
-                        }
-                        .gangsta-check:checked + label { color:#fff; text-shadow:0 0 5px rgba(255,255,255,0.5); }
-                    </style>
                     <input type="checkbox" id="fullScreenToggle" class="gangsta-check">
                     <label for="fullScreenToggle">FULL SCREEN MODE</label>
                 </div>
@@ -298,6 +273,18 @@
 
     <!-- FOOTER CONTROLS -->
 
+
+    <!-- NEW: Confirmation Modal -->
+    <div id="confirmModal" class="modal">
+        <div class="modal-content modal-extra-small">
+            <h2 id="confirmTitle" class="modal-title">ARE YOU SURE?</h2>
+            <p id="confirmMessage" class="label-text mb-20 text-center"></p>
+            <div class="flex-row-gap justify-center">
+                <button id="confirmYes" class="btn btn-restore">YES</button>
+                <button id="confirmNo" class="btn automix-btn-full">NO</button>
+            </div>
+        </div>
+    </div>
 
     <!-- SCRIPTS -->
     <script type="module" src="js/main.js"></script>

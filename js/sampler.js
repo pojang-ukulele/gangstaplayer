@@ -1,6 +1,7 @@
 // === SAMPLER MODULE ===
 import { KEYBOARD_MAP, DEFAULT_PAD_VOLUME } from './constants.js';
 import { audioCtx, masterGain, resumeAudioContext } from './audio.js';
+import { toast } from './toast.js';
 
 export const padBuffers = {};
 export const padPaths = {};
@@ -52,7 +53,7 @@ export async function loadSampleFile(file, index) {
         padBuffers[index] = audioBuffer;
         padPaths[index] = file.name;
         updatePadVisuals(index, file.name);
-        if (detectBPMFn) padBPMs[index] = detectBPMFn(audioBuffer);
+        if (detectBPMFn) padBPMs[index] = await detectBPMFn(audioBuffer);
     } catch (e) { console.error("Sample load failed:", e); }
 }
 
@@ -64,7 +65,7 @@ export async function loadSampleFromPath(path, index) {
         padBuffers[index] = audioBuffer;
         padPaths[index] = path;
         updatePadVisuals(index, path);
-        if (detectBPMFn) padBPMs[index] = detectBPMFn(audioBuffer);
+        if (detectBPMFn) padBPMs[index] = await detectBPMFn(audioBuffer);
     } catch (e) { console.error("Sample load from path failed:", e); }
 }
 
@@ -143,6 +144,30 @@ export function createPadGrid() {
         recBtn.addEventListener('mouseleave', (e) => {
             e.stopPropagation();
             stopRecording(i);
+        });
+
+        // DRAG & DROP
+        pad.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            pad.classList.add('drag-over');
+        });
+
+        pad.addEventListener('dragleave', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            pad.classList.remove('drag-over');
+        });
+
+        pad.addEventListener('drop', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            pad.classList.remove('drag-over');
+            if (e.dataTransfer && e.dataTransfer.files.length > 0) {
+                // Load the dropped file
+                const file = e.dataTransfer.files[0];
+                loadSampleFile(file, i);
+            }
         });
 
         const volSlider = document.createElement('input');
@@ -229,7 +254,7 @@ async function startRecording(index) {
 
     } catch (e) {
         console.error("Recording failed", e);
-        alert("Could not start recording: " + e.message);
+        toast.error("COULD NOT START RECORDING");
     }
 }
 
@@ -271,10 +296,10 @@ async function saveKit() {
         }
         
         await fsBridgeRef.saveFile(path, JSON.stringify(kit, null, 2));
-        alert("Kit Saved!");
+        toast.success("KIT SAVED");
     } catch (err) {
         console.error("Save Kit Failed", err);
-        alert("Failed to save kit: " + err.message);
+        toast.error("FAILED TO SAVE KIT");
     }
 }
 
@@ -309,6 +334,6 @@ async function loadKitDialog() {
         }
     } catch (err) {
         console.error("Load Kit Failed", err);
-        alert("Failed to load kit: " + err.message);
+        toast.error("FAILED TO LOAD KIT");
     }
 }

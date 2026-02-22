@@ -87,21 +87,29 @@ function masterLoop() {
     const AVG_THRESHOLD = 2;
 
     if (totalAvg > AVG_THRESHOLD) {
+        // Only update visualizer bars every frame
         const step = Math.floor(dataArray.length / 16);
-        visualizerBars.forEach((bar, i) => {
+        for (let i = 0; i < 16; i++) {
             const value = dataArray[i * step];
-            bar.style.height = Math.max(5, (value / 255) * 100) + '%';
-        });
+            visualizerBars[i].style.height = Math.max(5, (value / 255) * 100) + '%';
+        }
 
-        let bassSum = 0, midSum = 0, highSum = 0;
-        for (let i = 0; i < 5; i++) bassSum += dataArray[i];
-        for (let i = 10; i < 30; i++) midSum += dataArray[i];
-        for (let i = 80; i < 120; i++) highSum += dataArray[i];
+        // Only run heavy LED logic every 2nd frame or so (optimization)
+        if (scannerIndex % 2 === 0) {
+            let bassSum = 0, midSum = 0, highSum = 0;
+            for (let i = 0; i < 5; i++) bassSum += dataArray[i];
+            for (let i = 10; i < 30; i++) midSum += dataArray[i];
+            for (let i = 80; i < 120; i++) highSum += dataArray[i];
 
-        leds.forEach(l => l.classList.remove('lit'));
-        if ((bassSum / 5) > BASS_THRESHOLD) { if(leds[0]) leds[0].classList.add('lit'); if(leds[5]) leds[5].classList.add('lit'); }
-        if ((midSum / 20) > MID_THRESHOLD) { if(leds[1]) leds[1].classList.add('lit'); if(leds[4]) leds[4].classList.add('lit'); }
-        if ((highSum / 40) > HIGH_THRESHOLD) { if(leds[2]) leds[2].classList.add('lit'); if(leds[3]) leds[3].classList.add('lit'); }
+            if (leds.length >= 6) {
+                leds[0].classList.toggle('lit', (bassSum / 5) > BASS_THRESHOLD);
+                leds[5].classList.toggle('lit', (bassSum / 5) > BASS_THRESHOLD);
+                leds[1].classList.toggle('lit', (midSum / 20) > MID_THRESHOLD);
+                leds[4].classList.toggle('lit', (midSum / 20) > MID_THRESHOLD);
+                leds[2].classList.toggle('lit', (highSum / 40) > HIGH_THRESHOLD);
+                leds[3].classList.toggle('lit', (highSum / 40) > HIGH_THRESHOLD);
+            }
+        }
     } else {
         visualizerBars.forEach(bar => bar.style.height = '5%');
         const now = performance.now();
@@ -120,7 +128,7 @@ function masterLoop() {
 export function playStartupSound() {
     console.log("[Visuals] Triggering startup sound...");
     resumeAudioContext().then(() => {
-        fetch('gun-load.wav')
+        fetch('assets/gun-load.wav')
             .then(response => response.arrayBuffer())
             .then(arrayBuffer => audioCtx.decodeAudioData(arrayBuffer))
             .then(audioBuffer => {

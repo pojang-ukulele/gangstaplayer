@@ -9,20 +9,23 @@ import {
     startPad, stopPad, loadSampleFile, loadSampleFromPath, toggleSync,
     padBuffers, activeVoices, padVolumes, padSyncState
 } from './sampler.js';
-import { 
-    initPlayer, setupPlayerHandlers, loadTrack, playTrack, pauseTrack, 
-    detectBPM, getMasterBPMRef, getTempoSlider, setAutoMixEnabled,
-    playerAudio, currentTrackIndex, stopPlayback
+import { initPlayer, setupPlayerHandlers, loadTrack, playTrack, pauseTrack, 
+    getMasterBPMRef, getTempoSlider, setAutoMixEnabled,
+    getPlayerAudio, stopPlayback
 } from './player.js';
-import { initPlaylist, setupPlaylistHandlers, renderPlaylist, playlist, setBlendingIndex, handlePlaylistNavigation } from './playlist.js';
+import { detectBPMWorker } from './worker-client.js';
+import { initPlaylist, setupPlaylistHandlers, renderPlaylist, setBlendingIndex, handlePlaylistNavigation } from './playlist.js';
 import { initSettings, setupSettingsHandlers, loadSettings } from './settings.js';
 import { initVisuals, playStartupSound } from './visuals.js';
+import { state } from './state.js';
+import { toast } from './toast.js';
 
 const bridge = window.electronAPI;
 const fsBridge = window.fileSystem;
 
 async function initApp() {
     console.log('[GANGSTA PLAYER PRO 3] Initializing Modules...');
+    applyPlatformStyles();
     
     // Window Controls
     const minBtn = document.getElementById('minBtn');
@@ -33,21 +36,21 @@ async function initApp() {
     if (closeBtn) closeBtn.addEventListener('click', () => bridge.close());
 
     initSampler({
-        fsBridge, bridge, detectBPM,
+        fsBridge, bridge, 
+        detectBPM: detectBPMWorker,
         masterBPMRef: getMasterBPMRef(),
         tempoSlider: getTempoSlider()
     });
 
-    initPlayer({ playlist, renderPlaylist, setBlendingIndex });
+    initPlayer({ renderPlaylist, setBlendingIndex });
 
     initPlaylist({
-        loadTrack, playTrack,
-        currentTrackIndexRef: { get value() { return currentTrackIndex; } }
+        loadTrack, playTrack
     });
 
     initMIDI({ startPad, stopPad, activeVoices, padVolumes });
 
-    initSettings({ bridge, playerAudio, setAutoMixEnabled });
+    initSettings({ bridge, playerAudio: getPlayerAudio(), setAutoMixEnabled });
 
     // Initialize UI components
     createPadGrid();
@@ -181,14 +184,14 @@ async function initApp() {
                         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
                         
                         // 3. Convert PCM to valid seekable WAV Blob
-                        const wavBlob = bufferToWave(audioBuffer);
+                        const wavBlob = await bufferToWave(audioBuffer);
                         const wavBuffer = await wavBlob.arrayBuffer();
 
                         // 4. Save
                         const path = await bridge.saveAudioDialog();
                         if (path) {
                              await fsBridge.saveFile(path, new Uint8Array(wavBuffer));
-                             alert("Recording Saved!");
+                             toast.success("RECORDING SAVED TO DISK");
                         }
                         
                         recBtn.classList.remove('recording');
@@ -342,6 +345,12 @@ async function initApp() {
         });
     }
 
+    // React to state changes
+    state.subscribe(() => {
+        // Many UI updates are already handled by direct calls in modules, 
+        // but this is where we'd add cross-module sync if needed.
+    });
+
 
     // Global Click Handler (Update existing one to include loopContextMenu)
     document.addEventListener('click', () => {
@@ -365,7 +374,19 @@ async function initApp() {
     });
 
 if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', initApp);
+    
+function applyPlatformStyles() {
+    // Apply Electron-specific styles programmatically to avoid CSS linter warnings
+    const style = document.createElement('style');
+    style.textContent = `
+        .title-bar { -webkit-app-region: drag; }
+        .window-controls, .kit-controls { -webkit-app-region: no-drag; }
+        * { -webkit-user-drag: none; }
+    `;
+    document.head.appendChild(style);
+}
+
+document.addEventListener('DOMContentLoaded', initApp);
 } else {
     initApp();
 

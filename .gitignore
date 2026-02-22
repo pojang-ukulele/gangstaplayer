@@ -6,11 +6,30 @@ dist/
 app-build/
 release/
 build/
+dist_source/
 
-# Logs
+# Logs & Data
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+recordings/
+logs/
+
+# Local Overrides
+config.json
+
+# Python / Sonetra
+venv/
+.venv/
+__pycache__/
+*.pyc
+python/
+python-embed/
+
+# Media/Binaries (Use assets/ for tracked ones)
+*.wav
+*.mp3
+!assets/
 
 # OS Files
 .DS_Store
@@ -27,3 +46,6 @@ Desktop.ini
 .idea/
 *.swp
 *.swo
+
+# Binaries
+*.exe

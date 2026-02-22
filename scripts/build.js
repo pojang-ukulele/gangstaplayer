@@ -47,14 +47,23 @@ async function build() {
         'index.html',
         'styles.css',
         'icon.png',
-        'preload.js', // Forgot this in check!
+        'preload.js',
         'package.json',
-        'sonetra-bridge.js', // Optional bridge
-        'gun-load.wav',
-        'wallpaper.jpg',
-        'README.txt'
+        'sonetra-bridge.js'
     ];
 
+    // Copy Assets from root + the assets directory
+    if (!fs.existsSync(path.join(BUILD_DIR, 'assets'))) {
+        fs.mkdirSync(path.join(BUILD_DIR, 'assets'));
+    }
+
+    const assetsDir = 'assets';
+    if (fs.existsSync(assetsDir)) {
+        const assets = fs.readdirSync(assetsDir);
+        for (const asset of assets) {
+            fs.copyFileSync(path.join(assetsDir, asset), path.join(BUILD_DIR, 'assets', asset));
+        }
+    }
     for (const file of filesToCopy) {
         if (file === 'package.json') {
             // Special handling: Clean package.json
@@ -62,10 +71,6 @@ async function build() {
             delete pkg.build;
             delete pkg.scripts;
             delete pkg.devDependencies;
-            // Optionally keep dependencies if they are native, but we bundled everything?
-            // If native modules exist, we need them. 'webmidi' is JS.
-            // Safe to keep 'dependencies' just in case or empty it if we are sure.
-            // Let's keep dependencies for now but strip build config.
             fs.writeFileSync(path.join(BUILD_DIR, 'package.json'), JSON.stringify(pkg, null, 2));
             continue;
         }
