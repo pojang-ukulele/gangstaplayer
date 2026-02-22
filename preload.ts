@@ -18,7 +18,9 @@ contextBridge.exposeInMainWorld('fileSystem', {
   saveFile: (path: string, data: Uint8Array) => ipcRenderer.invoke('fs:save-file', path, data),
   readFile: (path: string) => ipcRenderer.invoke('fs:read-file', path),
   ensureRecordingsDir: () => ipcRenderer.invoke('fs:ensure-recordings-dir'),
-  saveRecording: (buffer: ArrayBuffer, filename: string) => ipcRenderer.invoke('fs:save-recording', buffer, filename)
+  saveRecording: (buffer: ArrayBuffer, filename: string) => ipcRenderer.invoke('fs:save-recording', buffer, filename),
+  appendLog: (level: string, message: string) => ipcRenderer.invoke('fs:append-log', level, message),
+  getLogPath: () => ipcRenderer.invoke('fs:get-log-path')
 });
 
 // Sonetra AI Mixer Bridge

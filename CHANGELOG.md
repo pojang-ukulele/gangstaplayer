@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## [v4.4.0] - 2026-02-23 - "Black Box Recorder"
+
+### 📜 Persistent Diagnostic Logging
+
+- **Local Disk Logger**: Created a dedicated `GangstaLogger` that writes categorized logs (INFO, WARN, ERROR, DEBUG) to a local file in the user's AppData folder.
+- **Diagnostic Trace**: Integrated the logger into the Player and Main modules to track track-loading events, BPM analysis results, and initialization sequences.
+- **Simplified Debugging**: Users can now provide `gangsta_log.txt` for rapid problem resolution.
+- **IPC bridge**: Optimized `main.ts` and `preload.ts` to support high-throughput log appending with minimal main-thread blocking.
+
 ## [v4.3.0] - 2026-02-23 - "Reactive Pulse"
 
 ### 🔄 State Engine Overhaul

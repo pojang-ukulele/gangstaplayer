@@ -126,6 +126,25 @@ function createWindow() {
     return recPath;
   });
 
+  // Persistent Logging Handlers
+  ipcMain.handle('fs:append-log', async (_event, level: string, message: string) => {
+    try {
+      const userDataPath = app.getPath('userData');
+      const logPath = path.join(userDataPath, 'gangsta_log.txt');
+      const timestamp = new Date().toISOString();
+      const logEntry = `[${timestamp}] [${level.toUpperCase()}] ${message}\n`;
+      fs.appendFileSync(logPath, logEntry);
+      return true;
+    } catch (e) {
+      console.error('Failed to write log', e);
+      return false;
+    }
+  });
+
+  ipcMain.handle('fs:get-log-path', async () => {
+    return path.join(app.getPath('userData'), 'gangsta_log.txt');
+  });
+
   ipcMain.handle('dialog:open-sample', async () => {
     const { canceled, filePaths } = await dialog.showOpenDialog(win, {
       title: 'Load Audio Sample',

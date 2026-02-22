@@ -20,6 +20,7 @@ import { initVisuals, playStartupSound } from './visuals';
 import { engine } from './audio-engine';
 import { state } from './state';
 import { toast } from './toast';
+import { logger } from './logger';
 
 declare global {
     interface Window {
@@ -32,7 +33,7 @@ const bridge = window.electronAPI;
 const fsBridge = window.fileSystem;
 
 async function initApp() {
-    console.log('[GANGSTA PLAYER PRO 3] Initializing Modules...');
+    logger.info('[MAIN] Initializing Gangsta Player Pro 3 Core...');
     applyPlatformStyles();
     
     // Initialize Worklets first

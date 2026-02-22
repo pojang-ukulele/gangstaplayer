@@ -6,6 +6,7 @@ import { state, Track, PlaybackMode, LoopMode } from './state';
 import { detectBPMWorker } from './worker-client';
 import { toast } from './toast';
 import { engine } from './audio-engine';
+import { logger } from './logger';
 
 interface PlayerDeps {
     playlist: Track[];
@@ -150,6 +151,7 @@ export async function loadTrack(index: number): Promise<void> {
     if (renderPlaylistFn) renderPlaylistFn();
     
     engine.main.reset();
+    logger.info(`[Player] Loading track: ${track.name} [ID: ${track.id}]`);
     const safeUrl = await getSafeUrl(track.path, true);
     engine.main.load(safeUrl);
     engine.main.audio.playbackRate = tempoSlider ? parseFloat(tempoSlider.value) : 1;
@@ -172,8 +174,9 @@ export async function loadTrack(index: number): Promise<void> {
                 const bpmTxt = state.masterBPM > 0 ? `[${state.masterBPM} BPM]` : "[BPM: --]";
                 trackTitle.innerText = `${track.name} ${bpmTxt}`;
             }
+            logger.info(`[Player] Analysis finished for ${track.name}: ${detectedValue} BPM`);
         } catch (e) {
-            console.error("[Player] Analysis failed", e);
+            logger.error("[Player] BPM Analysis failed", e);
             toast.error("BPM ANALYSIS FAILED");
             track.bpm = 0;
             if (trackTitle && state.currentTrackIndex === index) {
