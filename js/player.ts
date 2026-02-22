@@ -17,23 +17,38 @@ interface PlayerDeps {
 let mainBlobUrl: string = "";
 let crossfadeBlobUrl: string = "";
 
+/**
+ * Revokes a Blob URL after a delay to ensure the browser has finished buffering.
+ * Prevents "Source Error" when skipping tracks rapidly.
+ */
+function revokeLater(url: string, delay = 5000): void {
+    if (!url || !url.startsWith('blob:')) return;
+    setTimeout(() => {
+        try {
+            URL.revokeObjectURL(url);
+            logger.debug(`[Player] Revoked stale URL: ${url}`);
+        } catch (e) {
+            // URL might already be revoked
+        }
+    }, delay);
+}
+
 async function getSafeUrl(filePath: string, isMain: boolean): Promise<string> {
     try {
         const rawData = await (window as any).fileSystem.readFile(filePath);
-        // We use blob for compatibility with HTMLAudioElement and webSecurity
         const blob = new Blob([rawData], { type: 'audio/mpeg' });
         const url = URL.createObjectURL(blob);
         
         if (isMain) {
-            if (mainBlobUrl) URL.revokeObjectURL(mainBlobUrl);
+            if (mainBlobUrl) revokeLater(mainBlobUrl);
             mainBlobUrl = url;
         } else {
-            if (crossfadeBlobUrl) URL.revokeObjectURL(crossfadeBlobUrl);
+            if (crossfadeBlobUrl) revokeLater(crossfadeBlobUrl);
             crossfadeBlobUrl = url;
         }
         return url;
     } catch (e) {
-        console.error("[SafeURL] Failed to create blob", e);
+        logger.error("[SafeURL] Failed to create blob", e);
         return filePath; // Fallback
     }
 }
@@ -281,11 +296,13 @@ function finishCrossfade(nextIndex: number): void {
     // PROMOTE channel
     engine.swapChannels();
     
-    // Swap tracked blob URLs
-    const tempUrl = mainBlobUrl;
+    // Swap tracked blob URLs safely
+    const oldMainUrl = mainBlobUrl; 
     mainBlobUrl = crossfadeBlobUrl;
-    crossfadeBlobUrl = ""; // Swapped channel had its src cleared in engine.swapChannels()
-    if (tempUrl) URL.revokeObjectURL(tempUrl);
+    crossfadeBlobUrl = ""; 
+    
+    // Nuking the old main only after it's definitely stopped and a new one is playing.
+    if (oldMainUrl) revokeLater(oldMainUrl, 3000);
 
     state.update({ currentTrackIndex: nextIndex, isCrossfadeInProgress: false });
     updateControlsLock(false);

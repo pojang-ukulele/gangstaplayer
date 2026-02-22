@@ -1,6 +1,6 @@
 /**
- * Gangsta AudioWorklet Processor
- * High-performance, low-latency DSP for real-time grit and character.
+ * Gangsta AudioWorklet Processor - Hardened Edition
+ * Features: Stereo isolation, Parameter smoothing, and Moog-Ladder DSP.
  */
 
 declare const sampleRate: number;
@@ -20,57 +20,67 @@ class GangstaProcessor extends AudioWorkletProcessor {
     ];
   }
 
-  private lowPassState = [0, 0, 0, 0]; // 4 stages for 24dB/oct
+  // Per-channel state to prevent stereo bleed
+  private stateL = [0, 0, 0, 0];
+  private stateR = [0, 0, 0, 0];
+  
+  // Smoothing values
+  private smoothCutoff = 20000;
+  private smoothDrive = 0;
+  private smoothBitDepth = 16;
+  private smoothingFactor = 0.05; // Adjust for responsiveness vs "zipper noise"
 
   process(inputs: Float32Array[][], outputs: Float32Array[][], parameters: Record<string, Float32Array>) {
     const input = inputs[0];
     const output = outputs[0];
+    if (!input || input.length === 0) return true;
 
-    // Get parameter values (taking first value of the block for efficiency)
-    const bitDepth = parameters.bitDepth[0];
-    const drive = parameters.drive[0];
-    const cutoff = parameters.filterCutoff[0];
+    // Targets for smoothing
+    const targetBitDepth = parameters.bitDepth[0];
+    const targetDrive = parameters.drive[0];
+    const targetCutoff = parameters.filterCutoff[0];
     const resonance = parameters.filterResonance[0];
 
-    // Pre-calculate filter coefficients (Simplified Moog-style)
-    const f = (cutoff / sampleRate) * 2;
-    const p = f * (1.8 - 0.8 * f);
-    const k = p + p - 1.0;
-    const t = (1.0 - p) * 1.386249;
-    const t2 = 12.0 + t * t;
-    const r = resonance * (t2 + 6.0 * t) / (t2 - 6.0 * t);
+    for (let i = 0; i < 128; i++) { // Worklets process in blocks of 128
+      // 1. Parameter Smoothing (per-sample)
+      this.smoothCutoff += (targetCutoff - this.smoothCutoff) * this.smoothingFactor;
+      this.smoothDrive += (targetDrive - this.smoothDrive) * this.smoothingFactor;
+      this.smoothBitDepth += (targetBitDepth - this.smoothBitDepth) * this.smoothingFactor;
 
-    for (let channel = 0; channel < input.length; channel++) {
-      const inputChannel = input[channel];
-      const outputChannel = output[channel];
+      // Filter Coeffs (Recalculate with smoothed values)
+      const f = (this.smoothCutoff / sampleRate) * 2;
+      const p = f * (1.8 - 0.8 * f);
+      const r = resonance * 4.0; // Resonance boost
 
-      for (let i = 0; i < inputChannel.length; i++) {
-        let x = inputChannel[i];
+      for (let channel = 0; channel < input.length; channel++) {
+        const chanIn = input[channel];
+        const chanOut = output[channel];
+        const lpState = channel === 0 ? this.stateL : this.stateR;
 
-        // 1. Bitcrusher
-        if (bitDepth < 16) {
-          const step = Math.pow(0.5, bitDepth);
+        let x = chanIn[i];
+
+        // --- STAGE 1: BITCRUSHER ---
+        if (this.smoothBitDepth < 15.5) {
+          const step = Math.pow(0.5, this.smoothBitDepth);
           x = Math.round(x / step) * step;
         }
 
-        // 2. Saturation (Soft Clipping)
-        if (drive > 0) {
-          const d = 1 + drive * 5;
+        // --- STAGE 2: SATURATION ---
+        if (this.smoothDrive > 0.01) {
+          const d = 1 + this.smoothDrive * 8;
           x = Math.tanh(x * d) / Math.tanh(d);
         }
 
-        // 3. 24dB Moog-ish Filter
-        // Note: For true stability and resonance, this needs a refined feedback loop
-        // This is a simplified version for performance
-        let y = x - r * this.lowPassState[3];
+        // --- STAGE 3: 24dB LADDER FILTER ---
+        // Simplified Moog-style with feedback
+        let y = x - r * lpState[3];
         
-        // 4 cascaded 1st order sections
-        this.lowPassState[0] = this.lowPassState[0] + f * (y - this.lowPassState[0]);
-        this.lowPassState[1] = this.lowPassState[1] + f * (this.lowPassState[0] - this.lowPassState[1]);
-        this.lowPassState[2] = this.lowPassState[2] + f * (this.lowPassState[1] - this.lowPassState[2]);
-        this.lowPassState[3] = this.lowPassState[3] + f * (this.lowPassState[2] - this.lowPassState[3]);
+        lpState[0] = lpState[0] + f * (y - lpState[0]);
+        lpState[1] = lpState[1] + f * (lpState[0] - lpState[1]);
+        lpState[2] = lpState[2] + f * (lpState[1] - lpState[2]);
+        lpState[3] = lpState[3] + f * (lpState[2] - lpState[3]);
 
-        outputChannel[i] = this.lowPassState[3];
+        chanOut[i] = lpState[3];
       }
     }
 

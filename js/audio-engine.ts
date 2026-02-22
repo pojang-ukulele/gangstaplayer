@@ -10,6 +10,7 @@ export class AudioChannel {
     hpFilter: BiquadFilterNode;
     source: MediaElementAudioSourceNode;
     workletNode: AudioWorkletNode | null = null;
+    private isWorkletConnected = false;
 
     constructor() {
         this.audio = new Audio();
@@ -27,6 +28,7 @@ export class AudioChannel {
         this.lpFilter.type = 'lowpass'; this.lpFilter.frequency.value = 20000;
         this.hpFilter.type = 'highpass'; this.hpFilter.frequency.value = 30;
 
+        // Base signal chain: Source -> EQ -> LP -> HP -> Gain -> Out
         this.source = audioCtx.createMediaElementSource(this.audio);
         this.source.connect(this.lowEQ);
         this.lowEQ.connect(this.midEQ);
@@ -35,18 +37,28 @@ export class AudioChannel {
         this.lpFilter.connect(this.hpFilter);
         this.hpFilter.connect(this.gain);
         this.gain.connect(masterGain);
+    }
 
-        // Try to initialize worklet if module is already loaded
+    /**
+     * Attempts to inject the Worklet into the signal chain safely.
+     * If it fails, the signal remains intact via the base chain.
+     */
+    initWorklet(): void {
+        if (this.isWorkletConnected) return;
+        
         try {
             this.workletNode = new AudioWorkletNode(audioCtx, 'gangsta-processor');
-            // Re-route chain through worklet
+            
+            // Safe re-routing
             this.hpFilter.disconnect(this.gain);
             this.hpFilter.connect(this.workletNode);
             this.workletNode.connect(this.gain);
-            console.log("[AudioEngine] Worklet connected to channel");
+            
+            this.isWorkletConnected = true;
+            console.log("[AudioChannel] Worklet injection successful");
         } catch (e) {
-            // Worklet module might not be loaded yet, we can retry later or ignore
-            console.warn("[AudioEngine] Worklet not ready yet or failed to load");
+            console.warn("[AudioChannel] Worklet injection deferred (node not ready)");
+            // Base chain is still connected, so audio will still play.
         }
     }
 
@@ -69,19 +81,6 @@ export class AudioChannel {
     load(url: string): void {
         this.audio.src = url;
     }
-
-    initWorklet(): void {
-        if (this.workletNode) return;
-        try {
-            this.workletNode = new AudioWorkletNode(audioCtx, 'gangsta-processor');
-            this.hpFilter.disconnect(this.gain);
-            this.hpFilter.connect(this.workletNode);
-            this.workletNode.connect(this.gain);
-            console.log("[AudioChannel] Worklet initialized");
-        } catch (e) {
-            console.warn("[AudioChannel] Worklet failed to initialize", e);
-        }
-    }
 }
 
 class AudioEngine {
@@ -91,22 +90,29 @@ class AudioEngine {
     constructor() {
         this.main = new AudioChannel();
         this.crossfade = new AudioChannel();
-        // Crossfade channel starts at 0 gain
         this.crossfade.gain.gain.value = 0.001;
     }
 
-    initWorklets(): void {
-        this.main.initWorklet();
-        this.crossfade.initWorklet();
+    /**
+     * Robust Worklet initialization with retry logic
+     */
+    async initWorklets(retries = 3): Promise<void> {
+        for (let i = 0; i < retries; i++) {
+            this.main.initWorklet();
+            this.crossfade.initWorklet();
+            
+            if ((this.main as any).isWorkletConnected) break;
+            
+            console.log(`[AudioEngine] Worklet init retry ${i+1}...`);
+            await new Promise(r => setTimeout(r, 100 * (i + 1)));
+        }
     }
 
     swapChannels(): void {
-        // Promote crossfade to main
         const temp = this.main;
         this.main = this.crossfade;
         this.crossfade = temp;
         
-        // Clean up now-background channel
         this.crossfade.audio.pause();
         this.crossfade.audio.src = "";
     }

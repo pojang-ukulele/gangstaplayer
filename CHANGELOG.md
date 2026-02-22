@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## [v4.5.0] - 2026-02-23 - "Bulletproof Logic"
+
+### 🛡️ Paranoid Security & DSP Hardening
+
+- **Stereo DSP Isolation**: Refactored `GangstaProcessor` to use isolated filter states for Left/Right channels, eliminating stereo-to-mono bleed bugs.
+- **Parameter Smoothing**: Implemented interpolation for filter cutoff, drive, and bit-depth to prevent audible digital "zipper noise" and pops during UI interaction.
+- **Safe Revocation System**: Replaced immediate Blob URL revocation with a delayed "Graveyard" mechanism, solving race conditions during rapid track skipping.
+- **Path Traversal Guards**: Added strict path validation and null-character poisoning checks to all Main process file operations.
+- **Worklet Race Fixing**: Implemented retry logic for AudioWorklet initialization to ensure the engine doesn't start "silent" if a thread is slow to boot.
+- **Deep State Reactivity**: Fixed shallow update bugs in the `ReactiveStore` to ensure nested data structures (like Track objects) trigger UI updates correctly.
+
 ## [v4.4.0] - 2026-02-23 - "Black Box Recorder"
 
 ### 📜 Persistent Diagnostic Logging

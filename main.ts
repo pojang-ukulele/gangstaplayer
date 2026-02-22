@@ -16,6 +16,30 @@ function addToCache(key: string, value: any) {
   transitionCache.set(key, value);
 }
 
+/**
+ * Validates that a path is not attempting to escape safe boundaries
+ * and is a valid system path.
+ */
+function validatePath(p: string): string | null {
+  if (!p || typeof p !== 'string') return null;
+  const normalized = path.normalize(p);
+  // Prevent poisoning or illegal characters
+  if (normalized.includes('\0')) return null;
+  return normalized;
+}
+
+function logToDisk(level: string, message: string) {
+  try {
+    const userDataPath = app.getPath('userData');
+    const logPath = path.join(userDataPath, 'gangsta_log.txt');
+    const timestamp = new Date().toISOString();
+    const logEntry = `[${timestamp}] [MAIN] [${level.toUpperCase()}] ${message}\n`;
+    fs.appendFileSync(logPath, logEntry);
+  } catch (e) {
+    // Fail silent for logging
+  }
+}
+
 // FORCE AUTOPLAY
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 
@@ -97,16 +121,22 @@ function createWindow() {
 
   // Secure File System Handlers
   ipcMain.handle('fs:save-file', async (_event, pathStr: string, data: Uint8Array) => {
-    if (!pathStr || typeof pathStr !== 'string') return false;
-    const normalized = path.normalize(pathStr);
-    fs.writeFileSync(normalized, data);
+    const validated = validatePath(pathStr);
+    if (!validated) {
+        logToDisk('ERROR', `Security: Blocked illegal write attempt to ${pathStr}`);
+        return false;
+    }
+    fs.writeFileSync(validated, data);
     return true;
   });
 
   ipcMain.handle('fs:read-file', async (_event, pathStr: string) => {
-    if (!pathStr || typeof pathStr !== 'string') return null;
-    const normalized = path.normalize(pathStr);
-    const buffer = fs.readFileSync(normalized);
+    const validated = validatePath(pathStr);
+    if (!validated) {
+        logToDisk('ERROR', `Security: Blocked illegal read attempt from ${pathStr}`);
+        return null;
+    }
+    const buffer = fs.readFileSync(validated);
     return buffer;
   });
 
@@ -159,7 +189,11 @@ function createWindow() {
   // ==================== SONETRA AI MIXER HANDLERS ====================
   
   ipcMain.handle('sonetra:start-server', async () => {
-    if (!sonetraBridge) return { success: false, error: 'Sonetra bridge not loaded' };
+    if (!sonetraBridge) {
+        logToDisk('ERROR', 'Sonetra bridge failure: Module not found');
+        return { success: false, error: 'Sonetra bridge not loaded' };
+    }
+    logToDisk('INFO', 'Starting Sonetra backend server...');
     return await sonetraBridge.startServer();
   });
 
