@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## [v4.6.2] - 2026-02-23 - "Buffer Alignment & Sampler Stability"
+
+### 🛡️ Sampler & Buffer Hardening
+
+- **Critical Buffer Fix**: Resolved a low-level Electron bug where passing the raw `.buffer` of an IPC-returned `Uint8Array` to `decodeAudioData` could cause random crashes or failures. Implementation now uses precise `ArrayBuffer` slicing (`byteOffset` / `byteLength`).
+- **Sampler Diagnostics**: Added comprehensive logging to the `Sampler` module to track pad loading events and capture failures in the persistent diagnostic trace.
+- **Null Guards**: Enhanced guards for security-blocked file operations to prevent null-dereference crashes in the renderer.
+- **Startup Recovery**: Updated the `npm start` script to correctly build and launch the application from the `app-build/` directory.
+
 ## [v4.6.0] - 2026-02-23 - "Master Fixer Status: ACTIVE"
 
 ### 🛡️ Final Hardening & Test Recovery

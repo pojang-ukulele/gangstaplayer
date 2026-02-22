@@ -1,7 +1,7 @@
-// === SAMPLER MODULE ===
 import { KEYBOARD_MAP, DEFAULT_PAD_VOLUME } from './constants';
 import { audioCtx, masterGain, resumeAudioContext } from './audio';
 import { toast } from './toast';
+import { logger } from './logger';
 
 interface SamplerDeps {
     fsBridge: any;
@@ -56,25 +56,46 @@ function updatePadVisuals(index: number, pathOrFile: string | { name: string }):
 
 export async function loadSampleFile(file: File, index: number): Promise<void> {
     try {
+        logger.info(`[Sampler] Loading file to pad ${index}: ${file.name}`);
         const arrayBuffer = await file.arrayBuffer();
         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
         padBuffers[index] = audioBuffer;
         padPaths[index] = file.name;
         updatePadVisuals(index, file.name);
-        if (detectBPMFn) padBPMs[index] = await detectBPMFn(audioBuffer);
-    } catch (e) { console.error("Sample load failed:", e); }
+        if (detectBPMFn) {
+            const bpm = await detectBPMFn(audioBuffer);
+            padBPMs[index] = bpm;
+            logger.info(`[Sampler] Pad ${index} BPM: ${bpm}`);
+        }
+    } catch (e) { 
+        logger.error(`[Sampler] Pad ${index} load failed:`, e);
+        toast.error("SAMPLE LOAD FAILED");
+    }
 }
 
 export async function loadSampleFromPath(path: string, index: number): Promise<void> {
     try {
+        logger.info(`[Sampler] Loading path to pad ${index}: ${path}`);
         const rawData = await fsBridgeRef.readFile(path);
-        const arrayBuffer = rawData.buffer || rawData;
+        if (!rawData) {
+            logger.error(`[Sampler] Read failed for path: ${path} (Check security guards)`);
+            return;
+        }
+        // CRITICAL FIX: Ensure we use a clean slice of the ArrayBuffer
+        const arrayBuffer = rawData.buffer.slice(rawData.byteOffset, rawData.byteOffset + rawData.byteLength);
         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
         padBuffers[index] = audioBuffer;
         padPaths[index] = path;
         updatePadVisuals(index, path);
-        if (detectBPMFn) padBPMs[index] = await detectBPMFn(audioBuffer);
-    } catch (e) { console.error("Sample load from path failed:", e); }
+        if (detectBPMFn) {
+            const bpm = await detectBPMFn(audioBuffer);
+            padBPMs[index] = bpm;
+            logger.info(`[Sampler] Pad ${index} BPM: ${bpm}`);
+        }
+    } catch (e) { 
+        logger.error(`[Sampler] Pad ${index} path load failed:`, e);
+        toast.error("SAMPLE LOAD FAILED");
+    }
 }
 
 export function startPad(index: number): void {

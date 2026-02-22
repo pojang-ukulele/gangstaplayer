@@ -46,7 +46,12 @@ export function setBlendingIndex(index: number): void {
 async function analyzeTrackInBackground(track: Track): Promise<void> {
     try {
         const rawData = await (window as any).fileSystem.readFile(track.path);
-        const arrayBuffer = rawData.buffer || rawData;
+        if (!rawData) {
+            console.warn(`[Playlist] Analysis skipped for ${track.name} (File unreadable)`);
+            return;
+        }
+        // CRITICAL FIX: Ensure we use a clean slice of the ArrayBuffer
+        const arrayBuffer = rawData.buffer.slice(rawData.byteOffset, rawData.byteOffset + rawData.byteLength);
         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
         const bpm = await detectBPMWorker(audioBuffer);
         track.bpm = bpm; 
