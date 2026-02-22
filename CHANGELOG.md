@@ -7,9 +7,10 @@
 - **Path Lockdown**: Sanitized IPC file handlers to prevent path traversal/remote access exploits.
 - **Strict Spawn**: Disabled shell-mode spawning for the Sonetra backend to block command injection.
 - **Cache Management**: Implemented LRU-style capacity limits for the Transition Cache (`MAX_CACHE_SIZE = 50`) to prevent memory leaks.
+- **Electron 40**: Bumped Electron to v40.6.0 for latest security patches and performance.
 - **Secure Sandbox**: Enabled `sandbox: true` in Electron webPreferences.
 - **Repo Hardening**: Performed pre-push audit; nuked duplicate `dist_source`, moved assets to `assets/` folder, and updated `.gitignore` to block local environments.
-- **License Clarity**: Formally set license to Proprietary in `package.json`.
+- **Open Source Migration**: Transitioned from Proprietary to MIT License.
 
 ### 🏗️ Architecture Redesign
 

@@ -157,11 +157,11 @@ To bundle into an installer:
 
 ## 📜 LICENSE & CREDITS
 
-**Gangsta Player Pro 3** is proprietary software. See the [LICENSE](LICENSE) file for full details.
+**Gangsta Player Pro 3** is open-source software licensed under the **MIT License**. See the [LICENSE](LICENSE) file for full details.
 
 ### Third-Party Software
 
-This software uses components from **Sonetra AI** (Sonetra-AI-Mixer), which is licensed under the **MIT License**.
+This software uses components from **Sonetra AI** (Sonetra-AI-Mixer), which is also licensed under the **MIT License**.
 
 > Copyright (c) Sonetra AI Contributors
 >

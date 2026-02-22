@@ -5,7 +5,7 @@
   "description": "Gangsta Player Pro 3 - The Ultimate Sampler",
   "main": "main.js",
   "author": "Gangsta Player Pro 3",
-  "license": "Proprietary",
+  "license": "MIT",
   "scripts": {
     "start": "electron .",
     "dist": "electron-builder",
@@ -18,7 +18,7 @@
     "webmidi": "^3.1.9"
   },
   "devDependencies": {
-    "electron": "^32.0.0",
+    "electron": "^40.6.0",
     "electron-builder": "^26.0.12",
     "esbuild": "^0.27.2",
     "jest": "^29.7.0",

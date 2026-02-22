@@ -32,7 +32,7 @@ jobs:
 
     - name: Build Windows Installer
       if: matrix.os == 'windows-latest'
-      run: npx electron-builder build --win --x64 --config.directories.app=app-build --config.electronVersion=32.0.0
+      run: npx electron-builder build --win --x64 --config.directories.app=app-build --config.electronVersion=40.6.0
 
     - name: Build Mac Universal Installer
       if: matrix.os == 'macos-latest'
