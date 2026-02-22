@@ -11,6 +11,7 @@
 - **Secure Sandbox**: Enabled `sandbox: true` in Electron webPreferences.
 - **Repo Hardening**: Performed pre-push audit; nuked duplicate `dist_source`, moved assets to `assets/` folder, and updated `.gitignore` to block local environments.
 - **Open Source Migration**: Transitioned from Proprietary to MIT License.
+- **Zero-Vulnerability Shield**: Fixed 33 high-severity vulnerabilities in transitive dependencies (`minimatch`, `glob`) using NPM Overrides without breaking core build tools.
 
 ### 🏗️ Architecture Redesign
 
