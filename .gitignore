@@ -9,6 +9,8 @@ build/
 release/
 *.asar
 *.asar.unpacked
+app-build/
+dist_source/
 
 # === Python / Sonetra ===
 __pycache__/
