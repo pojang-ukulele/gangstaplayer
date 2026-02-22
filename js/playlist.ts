@@ -27,11 +27,17 @@ export function initPlaylist(deps: PlaylistDeps): void {
     playlistEl = document.getElementById('playlist');
     playlistInput = document.getElementById('playlistInput') as HTMLInputElement;
     contextMenu = document.getElementById('contextMenu');
+
+    // === REACTIVE SUBSCRIPTIONS ===
+    const updateUI = () => renderPlaylist();
+    state.subscribe('playlist', updateUI);
+    state.subscribe('selectedIndices', updateUI);
+    state.subscribe('currentTrackIndex', updateUI);
+    state.subscribe('blendingIndex', updateUI);
 }
 
 export function setBlendingIndex(index: number): void {
     state.update({ blendingIndex: index });
-    renderPlaylist();
 }
 
 /**
@@ -44,10 +50,12 @@ async function analyzeTrackInBackground(track: Track): Promise<void> {
         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
         const bpm = await detectBPMWorker(audioBuffer);
         track.bpm = bpm; 
-        renderPlaylist();
+        // Trigger reactive update by re-setting playlist
+        state.update({ playlist: [...state.playlist] });
     } catch (e) {
         console.error(`[Playlist] Failed to analyze ${track.name}`, e);
         track.bpm = 0; 
+        state.update({ playlist: [...state.playlist] });
     }
 }
 
@@ -68,7 +76,7 @@ export function addTracksToPlaylist(files: File[]): void {
     });
 
     state.update({ playlist: currentPlaylist });
-    renderPlaylist();
+
     if (startIdx === 0 && state.playlist.length > 0 && loadTrackFn) {
         loadTrackFn(0);
         // Auto select first
@@ -77,7 +85,6 @@ export function addTracksToPlaylist(files: File[]): void {
         });
         anchorIndex = 0;
         pivotIndex = 0;
-        renderPlaylist();
     }
 }
 
@@ -155,7 +162,6 @@ export function renderPlaylist(): void {
                  state.update({ selectedIndices: [index] });
                  anchorIndex = index;
                  pivotIndex = index;
-                 renderPlaylist();
              }
              
              // 2. Show Menu
@@ -224,7 +230,6 @@ export function handlePlaylistNavigation(e: KeyboardEvent): void {
         pivotIndex = newAnchor;
     }
     
-    renderPlaylist();
     // Scroll into view
     if (playlistEl && playlistEl.children[anchorIndex]) {
         (playlistEl.children[anchorIndex] as HTMLElement).scrollIntoView({ block: 'nearest' });
@@ -265,8 +270,6 @@ export function removeSelectedTracks(): void {
         playlist: currentPlaylist, 
         selectedIndices: newSelected 
     });
-    
-    renderPlaylist();
 }
 
 export function setupPlaylistHandlers(): void {
@@ -288,7 +291,6 @@ export function setupPlaylistHandlers(): void {
                 state.update({ selectedIndices: [] });
                 pivotIndex = -1;
                 anchorIndex = -1;
-                renderPlaylist();
             }
         });
 
@@ -341,7 +343,6 @@ export function setupPlaylistHandlers(): void {
                 playlist: currentPlaylist,
                 selectedIndices: sorted.map(i => i-1) 
             });
-            renderPlaylist();
         }
     });
 
@@ -359,7 +360,6 @@ export function setupPlaylistHandlers(): void {
                 playlist: currentPlaylist,
                 selectedIndices: sorted.map(i => i+1) 
             });
-            renderPlaylist();
         }
     });
 

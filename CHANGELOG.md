@@ -1,5 +1,13 @@
 # CHANGELOG
 
+## [v4.3.0] - 2026-02-23 - "Reactive Pulse"
+
+### 🔄 State Engine Overhaul
+
+- **ReactiveStore Implementation**: Replaced manual UI imperative updates with a high-performance Pub/Sub reactive store.
+- **Fine-Grained Subscriptions**: Modules (Playlist, Player, Main) now "subscribe" to specific state keys (`playlist`, `isPlaying`, `isAutoMixEnabled`), ensuring instant, coordinated UI updates without manual overhead.
+- **Decoupled Architecture**: Logic and View are now separated by the state pulse, making the codebase significantly more maintainable and robust against race conditions.
+
 ## [v4.2.0] - 2026-02-23 - "Worklet Warrior"
 
 ### ⚡ Audio Architecture Upgrade

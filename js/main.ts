@@ -305,30 +305,24 @@ async function initApp() {
              else if (current === 'all') next = 'off';
              
              setLoopMode(next);
-             
-             if (next !== 'off') loopBtn.classList.add('active-loop');
-             else loopBtn.classList.remove('active-loop');
         });
     }
 
     if (ctxLoopOff) {
         ctxLoopOff.addEventListener('click', () => {
             setLoopMode('off');
-            loopBtn?.classList.remove('active-loop');
             loopContextMenu?.classList.add('hidden');
         });
     }
     if (ctxLoopOne) {
         ctxLoopOne.addEventListener('click', () => {
             setLoopMode('one');
-            loopBtn?.classList.add('active-loop');
             loopContextMenu?.classList.add('hidden');
         });
     }
     if (ctxLoopAll) {
         ctxLoopAll.addEventListener('click', () => {
             setLoopMode('all');
-            loopBtn?.classList.add('active-loop');
             loopContextMenu?.classList.add('hidden');
         });
     }

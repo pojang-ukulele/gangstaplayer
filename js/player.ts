@@ -103,33 +103,33 @@ export function initPlayer(deps: PlayerDeps): void {
     masterVol = document.getElementById('masterVol') as HTMLInputElement;
     volKnob = document.getElementById('volKnob');
     
-    // LOOP LOGIC
-    const loopBtn = document.getElementById('loopBtn');
-    if (loopBtn) {
-        loopBtn.addEventListener('click', () => {
-             if (!engine.main.audio.loop && state.isAutoMixEnabled) {
-                 setAutoMixEnabled(false);
-             }
-             
-             engine.main.audio.loop = !engine.main.audio.loop;
-             loopBtn.classList.toggle('loop-active', engine.main.audio.loop);
-        });
-    }
+    // === REACTIVE SUBSCRIPTIONS ===
+    state.subscribe('isPlaying', (playing) => {
+        if (playPauseBtn) playPauseBtn.innerText = playing ? "PAUSE" : "PLAY";
+    });
+
+    state.subscribe('isAutoMixEnabled', (enabled) => {
+        if (autoMixBtn) {
+            autoMixBtn.classList.toggle('active', enabled);
+            autoMixBtn.innerText = enabled ? 'AUTOMIX ON' : 'AUTOMIX OFF';
+        }
+    });
+
+    state.subscribe('loopMode', (mode) => {
+        const loopBtn = document.getElementById('loopBtn');
+        if (loopBtn) {
+            loopBtn.classList.toggle('active-loop', mode !== 'off');
+        }
+        engine.main.audio.loop = (mode === 'one');
+    });
+
+    setupPlayerHandlers();
 }
 
 export function setAutoMixEnabled(val: boolean): void {
     state.update({ isAutoMixEnabled: val });
-    if (autoMixBtn) {
-        if (state.isAutoMixEnabled) {
-            autoMixBtn.classList.add('active');
-            if (engine.main.audio.loop) {
-                 engine.main.audio.loop = false;
-                 const loopBtn = document.getElementById('loopBtn');
-                 if (loopBtn) loopBtn.classList.remove('loop-active');
-                 state.update({ loopMode: 'off' });
-            }
-        }
-        else autoMixBtn.classList.remove('active');
+    if (val && state.loopMode === 'one') {
+        state.update({ loopMode: 'off' });
     }
 }
 
@@ -305,7 +305,6 @@ export function playTrack(): void {
     resumeAudioContext();
     engine.main.audio.play().then(() => {
         state.update({ isPlaying: true });
-        if (playPauseBtn) playPauseBtn.innerText = "PAUSE";
         updateControlsLock(false);
     }).catch(console.error);
 }
@@ -314,7 +313,6 @@ export function pauseTrack(): void {
     if (state.isCrossfadeInProgress) return;
     if (engine.main.audio) engine.main.audio.pause();
     state.update({ isPlaying: false });
-    if (playPauseBtn) playPauseBtn.innerText = "PLAY";
 }
 
 export function stopPlayback(): void {
@@ -326,7 +324,6 @@ export function stopPlayback(): void {
     state.update({ isPlaying: false, isCrossfadeInProgress: false });
     updateControlsLock(false);
     
-    if (playPauseBtn) playPauseBtn.innerText = "PLAY";
     if (progressBar) progressBar.value = "0";
     if (setBlendingIndexFn) setBlendingIndexFn(-1);
     if (autoMixBtn) autoMixBtn.classList.remove('blending');
