@@ -1,5 +1,10 @@
 # GANGSTA PLAYER PRO
 
+![Main Interface Placeholder](https://via.placeholder.com/800x450?text=Gangsta+Player+Pro+Main+UI)
+![Sampler Pads View](https://via.placeholder.com/400x300?text=16-Pad+Sampler+View)
+![Settings Panel](https://via.placeholder.com/400x300?text=Settings+&+Customization)
+*The ultimate ghetto-tech sampler for the streets.*
+
 ## 💀 ABOUT DA SOFTWARE
 
 This is the ultimate **ghetto-tech sampler and tape deck** for the streets. **Gangsta Player Pro 3** turns your PC into a beat-making, chopper-screwing powerhouse. Whether you're laying down tracks or just slowing down the classics, this tool has the grit you need. It also works flawlessly as a basic music audio player for your daily listening.
@@ -130,7 +135,9 @@ This is the ultimate **ghetto-tech sampler and tape deck** for the streets. **Ga
 ### Prerequisites
 
 - **Node.js**: v18+ Recommended
-- **Python**: v3.10+ (for Sonetra AI bridge functionality)
+- **Python**: v3.10+ (Required for Sonetra AI bridge functionality)
+
+> **Note**: Sonetra AI mixing requires a running/local Python FastAPI server (setup in `sonetra-bridge.js`). If not using AI features, you can skip the Python dependency.
 
 ### Setup
 

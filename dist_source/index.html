@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GANGSTA PLAYER PRO 3</title>
+    <!-- Content Security Policy for Safety -->
+    <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self' 'unsafe-inline' 'unsafe-eval'; script-src 'self' 'unsafe-inline' blob:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; media-src 'self' blob: data:; connect-src 'self' blob: data:;">
+    <link rel="stylesheet" href="styles.css">
+</head>
+
+<body>
+    <div class="title-bar">
+        <div class="titlebar-left">
+            <span class="title-icon">⚡</span>
+            <span class="title-bar-title">GANGSTA PLAYER PRO 3</span>
+        </div>
+        <div class="titlebar-right">
+            <div class="kit-controls">
+                <button class="kit-btn" id="btnSaveKit">SAVE KIT</button>
+                <button class="kit-btn" id="btnLoadKit">LOAD KIT</button>
+            </div>
+            <span id="midiStatus" class="midi-status">MIDI: OFF</span>
+            <div class="window-controls">
+                <button class="win-btn settings-btn-large" id="settingsBtn" title="Settings">⚙️</button>
+                <button class="win-btn" id="minBtn">_</button>
+                <button class="win-btn" id="maxBtn" title="Maximize">☐</button>
+                <button class="win-btn close-btn" id="closeBtn">X</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- OLD SETTINGS MODAL REMOVED -->
+    <h1>GANGSTA PLAYER PRO 3</h1>
+
+    <div class="device-container">
+        <!-- INDUSTRIAL SCREWS -->
+        <div class="screw tl"></div>
+        <div class="screw tr"></div>
+        <div class="screw bl"></div>
+        <div class="screw br"></div>
+        <div class="light-rack rack-left">
+            <div class="led" id="l1"></div>
+            <div class="led" id="l2"></div>
+            <div class="led" id="l3"></div>
+        </div>
+        <div class="light-rack rack-right">
+            <div class="led" id="r1"></div>
+            <div class="led" id="r2"></div>
+            <div class="led" id="r3"></div>
+        </div>
+        <div class="sampler-section">
+            <div class="label-text">SAMPLER PADS (DRAG & DROP AUDIO OR CLICK THE PAD)</div>
+            <div class="pad-grid" id="padGrid"></div>
+        </div>
+        <div class="player-section">
+            <!-- REMOVED: TAPE DECK LABEL -->
+            <div class="screen">
+                <span id="trackTitle">INSERT TAPE...</span>
+                <!-- BPM merged into trackTitle -->
+                <div class="visualizer" id="visualizer"></div>
+
+            </div>
+            <div class="progress-container">
+                <span id="currentTime" class="time-display">0:00</span>
+                <input type="range" class="progress-slider" id="progressBar" value="0" min="0" max="100" step="0.1" title="Track Progress">
+                <span id="totalTime" class="time-display">0:00</span>
+            </div>
+            <div class="transport-controls">
+                <button class="btn" id="prevBtn">|&lt;</button>
+                <button class="btn" id="playPauseBtn">PLAY</button>
+                <button class="btn" id="loopBtn" title="Loop Current Track">LOOP</button>
+                <button class="btn master-rec-btn" id="masterRecBtn">REC</button>
+                <button class="btn auto-mix-btn" id="autoMixBtn" title="AI Auto-Mix: Seamlessly blend songs">MIX</button>
+                <button class="btn" id="stopBtn">STOP</button>
+                <button class="btn" id="nextBtn">&gt;|</button>
+            </div>
+            <div class="flex-row-gap">
+                <span class="label-text">VOL:</span>
+                <div class="volume-wrapper">
+                    <input type="range" class="volume-slider" id="masterVol" min="0" max="1" step="0.01" value="1" title="Master Volume">
+                    <div id="volKnob" class="vol-knob">100%</div>
+                </div>
+            </div>
+            <label class="file-upload-btn">
+                [+] LOAD AUDIO
+                <input type="file" id="playlistInput" multiple accept="audio/*" class="hidden-input">
+            </label>
+            <ul class="playlist" id="playlist"></ul>
+            <div class="chopper-section">
+                <div id="chopperTitle" class="label-text chopper-title">CHOPPER AND SCREWER</div>
+                <div id="chopperBPM" class="label-text chopper-bpm">SPEED: 100% (BPM: ---)</div>
+                <div id="tempoContainer">
+                    <div id="tempoMarker"></div>
+                    <input type="range" class="progress-slider tempo-slider-wrapper" id="tempoSlider" min="0.5" max="1.5" step="0.01" value="1" title="Tempo/Speed Control">
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- HELP MODAL -->
+    <div id="helpModal" class="modal">
+        <div class="modal-content modal-small">
+            <span id="closeHelp" class="close">&times;</span>
+            <h2 class="modal-title">GANGSTA PLAYER PRO 3 - MANUAL</h2>
+
+            <div class="help-grid">
+                <div class="help-section">
+                    <h3>KEYS & CONTROLS</h3>
+                    <ul>
+                        <li><span class="key">SPACE</span> : Play / Pause Main Deck</li>
+                        <li><span class="key">&uarr; / &darr;</span> : Navigate Playlist</li>
+                        <li><span class="key">SHIFT + &uarr;/&darr;</span> : Multi-Select Tracks</li>
+                        <li><span class="key">&larr; / &rarr;</span> : Skip 5 Seconds Back / Forward</li>
+                        <li><span class="key">ENTER</span> : Universal Stop / Emergency Reset</li>
+                        <li><span class="key">DELETE</span> : Remove Track(s) from Playlist</li>
+                        <li><span class="key">PAD KEYS</span> : Trigger Pad (Hold to Play)</li>
+                        <li><span class="key">CTRL + PAD KEY</span> : Hold to Record (Input Audio)</li>
+                        <li style="margin-top: 10px; list-style: none;"><button id="btnOpenManual" class="btn btn-manual-txt" title="Open full manual in text editor" style="width: 100%;">OPEN FULL MANUAL (TXT)</button></li>
+                    </ul>
+                </div>
+
+
+                <div class="help-section">
+                    <h3>FEATURES</h3>
+                    <ul>
+                        <li><strong>LOAD SAMPLE:</strong> Right-click any pad and select "LOAD SAMPLE" to load audio.
+                            You can also drag & drop files onto pads.</li>
+                        <li><strong>RECORD PAD:</strong> Click the small [REC] button on a pad or use CTRL+Key shortcut.
+                            Records your mic/input to that pad.</li>
+                        <li><strong>MASTER REC:</strong> The big [REC] button records the ENTIRE OUTPUT (mix) to a
+                            high-quality WAV file.</li>
+                        <li><strong>SYNC:</strong> Right-click a loaded pad and select "SYNC" to match its tempo to the
+                            Main Deck. A ✓ checkmark shows when SYNC is active.</li>
+                        <li><strong>CHOPPER & SCREWER:</strong> The slider controls global playback speed. Slow it down
+                            for that screw effect. Magnetic snap at 100%.</li>
+                        <li><strong>AI AUTO-MIX:</strong> Seamlessly mixes between tracks with pro DJ effects.
+                            Toggle options in Settings. Use Next/Prev buttons for fast mixes. Customize fade lengths in Settings!</li>
+                        <li><strong>SETTINGS:</strong> App automatically saves your preferences. Use "RESTORE DEFAULTS" to reset.</li>
+                    </ul>
+                </div>
+                
+
+
+            </div>
+        </div>
+    </div>
+
+    <!-- RESTORED COOL SETTINGS MODAL -->
+    <div id="settingsModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+            <h2>SETTINGS</h2>
+                <span class="close-modal" id="closeSettings">&times;</span>
+            </div>
+            <div class="modal-body">
+                <label for="inputDeviceSelect">INPUT DEVICE (MIC/LINE IN):</label>
+                <select id="inputDeviceSelect" title="Select Input Device"></select>
+
+                <label for="outputDeviceSelect" class="settings-inline-section">OUTPUT DEVICE (SPEAKERS):</label>
+                <select id="outputDeviceSelect" title="Select Output Device"></select>
+
+                <label for="midiDeviceSelect" class="settings-inline-section">MIDI CONTROLLER:</label>
+                <select id="midiDeviceSelect" title="Select MIDI Device">
+                    <option value="none">Scanning for MIDI...</option>
+                </select>
+
+                <div class="settings-checkbox-row">
+                    <style>
+                        /* Custom Gangsta Checkbox */
+                        .gangsta-check { display:none; }
+                        .gangsta-check + label {
+                            position: relative;
+                            padding-left: 30px;
+                            cursor: pointer;
+                            color: #aaa;
+                            font-family: inherit;
+                        }
+                        .gangsta-check + label::before {
+                            content:'';
+                            position:absolute;
+                            left:0; top:0;
+                            width:18px; height:18px;
+                            border: 2px solid #555;
+                            background: #111;
+                        }
+                        .gangsta-check:checked + label::before {
+                            background: var(--neon-purple);
+                            border-color: #fff;
+                            box-shadow: 0 0 5px var(--neon-purple);
+                        }
+                        .gangsta-check:checked + label { color:#fff; text-shadow:0 0 5px rgba(255,255,255,0.5); }
+                    </style>
+                    <input type="checkbox" id="fullScreenToggle" class="gangsta-check">
+                    <label for="fullScreenToggle">FULL SCREEN MODE</label>
+                </div>
+
+                <!-- AUTO-MIX OPTIONS BUTTON -->
+                <div class="settings-divider-section">
+                    <button id="btnOpenAutoMix" class="btn btn-automix-settings">🎧 AUTOMIX SETTINGS</button>
+                </div>
+
+                <div class="settings-button-section">
+                    <button id="openHelpFromSettings" class="btn btn-manual">HOW TO USE / MANUAL</button>
+                    
+                    <button id="restoreDefaultsBtn" class="btn btn-restore">RESTORE DEFAULT SETTINGS</button>
+                </div>
+
+                <div class="settings-note">
+                    * Restart app if devices don't show up.
+                    <br>* Settings are saved automatically.
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- NEW: Auto-Mix Settings Modal -->
+    <div id="autoMixModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>AUTOMIX SETTINGS</h2>
+                <span class="close-modal" id="closeAutoMix">&times;</span>
+            </div>
+            <div class="modal-body">
+                <div class="automix-options">
+                    <div class="automix-option-row">
+                        <input type="checkbox" id="mixOptEQCrossfade" class="gangsta-check" checked>
+                        <label for="mixOptEQCrossfade" class="automix-checkbox-label">EQ Crossfade (Bass Swap)</label>
+                    </div>
+                    <div class="automix-option-row">
+                        <input type="checkbox" id="mixOptFilterSweep" class="gangsta-check" checked>
+                        <label for="mixOptFilterSweep" class="automix-checkbox-label">Low-Pass Filter Sweep</label>
+                    </div>
+                    <div class="automix-option-row">
+                        <input type="checkbox" id="mixOptHPFSweep" class="gangsta-check" checked>
+                        <label for="mixOptHPFSweep" class="automix-checkbox-label">High-Pass Sweep (Incoming)</label>
+                    </div>
+                    <div class="automix-option-row">
+                        <!-- BPM Sync OFF by default -->
+                        <input type="checkbox" id="mixOptBPMSync" class="gangsta-check">
+                        <label for="mixOptBPMSync" class="automix-checkbox-label">BPM Sync (Tempo Match)</label>
+                    </div>
+
+                    <!-- FADE SLIDERS -->
+                    <div class="automix-slider-section">
+                        <label class="automix-slider-label">TRACK END FADE: <span id="valTrackFade" class="automix-slider-value">10.0s</span></label>
+                        <div class="automix-slider-row">
+                            <div class="automix-center-mark"></div> <!-- Center Mark -->
+                            <input type="range" id="sliderTrackFade" class="progress-slider tempo-slider-wrapper" min="0" max="20" step="0.5" value="10" title="Track End Fade Duration">
+                        </div>
+                    </div>
+
+                    <div class="automix-slider-margin">
+                        <label class="automix-slider-label">BUTTON SKIP FADE: <span id="valBtnFade" class="automix-slider-value">4.0s</span></label>
+                        <div class="automix-slider-row">
+                            <div class="automix-center-mark"></div> <!-- Center Mark -->
+                            <input type="range" id="sliderBtnFade" class="progress-slider tempo-slider-wrapper" min="0" max="8" step="0.5" value="4" title="Button Skip Fade Duration">
+                        </div>
+                    </div>
+                </div>
+                <div class="automix-close-section">
+                    <button id="closeAutoMixBtn" class="btn automix-btn-full">CLOSE</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- NEW: Custom Context Menu -->
+    <div id="contextMenu" class="context-menu hidden" role="menu" aria-hidden="true" aria-label="Playlist Context Menu">
+        <div class="context-item" id="ctxPlay" role="menuitem" tabindex="-1">PLAY</div>
+        <div class="context-item" id="ctxMoveUp" role="menuitem" tabindex="-1">MOVE UP</div>
+        <div class="context-item" id="ctxMoveDown" role="menuitem" tabindex="-1">MOVE DOWN</div>
+        <div class="context-divider" role="separator"></div>
+        <div class="context-item" id="ctxRemove" role="menuitem" tabindex="-1">REMOVE FROM PLAYLIST</div>
+    </div>
+
+    <!-- NEW: Pad Context Menu -->
+    <div id="padContextMenu" class="context-menu hidden" role="menu" aria-hidden="true" aria-label="Pad Context Menu">
+        <div class="context-item" id="ctxLoadSample" role="menuitem" tabindex="-1">LOAD SAMPLE</div>
+        <div id="padCtxDivider" class="context-divider hidden" role="separator"></div>
+        <div class="context-item hidden" id="ctxSync" role="menuitem" tabindex="-1">SYNC</div>
+    </div>
+
+    <!-- NEW: Play Button Context Menu -->
+    <div id="playContextMenu" class="context-menu hidden" role="menu" aria-hidden="true" aria-label="Playback Options Menu">
+        <div class="context-item" id="ctxPlayContinuous" role="menuitem" tabindex="-1">CONTINUOUS PLAYBACK ✓</div>
+        <div class="context-item" id="ctxPlaySingle" role="menuitem" tabindex="-1">STOP AFTER CURRENT</div>
+    </div>
+
+    <!-- NEW: Loop Context Menu -->
+    <div id="loopContextMenu" class="context-menu hidden" role="menu" aria-hidden="true" aria-label="Loop Options Menu">
+        <div class="context-item" id="ctxLoopOff" role="menuitem" tabindex="-1">LOOP OFF ✓</div>
+        <div class="context-item" id="ctxLoopOne" role="menuitem" tabindex="-1">LOOP CURRENT TRACK</div>
+        <div class="context-item" id="ctxLoopAll" role="menuitem" tabindex="-1">LOOP PLAYLIST</div>
+    </div>
+
+    <!-- FOOTER CONTROLS -->
+
+
+    <!-- SCRIPTS -->
+    <script type="module" src="js/main.js"></script>
+</body>
+
+</html>
