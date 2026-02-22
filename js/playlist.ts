@@ -39,8 +39,8 @@ export function setBlendingIndex(index: number): void {
  */
 async function analyzeTrackInBackground(track: Track): Promise<void> {
     try {
-        const response = await fetch(track.path); // Track 'url' was used in JS, but 'path' in state.ts Track interface
-        const arrayBuffer = await response.arrayBuffer();
+        const rawData = await (window as any).fileSystem.readFile(track.path);
+        const arrayBuffer = rawData.buffer || rawData;
         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
         const bpm = await detectBPMWorker(audioBuffer);
         track.bpm = bpm; 
@@ -55,11 +55,12 @@ export function addTracksToPlaylist(files: File[]): void {
     const currentPlaylist = [...state.playlist];
     const startIdx = currentPlaylist.length;
     files.forEach((file) => {
+        const fullPath = (window as any).electronAPI.getPathForFile(file);
         const track: Track = { 
             id: Math.random().toString(36).substr(2, 9),
             name: file.name, 
-            path: URL.createObjectURL(file), // Using 'path' as the URL placeholder
-            duration: 0, // Duration will be set when loaded
+            path: fullPath, 
+            duration: 0, 
             bpm: undefined 
         };
         currentPlaylist.push(track);

@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## [v4.1.0] - 2026-02-23 - "The Hardened Core"
+
+### 🛡️ Paranoid Logic Hardening
+
+- **Permanent Playlist Persistence**: Migrated from ephemeral browser Blobs to absolute OS disk paths for track storage.
+- **Privileged Audio Loading**: Implemented a "Bridge-to-Blob" rotation system that bypasses Electron's `webSecurity` for local files.
+- **Memory Safety**: Added automatic `Object URL` revocation to prevent memory leaks during long-running sessions.
+- **Robust BPM Analysis**: Refactored background scanners to use the privileged `fsBridge` instead of `fetch`, ensuring 100% reliability for local files.
+
 ## [v4.0.0] - 2026-02-23 - "Type-Safe Evolution"
 
 ### 🛡️ TypeScript Migration

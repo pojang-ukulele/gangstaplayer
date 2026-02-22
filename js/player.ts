@@ -13,6 +13,30 @@ interface PlayerDeps {
     setBlendingIndex?: (index: number) => void;
 }
 
+let mainBlobUrl: string = "";
+let crossfadeBlobUrl: string = "";
+
+async function getSafeUrl(filePath: string, isMain: boolean): Promise<string> {
+    try {
+        const rawData = await (window as any).fileSystem.readFile(filePath);
+        // We use blob for compatibility with HTMLAudioElement and webSecurity
+        const blob = new Blob([rawData], { type: 'audio/mpeg' });
+        const url = URL.createObjectURL(blob);
+        
+        if (isMain) {
+            if (mainBlobUrl) URL.revokeObjectURL(mainBlobUrl);
+            mainBlobUrl = url;
+        } else {
+            if (crossfadeBlobUrl) URL.revokeObjectURL(crossfadeBlobUrl);
+            crossfadeBlobUrl = url;
+        }
+        return url;
+    } catch (e) {
+        console.error("[SafeURL] Failed to create blob", e);
+        return filePath; // Fallback
+    }
+}
+
 // Local UI references
 let isDraggingProgress = false;
 let playPauseBtn: HTMLElement | null = null;
@@ -126,7 +150,8 @@ export async function loadTrack(index: number): Promise<void> {
     if (renderPlaylistFn) renderPlaylistFn();
     
     engine.main.reset();
-    engine.main.load(track.path);
+    const safeUrl = await getSafeUrl(track.path, true);
+    engine.main.load(safeUrl);
     engine.main.audio.playbackRate = tempoSlider ? parseFloat(tempoSlider.value) : 1;
     
     if (track.bpm !== null && track.bpm !== undefined) {
@@ -137,8 +162,8 @@ export async function loadTrack(index: number): Promise<void> {
         state.update({ masterBPM: 0 });
         if (trackTitle) trackTitle.innerText = `${track.name} [Analyzing...]`;
         try {
-            const response = await fetch(track.path);
-            const arrayBuffer = await response.arrayBuffer();
+            const rawData = await (window as any).fileSystem.readFile(track.path);
+            const arrayBuffer = rawData.buffer || rawData;
             const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
             const detectedValue = await detectBPMWorker(audioBuffer);
             track.bpm = detectedValue;
@@ -183,7 +208,8 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
     if (autoMixBtn) autoMixBtn.classList.add('blending');
 
     engine.crossfade.reset();
-    engine.crossfade.load(playlistRef[nextIdx].path);
+    const safeUrl = await getSafeUrl(playlistRef[nextIdx].path, false);
+    engine.crossfade.load(safeUrl);
     
     engine.crossfade.lowEQ.gain.value = settings.autoMix.eqCrossfade ? -24 : 0;
     engine.crossfade.midEQ.gain.value = settings.autoMix.eqCrossfade ? -6 : 0;
@@ -251,6 +277,13 @@ function finishCrossfade(nextIndex: number): void {
     
     // PROMOTE channel
     engine.swapChannels();
+    
+    // Swap tracked blob URLs
+    const tempUrl = mainBlobUrl;
+    mainBlobUrl = crossfadeBlobUrl;
+    crossfadeBlobUrl = ""; // Swapped channel had its src cleared in engine.swapChannels()
+    if (tempUrl) URL.revokeObjectURL(tempUrl);
+
     state.update({ currentTrackIndex: nextIndex, isCrossfadeInProgress: false });
     updateControlsLock(false);
     
