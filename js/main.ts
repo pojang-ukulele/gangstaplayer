@@ -186,24 +186,32 @@ async function initApp() {
                     };
                     
                     mediaRecorder.onstop = async () => {
-                        const webmBlob = new Blob(recordedChunks, { type: 'audio/webm' });
-                        recordedChunks = [];
-                        
-                        const arrayBuffer = await webmBlob.arrayBuffer();
-                        const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-                        
-                        const wavBlob = await bufferToWave(audioBuffer);
-                        const wavBuffer = await wavBlob.arrayBuffer();
+                        try {
+                            const webmBlob = new Blob(recordedChunks, { type: 'audio/webm' });
+                            recordedChunks = [];
+                            
+                            const arrayBuffer = await webmBlob.arrayBuffer();
+                            const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+                            
+                            const wavBlob = await bufferToWave(audioBuffer);
+                            const wavBuffer = await wavBlob.arrayBuffer();
 
-                        const path = await bridge.saveAudioDialog();
-                        if (path) {
-                             await fsBridge.saveFile(path, new Uint8Array(wavBuffer));
-                             toast.success("RECORDING SAVED TO DISK");
+                            const path = await bridge.saveAudioDialog();
+                            if (path) {
+                                 const uint8 = new Uint8Array(wavBuffer);
+                                 // IPC Buffer Fix (Double Slice to be absolutely safe)
+                                 const safeBuffer = uint8.buffer.slice(uint8.byteOffset, uint8.byteOffset + uint8.byteLength);
+                                 await fsBridge.saveFile(path, new Uint8Array(safeBuffer));
+                                 toast.success("RECORDING SAVED TO DISK");
+                            }
+                        } catch (e) {
+                            logger.error("[MasterRec] Save failed", e);
+                            toast.error("COULD NOT SAVE RECORDING");
+                        } finally {
+                            recBtn.classList.remove('recording');
+                            recBtn.innerText = "REC";
+                            isRecording = false;
                         }
-                        
-                        recBtn.classList.remove('recording');
-                        recBtn.innerText = "REC";
-                        isRecording = false;
                     };
                 }
                 

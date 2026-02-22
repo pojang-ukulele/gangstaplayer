@@ -36,7 +36,13 @@ function revokeLater(url: string, delay = 5000): void {
 async function getSafeUrl(filePath: string, isMain: boolean): Promise<string> {
     try {
         const rawData = await (window as any).fileSystem.readFile(filePath);
-        const blob = new Blob([rawData], { type: 'audio/mpeg' });
+        if (!rawData) {
+            logger.warn(`[SafeURL] File unreadable: ${filePath}`);
+            return filePath;
+        }
+        // IPC Buffer Alignment Fix
+        const arrayBuffer = rawData.buffer.slice(rawData.byteOffset, rawData.byteOffset + rawData.byteLength);
+        const blob = new Blob([arrayBuffer], { type: 'audio/mpeg' });
         const url = URL.createObjectURL(blob);
         
         if (isMain) {

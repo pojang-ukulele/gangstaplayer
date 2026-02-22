@@ -108,7 +108,11 @@ export function startPad(index: number): void {
     }
     const currentVoice = activeVoices[index];
     if (currentVoice) {
-        try { currentVoice.source.stop(); } catch (e) {}
+        try { 
+            currentVoice.source.stop(); 
+            currentVoice.source.disconnect();
+            currentVoice.gain.disconnect();
+        } catch (e) {}
     }
     const source = audioCtx.createBufferSource();
     source.buffer = padBuffers[index];
@@ -251,8 +255,9 @@ let activeRecorders: Record<number, MediaRecorder> = {};
 async function startRecording(index: number): Promise<void> {
     if (activeRecorders[index]) return;
     
+    let stream: MediaStream | null = null;
     try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         const mediaRecorder = new MediaRecorder(stream);
         const chunks: Blob[] = [];
 
@@ -261,13 +266,20 @@ async function startRecording(index: number): Promise<void> {
             const blob = new Blob(chunks, { type: 'audio/webm' }); 
             const arrayBuffer = await blob.arrayBuffer();
              
-             audioCtx.decodeAudioData(arrayBuffer).then(decodedBuffer => {
-                 padBuffers[index] = decodedBuffer;
-                 padPaths[index] = `Recorded Sample ${new Date().toLocaleTimeString()}`;
-                 updatePadVisuals(index, { name: "RECORDING" }); 
-                 
-                 stream.getTracks().forEach(track => track.stop());
-             }).catch(e => console.error("Decode Rec Error", e));
+             try {
+                const decodedBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+                padBuffers[index] = decodedBuffer;
+                padPaths[index] = `REC_${Date.now()}`;
+                updatePadVisuals(index, { name: "RECORDING" });
+                logger.debug(`[Sampler] Recording on pad ${index} successful`);
+             } catch (e) {
+                logger.error(`[Sampler] Recording decode failed on pad ${index}`, e);
+                toast.error("RECORDING DECODE FAILED");
+             } finally {
+                if (stream) {
+                    stream.getTracks().forEach(track => track.stop());
+                }
+             }
 
             delete activeRecorders[index];
             updateRecVisuals(index, false);
@@ -278,8 +290,9 @@ async function startRecording(index: number): Promise<void> {
         updateRecVisuals(index, true);
 
     } catch (e) {
-        console.error("Recording failed", e);
+        logger.error("[Sampler] Recording start failed", e);
         toast.error("COULD NOT START RECORDING");
+        if (stream) stream.getTracks().forEach(t => t.stop());
     }
 }
 

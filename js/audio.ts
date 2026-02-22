@@ -34,13 +34,16 @@ export async function bufferToWave(ab: AudioBuffer): Promise<Blob> {
     return await bufferToWaveWorker(ab, ab.length);
 }
 
+let isWorkletRegistered = false;
+
 /**
- * Initialize AudioWorklets
+ * Initialize AudioWorklets with singleton protection
  */
 export async function initWorklets(): Promise<void> {
+    if (isWorkletRegistered) return;
     try {
-        // Path matches the bundled location in app-build
         await audioCtx.audioWorklet.addModule('js/workers/gangsta-processor.js');
+        isWorkletRegistered = true;
         console.log('[Audio] GangstaWorklet Registered');
     } catch (e) {
         console.error('[Audio] Worklet registration failed', e);

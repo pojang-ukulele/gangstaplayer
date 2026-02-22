@@ -1,5 +1,14 @@
 # CHANGELOG
 
+## [v4.7.0] - 2026-02-23 - "Ultra-Paranoid Recovery"
+
+### 🛡️ Atomic Reliability & Memory Hardening
+
+- **Global Buffer Slicing Fix**: Expanded the `ArrayBuffer` alignment fix to the `Player` and `Playlist` modules, ensuring that all audio data extracted via IPC is perfectly bounded, eliminating "Source Errors" and memory access crashes.
+- **Zombie Stream Cleanup**: Refactored both Sampler and Master Recording to use `finally` blocks for `MediaStream` track termination, ensuring microphones are always deactivated even on decode failure.
+- **Voice Pool Hardening**: Implemented explicit `.disconnect()` calls for sampler voices to prevent "Ghost Sources" from accumulating in memory during rapid re-triggering.
+- **State Singletons**: Added guard gates to Worklet registration to prevent "Module Already Added" exceptions during hot-reloads or app re-initialization.
+
 ## [v4.6.2] - 2026-02-23 - "Buffer Alignment & Sampler Stability"
 
 ### 🛡️ Sampler & Buffer Hardening
