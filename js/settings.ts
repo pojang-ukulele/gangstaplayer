@@ -1,10 +1,33 @@
 // === SETTINGS MODULE ===
-import { toast } from './toast.js';
-import { showConfirm } from './player.js';
+import { toast } from './toast';
+import { showConfirm } from './player';
+
+interface AutoMixSettings {
+    eqCrossfade: boolean;
+    filterSweep: boolean;
+    hpfSweep: boolean;
+    bpmSync: boolean;
+    trackDuration: number;
+    btnDuration: number;
+}
+
+interface Settings {
+    fullScreen: boolean;
+    inputDevice: string;
+    outputDevice: string;
+    midiDevice: string;
+    autoMix: AutoMixSettings;
+}
+
+declare global {
+    interface Window {
+        electronAPI: any;
+    }
+}
 
 const bridge = window.electronAPI;
 
-export const settings = {
+export const settings: Settings = {
     fullScreen: false,
     inputDevice: 'default',
     outputDevice: 'default',
@@ -19,9 +42,9 @@ export const settings = {
     }
 };
 
-let setAutoMixEnabledFn = null;
+let setAutoMixEnabledFn: ((enabled: boolean) => void) | null = null;
 
-export function initSettings(deps) {
+export function initSettings(deps: { setAutoMixEnabled: (enabled: boolean) => void }): void {
     setAutoMixEnabledFn = deps.setAutoMixEnabled;
     const settingsBtn = document.getElementById('settingsBtn');
     const settingsModal = document.getElementById('settingsModal');
@@ -39,18 +62,18 @@ export function initSettings(deps) {
 
     // Modal Click-outside to close
     window.addEventListener('click', (e) => {
-        if (e.target === settingsModal) settingsModal.style.display = 'none';
+        if (e.target === settingsModal && settingsModal) settingsModal.style.display = 'none';
         const autoMixModal = document.getElementById('autoMixModal');
-        if (e.target === autoMixModal) autoMixModal.style.display = 'none';
+        if (e.target === autoMixModal && autoMixModal) autoMixModal.style.display = 'none';
         const helpModal = document.getElementById('helpModal');
-        if (e.target === helpModal) helpModal.style.display = 'none';
+        if (e.target === helpModal && helpModal) helpModal.style.display = 'none';
     });
 
     setupSettingsHandlers();
     loadSettings();
 }
 
-export function loadSettings() {
+export function loadSettings(): void {
     try {
         const saved = localStorage.getItem('ug_settings');
         if (saved) {
@@ -63,14 +86,14 @@ export function loadSettings() {
     } catch(e) { console.error("Load Settings Error", e); }
 }
 
-function applySettingsToUI() {
-    const fullScreenToggle = document.getElementById('fullScreenToggle');
+function applySettingsToUI(): void {
+    const fullScreenToggle = document.getElementById('fullScreenToggle') as HTMLInputElement;
     if (fullScreenToggle) fullScreenToggle.checked = !!settings.fullScreen;
 
-    const mixOptEQCrossfade = document.getElementById('mixOptEQCrossfade');
-    const mixOptFilterSweep = document.getElementById('mixOptFilterSweep');
-    const mixOptHPFSweep = document.getElementById('mixOptHPFSweep');
-    const mixOptBPMSync = document.getElementById('mixOptBPMSync');
+    const mixOptEQCrossfade = document.getElementById('mixOptEQCrossfade') as HTMLInputElement;
+    const mixOptFilterSweep = document.getElementById('mixOptFilterSweep') as HTMLInputElement;
+    const mixOptHPFSweep = document.getElementById('mixOptHPFSweep') as HTMLInputElement;
+    const mixOptBPMSync = document.getElementById('mixOptBPMSync') as HTMLInputElement;
 
     if (mixOptEQCrossfade) mixOptEQCrossfade.checked = !!settings.autoMix.eqCrossfade;
     if (mixOptFilterSweep) mixOptFilterSweep.checked = !!settings.autoMix.filterSweep;
@@ -81,19 +104,17 @@ function applySettingsToUI() {
     updateSliderUI('sliderBtnFade', 'valBtnFade', settings.autoMix.btnDuration);
 }
 
-export function saveSettings() {
-    const fullScreenToggle = document.getElementById('fullScreenToggle');
-    const mixOptEQCrossfade = document.getElementById('mixOptEQCrossfade');
-    const mixOptFilterSweep = document.getElementById('mixOptFilterSweep');
-    const mixOptHPFSweep = document.getElementById('mixOptHPFSweep');
-    const mixOptBPMSync = document.getElementById('mixOptBPMSync');
+export function saveSettings(): void {
+    const fullScreenToggle = document.getElementById('fullScreenToggle') as HTMLInputElement;
+    const mixOptEQCrossfade = document.getElementById('mixOptEQCrossfade') as HTMLInputElement;
+    const mixOptFilterSweep = document.getElementById('mixOptFilterSweep') as HTMLInputElement;
+    const mixOptHPFSweep = document.getElementById('mixOptHPFSweep') as HTMLInputElement;
+    const mixOptBPMSync = document.getElementById('mixOptBPMSync') as HTMLInputElement;
 
     settings.fullScreen = fullScreenToggle ? fullScreenToggle.checked : settings.fullScreen;
     if (mixOptEQCrossfade) settings.autoMix.eqCrossfade = mixOptEQCrossfade.checked;
     if (mixOptFilterSweep) settings.autoMix.filterSweep = mixOptFilterSweep.checked;
     if (mixOptHPFSweep) settings.autoMix.hpfSweep = mixOptHPFSweep.checked;
-    if (mixOptBPMSync) settings.autoMix.bpmSync = mixOptBPMSync.checked;
-
     if (mixOptBPMSync) settings.autoMix.bpmSync = mixOptBPMSync.checked;
 
     localStorage.setItem('ug_settings', JSON.stringify(settings));
@@ -102,24 +123,24 @@ export function saveSettings() {
     if (bridge && bridge.setFullScreen) bridge.setFullScreen(settings.fullScreen);
 }
 
-function updateSliderUI(sliderId, labelId, val) {
-    const slider = document.getElementById(sliderId);
+function updateSliderUI(sliderId: string, labelId: string, val: number): void {
+    const slider = document.getElementById(sliderId) as HTMLInputElement;
     const label = document.getElementById(labelId);
     if (slider && label) {
-        slider.value = val;
+        slider.value = val.toString();
         label.innerText = val.toFixed(1) + 's';
     }
 }
 
-export function setupSettingsHandlers() {
+export function setupSettingsHandlers(): void {
     const btnOpenAutoMix = document.getElementById('btnOpenAutoMix');
     const autoMixModal = document.getElementById('autoMixModal');
     const closeAutoMix = document.getElementById('closeAutoMix');
     const closeAutoMixBtn = document.getElementById('closeAutoMixBtn');
 
-    if (btnOpenAutoMix) btnOpenAutoMix.addEventListener('click', () => { autoMixModal.style.display = 'block'; });
-    if (closeAutoMix) closeAutoMix.addEventListener('click', () => { autoMixModal.style.display = 'none'; });
-    if (closeAutoMixBtn) closeAutoMixBtn.addEventListener('click', () => { autoMixModal.style.display = 'none'; });
+    if (btnOpenAutoMix && autoMixModal) btnOpenAutoMix.addEventListener('click', () => { autoMixModal.style.display = 'block'; });
+    if (closeAutoMix && autoMixModal) closeAutoMix.addEventListener('click', () => { autoMixModal.style.display = 'none'; });
+    if (closeAutoMixBtn && autoMixModal) closeAutoMixBtn.addEventListener('click', () => { autoMixModal.style.display = 'none'; });
 
     // Auto-save on any change
     const inputs = ['fullScreenToggle', 'mixOptEQCrossfade', 'mixOptFilterSweep', 'mixOptHPFSweep', 'mixOptBPMSync'];
@@ -173,13 +194,14 @@ export function setupSettingsHandlers() {
     }
 }
 
-function setupDurationSlider(sliderId, labelId, isTrackFade) {
-    const slider = document.getElementById(sliderId);
+function setupDurationSlider(sliderId: string, labelId: string, isTrackFade: boolean): void {
+    const slider = document.getElementById(sliderId) as HTMLInputElement;
     const label = document.getElementById(labelId);
     if (!slider || !label) return;
 
     slider.addEventListener('input', (e) => {
-        const val = parseFloat(e.target.value);
+        const target = e.target as HTMLInputElement;
+        const val = parseFloat(target.value);
         label.innerText = val.toFixed(1) + 's';
         if (isTrackFade) settings.autoMix.trackDuration = val;
         else settings.autoMix.btnDuration = val;
@@ -187,9 +209,9 @@ function setupDurationSlider(sliderId, labelId, isTrackFade) {
     });
 }
 
-async function refreshAudioDevices() {
-    const inputSelect = document.getElementById('inputDeviceSelect');
-    const outputSelect = document.getElementById('outputDeviceSelect');
+async function refreshAudioDevices(): Promise<void> {
+    const inputSelect = document.getElementById('inputDeviceSelect') as HTMLSelectElement;
+    const outputSelect = document.getElementById('outputDeviceSelect') as HTMLSelectElement;
     if (!inputSelect || !outputSelect) return;
 
     try {

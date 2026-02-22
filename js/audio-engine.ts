@@ -1,6 +1,15 @@
-import { audioCtx, masterGain } from './audio.js';
+import { audioCtx, masterGain } from './audio';
 
-class AudioChannel {
+export class AudioChannel {
+    audio: HTMLAudioElement;
+    gain: GainNode;
+    lowEQ: BiquadFilterNode;
+    midEQ: BiquadFilterNode;
+    highEQ: BiquadFilterNode;
+    lpFilter: BiquadFilterNode;
+    hpFilter: BiquadFilterNode;
+    source: MediaElementAudioSourceNode;
+
     constructor() {
         this.audio = new Audio();
         this.audio.crossOrigin = "anonymous";
@@ -27,7 +36,7 @@ class AudioChannel {
         this.gain.connect(masterGain);
     }
 
-    reset() {
+    reset(): void {
         const now = audioCtx.currentTime;
         this.gain.gain.cancelScheduledValues(now);
         this.gain.gain.setValueAtTime(1, now);
@@ -43,12 +52,15 @@ class AudioChannel {
         this.hpFilter.frequency.setValueAtTime(30, now);
     }
 
-    load(url) {
+    load(url: string): void {
         this.audio.src = url;
     }
 }
 
 class AudioEngine {
+    main: AudioChannel;
+    crossfade: AudioChannel;
+
     constructor() {
         this.main = new AudioChannel();
         this.crossfade = new AudioChannel();
@@ -56,7 +68,7 @@ class AudioEngine {
         this.crossfade.gain.gain.value = 0.001;
     }
 
-    swapChannels() {
+    swapChannels(): void {
         // Promote crossfade to main
         const temp = this.main;
         this.main = this.crossfade;

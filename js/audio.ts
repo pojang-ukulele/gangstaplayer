@@ -1,5 +1,12 @@
-import { VISUALIZER_FFT_SIZE } from './constants.js';
-import { bufferToWaveWorker } from './worker-client.js';
+import { VISUALIZER_FFT_SIZE } from './constants';
+import { bufferToWaveWorker } from './worker-client';
+
+// Extend window to support webkitAudioContext
+declare global {
+    interface Window {
+        webkitAudioContext: typeof AudioContext;
+    }
+}
 
 const AudioContextClass = window.AudioContext || window.webkitAudioContext;
 export const audioCtx = new AudioContextClass();
@@ -10,7 +17,10 @@ analyser.fftSize = VISUALIZER_FFT_SIZE;
 masterGain.connect(analyser);
 analyser.connect(audioCtx.destination);
 
-export function resumeAudioContext() {
+/**
+ * Resumes the audio context if it's suspended
+ */
+export function resumeAudioContext(): Promise<void> {
     if (audioCtx.state === 'suspended') {
         return audioCtx.resume();
     }
@@ -20,6 +30,6 @@ export function resumeAudioContext() {
 /**
  * Convert AudioBuffer to a Blob (WAV) - Offloaded to Worker
  */
-export async function bufferToWave(ab) {
+export async function bufferToWave(ab: AudioBuffer): Promise<Blob> {
     return await bufferToWaveWorker(ab, ab.length);
 }

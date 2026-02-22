@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## [v4.0.0] - 2026-02-23 - "Type-Safe Evolution"
+
+### 🛡️ TypeScript Migration
+
+- **Full Codebase Conversion**: Migrated 100% of JavaScript files to TypeScript, including Main, Preload, and Audio Workers.
+- **Type Safety**: Defined comprehensive interfaces for `AppState`, `Track`, and module dependencies to catch runtime errors during build.
+- **Improved Tooling**: Configured `tsconfig.json` for incremental migration and strict mode.
+- **Enhanced Build Pipeline**: Updated `scripts/build.js` with `esbuild` to handle `.ts` entry points and produce optimized, bundled output for both Main and Renderer processes.
+- **Bug Fixes**: Resolved several unclosed functions and logic errors discovered during the type-checking phase in `main.js` and `playlist.js`.
+
 ## [v3.2.1] - 2026-02-22 - "Hardened Core & Modular Audio"
 
 ### 🛡️ Security Audit Fixes

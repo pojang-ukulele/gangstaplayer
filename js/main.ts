@@ -1,24 +1,31 @@
 // === MAIN ENTRY POINT ===
 // Gangsta Player Pro 3 - Modular Architecture
-// This is the orchestrator that imports and initializes all modules
-import { KEYBOARD_MAP } from './constants.js';
-import { resumeAudioContext } from './audio.js';
-import { enableMIDI, initMIDI } from './midi.js';
+import { resumeAudioContext, masterGain, audioCtx, bufferToWave } from './audio';
+import { enableMIDI, initMIDI } from './midi';
 import { 
     initSampler, createPadGrid, setupPadKeyboardHandlers, getPadGrid,
-    startPad, stopPad, loadSampleFile, loadSampleFromPath, toggleSync,
+    startPad, stopPad, loadSampleFromPath, toggleSync,
     padBuffers, activeVoices, padVolumes, padSyncState
-} from './sampler.js';
-import { initPlayer, setupPlayerHandlers, loadTrack, playTrack, pauseTrack, 
+} from './sampler';
+import { 
+    initPlayer, setupPlayerHandlers, loadTrack, playTrack, pauseTrack, 
     getMasterBPMRef, getTempoSlider, setAutoMixEnabled,
-    getPlayerAudio, stopPlayback
-} from './player.js';
-import { detectBPMWorker } from './worker-client.js';
-import { initPlaylist, setupPlaylistHandlers, renderPlaylist, setBlendingIndex, handlePlaylistNavigation } from './playlist.js';
-import { initSettings, setupSettingsHandlers, loadSettings } from './settings.js';
-import { initVisuals, playStartupSound } from './visuals.js';
-import { state } from './state.js';
-import { toast } from './toast.js';
+    getPlayerAudio, stopPlayback, getPlaybackMode, setPlaybackMode,
+    getLoopMode, setLoopMode
+} from './player';
+import { detectBPMWorker } from './worker-client';
+import { initPlaylist, setupPlaylistHandlers, renderPlaylist, setBlendingIndex, handlePlaylistNavigation } from './playlist';
+import { initSettings, setupSettingsHandlers, loadSettings } from './settings';
+import { initVisuals, playStartupSound } from './visuals';
+import { state } from './state';
+import { toast } from './toast';
+
+declare global {
+    interface Window {
+        electronAPI: any;
+        fileSystem: any;
+    }
+}
 
 const bridge = window.electronAPI;
 const fsBridge = window.fileSystem;
@@ -39,10 +46,10 @@ async function initApp() {
         fsBridge, bridge, 
         detectBPM: detectBPMWorker,
         masterBPMRef: getMasterBPMRef(),
-        tempoSlider: getTempoSlider()
+        tempoSlider: getTempoSlider() as HTMLInputElement
     });
 
-    initPlayer({ renderPlaylist, setBlendingIndex });
+    initPlayer({ playlist: state.playlist, renderPlaylist, setBlendingIndex });
 
     initPlaylist({
         loadTrack, playTrack
@@ -50,7 +57,7 @@ async function initApp() {
 
     initMIDI({ startPad, stopPad, activeVoices, padVolumes });
 
-    initSettings({ bridge, playerAudio: getPlayerAudio(), setAutoMixEnabled });
+    initSettings({ setAutoMixEnabled });
 
     // Initialize UI components
     createPadGrid();
@@ -60,8 +67,8 @@ async function initApp() {
     setupPadKeyboardHandlers();
     setupPlayerHandlers();
     setupPlaylistHandlers();
-    // setupSettingsHandlers(); // Already called in initSettings
-    // loadSettings();          // Already called in initSettings
+    setupSettingsHandlers();
+    loadSettings();
 
     // Context Menu for Pads
     const padGrid = getPadGrid();
@@ -73,7 +80,7 @@ async function initApp() {
     if (padGrid && padContextMenu) {
         for (let i = 0; i < 16; i++) {
             const padWrapper = padGrid.children[i];
-            const pad = padWrapper?.querySelector('.pad');
+            const pad = padWrapper?.querySelector('.pad') as HTMLElement;
             if (pad) {
                 pad.addEventListener('contextmenu', (e) => {
                     e.preventDefault();
@@ -96,7 +103,7 @@ async function initApp() {
                     padContextMenu.setAttribute('aria-hidden', 'false');
                     padContextMenu.style.left = e.pageX + 'px';
                     padContextMenu.style.top = e.pageY + 'px';
-                    padContextMenu.dataset.padIndex = i;
+                    padContextMenu.dataset.padIndex = i.toString();
                 });
                 pad.addEventListener('mousedown', (e) => { if (e.button === 0 && padBuffers[i]) startPad(i); });
                 pad.addEventListener('mouseup', () => stopPad(i));
@@ -111,18 +118,16 @@ async function initApp() {
         }
     }
 
-    // Global Click Handler to hide menus (handled later with unified logic)
-
-    if (ctxLoadSample) {
+    if (ctxLoadSample && padContextMenu) {
         ctxLoadSample.addEventListener('click', async () => {
-            const index = parseInt(padContextMenu.dataset.padIndex);
+            const index = parseInt(padContextMenu.dataset.padIndex || "0");
             const filePath = await bridge.openSampleDialog();
             if (filePath) await loadSampleFromPath(filePath, index);
         });
     }
-    if (ctxSync) {
+    if (ctxSync && padContextMenu) {
         ctxSync.addEventListener('click', () => {
-            const index = parseInt(padContextMenu.dataset.padIndex);
+            const index = parseInt(padContextMenu.dataset.padIndex || "0");
             toggleSync(index);
         });
     }
@@ -130,11 +135,13 @@ async function initApp() {
     // === GLOBAL KEYBOARD SHORTCUTS ===
     document.addEventListener('keydown', (e) => {
         // Ignore if user is typing in an input
-        if (e.target.tagName === 'INPUT' && e.target.type === 'text') return;
+        const target = e.target as HTMLElement;
+        if (target.tagName === 'INPUT' && (target as HTMLInputElement).type === 'text') return;
 
         // Transport
         if (e.code === 'Space') {
             e.preventDefault(); 
+            const playerAudio = getPlayerAudio();
             if (playerAudio) {
                 if (!playerAudio.paused) pauseTrack(); else playTrack();
             }
@@ -155,19 +162,17 @@ async function initApp() {
 
     // === MASTER RECORDING LOGIC ===
     const recBtn = document.getElementById('masterRecBtn');
-    let mediaRecorder;
-    let recordedChunks = [];
+    let mediaRecorder: MediaRecorder | null = null;
+    let recordedChunks: Blob[] = [];
     let isRecording = false;
 
     if (recBtn) {
         recBtn.addEventListener('click', async () => {
             if (!isRecording) {
                 // START RECORDING
-                const { masterGain, audioCtx, bufferToWave } = await import('./audio.js'); 
                 if (!mediaRecorder) {
                     const dest = audioCtx.createMediaStreamDestination();
                     masterGain.connect(dest);
-                    // Standard WebM recording
                     mediaRecorder = new MediaRecorder(dest.stream);
                     
                     mediaRecorder.ondataavailable = (e) => {
@@ -175,19 +180,15 @@ async function initApp() {
                     };
                     
                     mediaRecorder.onstop = async () => {
-                        // 1. Create WebM Blob from chunks
                         const webmBlob = new Blob(recordedChunks, { type: 'audio/webm' });
                         recordedChunks = [];
                         
-                        // 2. Decode WebM to PCM AudioBuffer
                         const arrayBuffer = await webmBlob.arrayBuffer();
                         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
                         
-                        // 3. Convert PCM to valid seekable WAV Blob
                         const wavBlob = await bufferToWave(audioBuffer);
                         const wavBuffer = await wavBlob.arrayBuffer();
 
-                        // 4. Save
                         const path = await bridge.saveAudioDialog();
                         if (path) {
                              await fsBridge.saveFile(path, new Uint8Array(wavBuffer));
@@ -214,7 +215,6 @@ async function initApp() {
             }
         });
     }
-    }
 
     // Manual Button
     const btnOpenManual = document.getElementById('btnOpenManual');
@@ -223,12 +223,12 @@ async function initApp() {
              bridge.openExternal('README.txt');
         });
     }
+
     // === PLAY BUTTON CONTEXT MENU ===
     const playPauseBtn = document.getElementById('playPauseBtn');
     const playContextMenu = document.getElementById('playContextMenu');
     const ctxPlayContinuous = document.getElementById('ctxPlayContinuous');
     const ctxPlaySingle = document.getElementById('ctxPlaySingle');
-    const { getPlaybackMode, setPlaybackMode } = await import('./player.js');
 
     if (playPauseBtn && playContextMenu) {
         playPauseBtn.addEventListener('contextmenu', (e) => {
@@ -240,12 +240,10 @@ async function initApp() {
             const playlistCtxMenu = document.getElementById('contextMenu');
             if (playlistCtxMenu) playlistCtxMenu.classList.add('hidden');
 
-            // Update Checks
             const mode = getPlaybackMode();
             if (ctxPlayContinuous) ctxPlayContinuous.innerText = `CONTINUOUS PLAYBACK ${mode === 'continuous' ? '✓' : ''}`;
             if (ctxPlaySingle) ctxPlaySingle.innerText = `STOP AFTER CURRENT ${mode === 'single' ? '✓' : ''}`;
 
-            // Show
             playContextMenu.classList.remove('hidden');
             playContextMenu.setAttribute('aria-hidden', 'false');
             playContextMenu.style.left = e.pageX + 'px';
@@ -256,17 +254,15 @@ async function initApp() {
     if (ctxPlayContinuous) {
         ctxPlayContinuous.addEventListener('click', () => {
             setPlaybackMode('continuous');
-            playContextMenu.classList.add('hidden');
+            playContextMenu?.classList.add('hidden');
         });
     }
     if (ctxPlaySingle) {
         ctxPlaySingle.addEventListener('click', () => {
             setPlaybackMode('single');
-            playContextMenu.classList.add('hidden');
+            playContextMenu?.classList.add('hidden');
         });
     }
-
-
 
     // === LOOP BUTTON CONTEXT MENU ===
     const loopBtn = document.getElementById('loopBtn');
@@ -274,85 +270,65 @@ async function initApp() {
     const ctxLoopOff = document.getElementById('ctxLoopOff');
     const ctxLoopOne = document.getElementById('ctxLoopOne');
     const ctxLoopAll = document.getElementById('ctxLoopAll');
-    const { getLoopMode, setLoopMode } = await import('./player.js');
 
     if (loopBtn && loopContextMenu) {
-        // Right Click: Show Menu
         loopBtn.addEventListener('contextmenu', (e) => {
             e.preventDefault();
             e.stopPropagation();
 
-            // Hide others
             if (padContextMenu) padContextMenu.classList.add('hidden');
             if (playContextMenu) playContextMenu.classList.add('hidden');
             const playlistCtxMenu = document.getElementById('contextMenu');
             if (playlistCtxMenu) playlistCtxMenu.classList.add('hidden');
 
-            // Update Checks
             const mode = getLoopMode();
             if (ctxLoopOff) ctxLoopOff.innerText = `LOOP OFF ${mode === 'off' ? '✓' : ''}`;
             if (ctxLoopOne) ctxLoopOne.innerText = `LOOP CURRENT TRACK ${mode === 'one' ? '✓' : ''}`;
             if (ctxLoopAll) ctxLoopAll.innerText = `LOOP PLAYLIST ${mode === 'all' ? '✓' : ''}`;
 
-            // Show
             loopContextMenu.classList.remove('hidden');
             loopContextMenu.setAttribute('aria-hidden', 'false');
             loopContextMenu.style.left = e.pageX + 'px';
             loopContextMenu.style.top = e.pageY + 'px';
         });
 
-        // Left Click: Toggle (Off -> One -> All -> Off) or (Off <-> Last Selected)?
-        // User request: "select to loop current song, or loop the playlist... and same kind of visual feedback when selected"
-        // Let's make Left Click cycle through modes for convenience, or just toggle One/Off?
-        // Standard behavior for Loop button: Toggle Off/One/All.
         loopBtn.addEventListener('click', () => {
              const current = getLoopMode();
-             let next = 'off';
+             let next: 'off' | 'one' | 'all' = 'off';
              if (current === 'off') next = 'one';
              else if (current === 'one') next = 'all';
              else if (current === 'all') next = 'off';
              
              setLoopMode(next);
              
-             // Update Visual Feedback on Button? 
-             // Maybe add active class if not off?
              if (next !== 'off') loopBtn.classList.add('active-loop');
              else loopBtn.classList.remove('active-loop');
-
-             // Optional: Show brief toast or log?
         });
     }
 
     if (ctxLoopOff) {
         ctxLoopOff.addEventListener('click', () => {
             setLoopMode('off');
-            loopBtn.classList.remove('active-loop');
-            loopContextMenu.classList.add('hidden');
+            loopBtn?.classList.remove('active-loop');
+            loopContextMenu?.classList.add('hidden');
         });
     }
     if (ctxLoopOne) {
         ctxLoopOne.addEventListener('click', () => {
             setLoopMode('one');
-            loopBtn.classList.add('active-loop');
-            loopContextMenu.classList.add('hidden');
+            loopBtn?.classList.add('active-loop');
+            loopContextMenu?.classList.add('hidden');
         });
     }
     if (ctxLoopAll) {
         ctxLoopAll.addEventListener('click', () => {
             setLoopMode('all');
-            loopBtn.classList.add('active-loop');
-            loopContextMenu.classList.add('hidden');
+            loopBtn?.classList.add('active-loop');
+            loopContextMenu?.classList.add('hidden');
         });
     }
 
-    // React to state changes
-    state.subscribe(() => {
-        // Many UI updates are already handled by direct calls in modules, 
-        // but this is where we'd add cross-module sync if needed.
-    });
-
-
-    // Global Click Handler (Update existing one to include loopContextMenu)
+    // Global Click Handler to hide menus
     document.addEventListener('click', () => {
         const playlistCtxMenu = document.getElementById('contextMenu');
         if (playlistCtxMenu) {
@@ -372,11 +348,9 @@ async function initApp() {
             loopContextMenu.setAttribute('aria-hidden', 'true');
         }
     });
+}
 
-if (document.readyState === 'loading') {
-    
 function applyPlatformStyles() {
-    // Apply Electron-specific styles programmatically to avoid CSS linter warnings
     const style = document.createElement('style');
     style.textContent = `
         .title-bar { -webkit-app-region: drag; }
@@ -386,13 +360,10 @@ function applyPlatformStyles() {
     document.head.appendChild(style);
 }
 
-document.addEventListener('DOMContentLoaded', initApp);
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initApp);
 } else {
     initApp();
-
-
-
-    // === MASTER RECORDING LOGIC MOVED TO initApp ===
 }
 
 document.body.addEventListener('click', () => { resumeAudioContext(); enableMIDI(); }, { once: true });

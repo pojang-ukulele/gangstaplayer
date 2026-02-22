@@ -1,47 +1,46 @@
 // === VISUALS & LIGHTS MODULE ===
-import { VISUALIZER_BARS } from './constants.js';
-import { analyser, masterGain, audioCtx, resumeAudioContext } from './audio.js';
+import { VISUALIZER_BARS } from './constants';
+import { analyser, masterGain, audioCtx, resumeAudioContext } from './audio';
 
 const dataArray = new Uint8Array(analyser.frequencyBinCount);
-const visualizerBars = [];
+const visualizerBars: HTMLElement[] = [];
 const barColors = ['#ff0000', '#d4002b', '#aa0055', '#800080', '#990ae6', '#bc13fe', '#bc13fe', '#a030f0', '#8a50d0', '#7070b0', '#509090', '#30b070', '#20d050', '#10f030', '#39ff14', '#39ff14'];
 
-let leds = [];
+let leds: HTMLElement[] = [];
 let scannerIndex = 0;
 let scannerDirection = 1;
 let lastScannerUpdate = 0;
 
-export function initVisuals() {
+export function initVisuals(): void {
     const visualizerContainer = document.getElementById('visualizer');
     if (!visualizerContainer) return;
 
     visualizerContainer.innerHTML = '';
     for (let i = 0; i < VISUALIZER_BARS; i++) {
-        let bar = document.createElement('div');
+        const bar = document.createElement('div');
         bar.className = 'bar';
         bar.style.backgroundColor = barColors[i];
         visualizerContainer.appendChild(bar);
         visualizerBars.push(bar);
     }
 
-    leds = [
+    leds = ([
         document.getElementById('l1'), document.getElementById('l2'), document.getElementById('l3'),
         document.getElementById('r1'), document.getElementById('r2'), document.getElementById('r3')
-    ].filter(l => l !== null);
+    ].filter(l => l !== null)) as HTMLElement[];
     
     setupScrews();
 
     masterLoop();
 }
 
-function setupScrews() {
-    const screws = document.querySelectorAll('.screw');
+function setupScrews(): void {
+    const screws = document.querySelectorAll<HTMLElement>('.screw');
     screws.forEach(screw => {
         let clicks = 0;
         screw.addEventListener('click', () => {
              clicks++;
              // Lefty-loosey attempts
-             // User requested direction flip for BR
              let rotationDir = 1;
              
              // Debugging class detection
@@ -65,7 +64,8 @@ function setupScrews() {
                      screw.classList.add('dropped');
                      // Create hole
                      const hole = document.createElement('div');
-                     hole.className = 'screw-hole ' + Array.from(screw.classList).find(c => ['tl','tr','bl','br'].includes(c));
+                     const posClass = Array.from(screw.classList).find(c => ['tl','tr','bl','br'].includes(c));
+                     hole.className = 'screw-hole ' + (posClass || '');
                      if (screw.parentElement) screw.parentElement.insertBefore(hole, screw);
                  }
              }
@@ -73,13 +73,13 @@ function setupScrews() {
     });
 }
 
-function masterLoop() {
+function masterLoop(): void {
     requestAnimationFrame(masterLoop);
     analyser.getByteFrequencyData(dataArray);
     
     let totalVol = 0;
     for (let i = 0; i < dataArray.length; i++) totalVol += dataArray[i];
-    let totalAvg = totalVol / dataArray.length;
+    const totalAvg = totalVol / dataArray.length;
 
     const BASS_THRESHOLD = 200;
     const MID_THRESHOLD = 160;
@@ -91,7 +91,9 @@ function masterLoop() {
         const step = Math.floor(dataArray.length / 16);
         for (let i = 0; i < 16; i++) {
             const value = dataArray[i * step];
-            visualizerBars[i].style.height = Math.max(5, (value / 255) * 100) + '%';
+            if (visualizerBars[i]) {
+                visualizerBars[i].style.height = Math.max(5, (value / 255) * 100) + '%';
+            }
         }
 
         // Only run heavy LED logic every 2nd frame or so (optimization)
@@ -125,7 +127,7 @@ function masterLoop() {
     }
 }
 
-export function playStartupSound() {
+export function playStartupSound(): void {
     console.log("[Visuals] Triggering startup sound...");
     resumeAudioContext().then(() => {
         fetch('assets/gun-load.wav')

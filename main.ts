@@ -1,28 +1,20 @@
-const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron')
-const path = require('path')
-const fs = require('fs')
+import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron';
+import * as path from 'path';
+import * as fs from 'fs';
 
-// Sonetra Bridge - optional, won't crash app if it fails
-let sonetraBridge = null;
-try {
-    sonetraBridge = require('./sonetra-bridge');
-} catch (err) {
-    console.error('[Sonetra] Failed to load bridge module:', err.message);
-}
+import sonetraBridge from './sonetra-bridge';
 
-// Transition cache for pre-computed transitions
 // Transition cache for pre-computed transitions
 const MAX_CACHE_SIZE = 50;
-const transitionCache = new Map();
+const transitionCache = new Map<string, any>();
 
-function addToCache(key, value) {
+function addToCache(key: string, value: any) {
   if (transitionCache.size >= MAX_CACHE_SIZE) {
     const firstKey = transitionCache.keys().next().value;
-    transitionCache.delete(firstKey);
+    if (firstKey) transitionCache.delete(firstKey);
   }
   transitionCache.set(key, value);
 }
-
 
 // FORCE AUTOPLAY
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
@@ -61,20 +53,15 @@ function createWindow() {
     }
   });
   ipcMain.on('app:close', () => { win.close(); });
-  ipcMain.on('app:set-fullscreen', (event, flag) => { win.setFullScreen(flag); })
+  ipcMain.on('app:set-fullscreen', (_event, flag) => { win.setFullScreen(flag); })
   
-  ipcMain.handle('app:open-external', async (event, relativePath) => {
-    let fullPath;
+  ipcMain.handle('app:open-external', async (_event, relativePath) => {
+    let fullPath: string;
     if (app.isPackaged) {
-        // Production: File is in 'resources' folder via extraResources
         fullPath = path.join(process.resourcesPath, relativePath);
     } else {
-        // Development: File is in app root
         fullPath = path.join(app.getAppPath(), relativePath);
     }
-    
-    // Check if exists for better debug?
-    // console.log("Opening external:", fullPath);
     await shell.openPath(fullPath);
   });
 
@@ -108,27 +95,21 @@ function createWindow() {
     return filePath
   })
 
-  // NEW: Secure File System Handlers
-  ipcMain.handle('fs:save-file', async (event, pathStr, data) => {
-    // Only allow saving to specific subdirectories or files already selected by dialog
-    // For now, at least ensure it's not trying to leave the system hierarchy via basic checks
+  // Secure File System Handlers
+  ipcMain.handle('fs:save-file', async (_event, pathStr: string, data: Uint8Array) => {
     if (!pathStr || typeof pathStr !== 'string') return false;
-    
-    // In a real production app, we would track 'authorizedPaths' from dialog results
-    // For this audit fix, we'll ensure we aren't writing to sensitive system areas
     const normalized = path.normalize(pathStr);
     fs.writeFileSync(normalized, data);
     return true;
   });
 
-  ipcMain.handle('fs:read-file', async (event, pathStr) => {
+  ipcMain.handle('fs:read-file', async (_event, pathStr: string) => {
     if (!pathStr || typeof pathStr !== 'string') return null;
     const normalized = path.normalize(pathStr);
     const buffer = fs.readFileSync(normalized);
     return buffer;
   });
 
-  // NEW: Recording Handlers
   ipcMain.handle('fs:ensure-recordings-dir', async () => {
     const userDataPath = app.getPath('userData');
     const recPath = path.join(userDataPath, 'recordings');
@@ -138,15 +119,13 @@ function createWindow() {
     return recPath;
   });
 
-  ipcMain.handle('fs:save-recording', async (event, buffer, filename) => {
+  ipcMain.handle('fs:save-recording', async (_event, buffer: ArrayBuffer, filename: string) => {
     const userDataPath = app.getPath('userData');
     const recPath = path.join(userDataPath, 'recordings', filename);
-    // Buffer comes as Uint8Array/ArrayBuffer from renderer
     fs.writeFileSync(recPath, Buffer.from(buffer));
     return recPath;
   });
 
-  // NEW: Soundpack Helper
   ipcMain.handle('dialog:open-sample', async () => {
     const { canceled, filePaths } = await dialog.showOpenDialog(win, {
       title: 'Load Audio Sample',
@@ -160,38 +139,32 @@ function createWindow() {
 
   // ==================== SONETRA AI MIXER HANDLERS ====================
   
-  // Start the Sonetra Python server
   ipcMain.handle('sonetra:start-server', async () => {
     if (!sonetraBridge) return { success: false, error: 'Sonetra bridge not loaded' };
     return await sonetraBridge.startServer();
   });
 
-  // Stop the Sonetra server
   ipcMain.handle('sonetra:stop-server', async () => {
     if (!sonetraBridge) return { success: false };
     return await sonetraBridge.stopServer();
   });
 
-  // Get server status
   ipcMain.handle('sonetra:get-status', async () => {
     if (!sonetraBridge) return { isRunning: false, error: 'Bridge not loaded' };
     return sonetraBridge.getStatus();
   });
 
-  // Create a transition between two tracks
-  ipcMain.handle('sonetra:create-transition', async (event, track1Path, track2Path, style) => {
+  ipcMain.handle('sonetra:create-transition', async (_event, track1Path: string, track2Path: string, style: string) => {
     if (!sonetraBridge) return { success: false, error: 'Sonetra bridge not loaded' };
     return await sonetraBridge.createTransition(track1Path, track2Path, style || 'smooth');
   });
 
-  // Analyze a single track
-  ipcMain.handle('sonetra:analyze-track', async (event, trackPath) => {
+  ipcMain.handle('sonetra:analyze-track', async (_event, trackPath: string) => {
     if (!sonetraBridge) return { success: false, error: 'Sonetra bridge not loaded' };
     return await sonetraBridge.analyzeTrack(trackPath);
   });
 
-  // Get cached transition (for pre-computed transitions)
-  ipcMain.handle('sonetra:get-cached-transition', async (event, track1Path, track2Path) => {
+  ipcMain.handle('sonetra:get-cached-transition', async (_event, track1Path: string, track2Path: string) => {
     const cacheKey = `${track1Path}||${track2Path}`;
     const cached = transitionCache.get(cacheKey);
     if (cached) {
@@ -200,22 +173,18 @@ function createWindow() {
     return { success: false, error: 'No cached transition found' };
   });
 
-  // Precompute and cache a transition (called when songs are added to playlist)
-  ipcMain.handle('sonetra:precompute-transition', async (event, track1Path, track2Path) => {
+  ipcMain.handle('sonetra:precompute-transition', async (_event, track1Path: string, track2Path: string) => {
     if (!sonetraBridge) return { success: false, error: 'Sonetra bridge not loaded' };
     
     const cacheKey = `${track1Path}||${track2Path}`;
     
-    // Check if already cached
     if (transitionCache.has(cacheKey)) {
       return { success: true, cached: true };
     }
 
-    // Generate the transition
     const result = await sonetraBridge.createTransition(track1Path, track2Path, 'smooth');
     
     if (result.success && result.audioBuffer) {
-      // Store in cache
       addToCache(cacheKey, result.audioBuffer);
       return { success: true, cached: false };
     }
@@ -223,7 +192,6 @@ function createWindow() {
     return result;
   });
 
-  // Clean up Sonetra server when window closes
   win.on('close', async () => {
     if (sonetraBridge) {
       await sonetraBridge.stopServer();

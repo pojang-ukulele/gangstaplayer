@@ -2,26 +2,35 @@
  * Client for communicating with the Audio Processing Worker
  */
 
+interface PendingRequest {
+    resolve: (value: any) => void;
+}
+
 const worker = new Worker('js/workers/audio-worker.js');
-const pendingRequests = new Map();
+const pendingRequests = new Map<number, PendingRequest>();
 let requestId = 0;
 
-worker.onmessage = function(e) {
+worker.onmessage = function(e: MessageEvent) {
     const { type, bpm, blob, id } = e.data;
     if (pendingRequests.has(id)) {
-        const { resolve } = pendingRequests.get(id);
-        pendingRequests.delete(id);
-        if (type === 'BPM_RESULT') resolve(bpm);
-        if (type === 'WAVE_RESULT') resolve(blob);
+        const request = pendingRequests.get(id);
+        if (request) {
+            pendingRequests.delete(id);
+            if (type === 'BPM_RESULT') request.resolve(bpm);
+            if (type === 'WAVE_RESULT') request.resolve(blob);
+        }
     }
 };
 
-export function detectBPMWorker(audioBuffer) {
+/**
+ * Detect BPM of an audio buffer using a worker
+ */
+export function detectBPMWorker(audioBuffer: AudioBuffer): Promise<number> {
     const id = requestId++;
     return new Promise((resolve) => {
         pendingRequests.set(id, { resolve });
-        // Create a copy if it's already detached or if we want to preserve original.
-        // Actually, AudioBuffer's buffers can be transferred if they are Float32Arrays.
+        
+        // AudioBuffer's buffers can be transferred if they are Float32Arrays.
         const data = new Float32Array(audioBuffer.getChannelData(0));
         worker.postMessage({ 
             type: 'DETECT_BPM', 
@@ -31,12 +40,15 @@ export function detectBPMWorker(audioBuffer) {
     });
 }
 
-export function bufferToWaveWorker(audioBuffer, len) {
+/**
+ * Convert AudioBuffer to a Blob (WAV) using a worker
+ */
+export function bufferToWaveWorker(audioBuffer: AudioBuffer, len: number): Promise<Blob> {
     const id = requestId++;
     return new Promise((resolve) => {
         pendingRequests.set(id, { resolve });
-        const channels = [];
-        const buffers = [];
+        const channels: Float32Array[] = [];
+        const buffers: ArrayBufferLike[] = [];
         for (let i = 0; i < audioBuffer.numberOfChannels; i++) {
             const data = new Float32Array(audioBuffer.getChannelData(i));
             channels.push(data);

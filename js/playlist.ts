@@ -1,30 +1,35 @@
-import { DRAG_THRESHOLD_PX } from './constants.js';
-import { audioCtx } from './audio.js';
-import { detectBPMWorker } from './worker-client.js';
-import { state } from './state.js';
+import { DRAG_THRESHOLD_PX } from './constants';
+import { audioCtx } from './audio';
+import { detectBPMWorker } from './worker-client';
+import { state, Track } from './state';
+
+interface PlaylistDeps {
+    loadTrack: (index: number) => Promise<void>;
+    playTrack: () => void;
+}
+
 let anchorIndex = -1;
 let pivotIndex = -1; // Start of selection range
 let draggedIndex = -1;
 let isDragging = false;
 let dragStartY = 0;
 
-let playlistEl = null;
+let playlistEl: HTMLElement | null = null;
+let playlistInput: HTMLInputElement | null = null;
+let contextMenu: HTMLElement | null = null;
 
-let playlistInput = null;
-let contextMenu = null;
+let loadTrackFn: ((index: number) => Promise<void>) | null = null;
+let playTrackFn: (() => void) | null = null;
 
-let loadTrackFn = null;
-let playTrackFn = null;
-
-export function initPlaylist(deps) {
+export function initPlaylist(deps: PlaylistDeps): void {
     loadTrackFn = deps.loadTrack;
     playTrackFn = deps.playTrack;
     playlistEl = document.getElementById('playlist');
-    playlistInput = document.getElementById('playlistInput');
+    playlistInput = document.getElementById('playlistInput') as HTMLInputElement;
     contextMenu = document.getElementById('contextMenu');
 }
 
-export function setBlendingIndex(index) {
+export function setBlendingIndex(index: number): void {
     state.update({ blendingIndex: index });
     renderPlaylist();
 }
@@ -32,9 +37,9 @@ export function setBlendingIndex(index) {
 /**
  * Background worker to analyze BPM for a track
  */
-async function analyzeTrackInBackground(track) {
+async function analyzeTrackInBackground(track: Track): Promise<void> {
     try {
-        const response = await fetch(track.url);
+        const response = await fetch(track.path); // Track 'url' was used in JS, but 'path' in state.ts Track interface
         const arrayBuffer = await response.arrayBuffer();
         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
         const bpm = await detectBPMWorker(audioBuffer);
@@ -46,14 +51,16 @@ async function analyzeTrackInBackground(track) {
     }
 }
 
-export function addTracksToPlaylist(files) {
+export function addTracksToPlaylist(files: File[]): void {
     const currentPlaylist = [...state.playlist];
     const startIdx = currentPlaylist.length;
     files.forEach((file) => {
-        const track = { 
+        const track: Track = { 
+            id: Math.random().toString(36).substr(2, 9),
             name: file.name, 
-            url: URL.createObjectURL(file),
-            bpm: null 
+            path: URL.createObjectURL(file), // Using 'path' as the URL placeholder
+            duration: 0, // Duration will be set when loaded
+            bpm: undefined 
         };
         currentPlaylist.push(track);
         analyzeTrackInBackground(track);
@@ -73,7 +80,7 @@ export function addTracksToPlaylist(files) {
     }
 }
 
-export function renderPlaylist() {
+export function renderPlaylist(): void {
     if (!playlistEl) return;
     playlistEl.innerHTML = '';
     state.playlist.forEach((track, index) => {
@@ -167,23 +174,22 @@ export function renderPlaylist() {
                  menu.style.top = y + 'px';
                  
                  // Store index for actions
-                 menu.dataset.removeIndex = index; 
+                 menu.dataset.removeIndex = index.toString(); 
              }
         });
 
-        playlistEl.appendChild(li);
+        if (playlistEl) playlistEl.appendChild(li);
     });
 }
 
 // === NEW: KEYBOARD NAVIGATION ===
-export function handlePlaylistNavigation(e) {
+export function handlePlaylistNavigation(e: KeyboardEvent): void {
     if (!state.playlist.length) return;
     
     // Ensure valid anchor/pivot if coming from empty state
     if (anchorIndex === -1) anchorIndex = 0;
     if (pivotIndex === -1) pivotIndex = anchorIndex;
 
-    const lastAnchor = anchorIndex;
     let newAnchor = anchorIndex;
 
     if (e.key === 'ArrowUp') {
@@ -220,11 +226,11 @@ export function handlePlaylistNavigation(e) {
     renderPlaylist();
     // Scroll into view
     if (playlistEl && playlistEl.children[anchorIndex]) {
-        playlistEl.children[anchorIndex].scrollIntoView({ block: 'nearest' });
+        (playlistEl.children[anchorIndex] as HTMLElement).scrollIntoView({ block: 'nearest' });
     }
 }
 
-export function removeSelectedTracks() {
+export function removeSelectedTracks(): void {
     if (!state.selectedIndices.length) return;
     
     const currentPlaylist = [...state.playlist];
@@ -240,7 +246,7 @@ export function removeSelectedTracks() {
     let newAnchor = Math.min(anchorIndex, currentPlaylist.length - 1);
     let newPivot = newAnchor; 
 
-    const newSelected = [];
+    const newSelected: number[] = [];
     if (newAnchor >= 0 && currentPlaylist.length > 0) {
         newSelected.push(newAnchor);
     } else if (currentPlaylist.length > 0) {
@@ -262,11 +268,14 @@ export function removeSelectedTracks() {
     renderPlaylist();
 }
 
-export function setupPlaylistHandlers() {
+export function setupPlaylistHandlers(): void {
     if (playlistInput) {
         playlistInput.addEventListener('change', (e) => {
-            addTracksToPlaylist(Array.from(e.target.files));
-            e.target.value = ''; // FIX: Allow re-adding same file
+            const target = e.target as HTMLInputElement;
+            if (target.files) {
+                addTracksToPlaylist(Array.from(target.files));
+            }
+            target.value = ''; // FIX: Allow re-adding same file
         });
     }
 
@@ -286,19 +295,19 @@ export function setupPlaylistHandlers() {
         playlistEl.addEventListener('dragover', (e) => {
             e.preventDefault();
             e.stopPropagation();
-            playlistEl.classList.add('drag-over');
+            if (playlistEl) playlistEl.classList.add('drag-over');
         });
 
         playlistEl.addEventListener('dragleave', (e) => {
             e.preventDefault();
             e.stopPropagation();
-            playlistEl.classList.remove('drag-over');
+            if (playlistEl) playlistEl.classList.remove('drag-over');
         });
 
         playlistEl.addEventListener('drop', (e) => {
             e.preventDefault();
             e.stopPropagation();
-            playlistEl.classList.remove('drag-over');
+            if (playlistEl) playlistEl.classList.remove('drag-over');
             if (e.dataTransfer && e.dataTransfer.files.length > 0) {
                 addTracksToPlaylist(Array.from(e.dataTransfer.files));
             }
@@ -354,10 +363,15 @@ export function setupPlaylistHandlers() {
     });
 
     if (ctxPlay) ctxPlay.addEventListener('click', () => {
-         const idx = parseInt(contextMenu.dataset.removeIndex);
-         if (!isNaN(idx)) {
-             if (loadTrackFn) loadTrackFn(idx);
-             if (playTrackFn) setTimeout(() => playTrackFn(), 100);
+         if (contextMenu) {
+             const idxStr = contextMenu.dataset.removeIndex;
+             if (idxStr) {
+                 const idx = parseInt(idxStr);
+                 if (!isNaN(idx)) {
+                     if (loadTrackFn) loadTrackFn(idx);
+                     if (playTrackFn) setTimeout(() => playTrackFn!(), 100);
+                 }
+             }
          }
     });
 }

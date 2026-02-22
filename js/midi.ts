@@ -1,31 +1,41 @@
 // === MIDI SUPPORT ===
-import { MIDI_NOTE_TO_PAD } from './constants.js';
-import { audioCtx } from './audio.js';
+import { MIDI_NOTE_TO_PAD } from './constants';
+import { audioCtx } from './audio';
+
+interface MidiDeps {
+    startPad: (pad: number) => void;
+    stopPad: (pad: number) => void;
+    activeVoices: Record<number, any>;
+    padVolumes: number[];
+}
 
 let selectedMidiId = 'all';
-let midiDeviceSelect = null;
-let midiStatusEl = null;
+let midiDeviceSelect: HTMLSelectElement | null = null;
+let midiStatusEl: HTMLElement | null = null;
 
-let startPadFn = null;
-let stopPadFn = null;
-let activeVoicesRef = null;
-let padVolumesRef = null;
+let startPadFn: ((pad: number) => void) | null = null;
+let stopPadFn: ((pad: number) => void) | null = null;
+let activeVoicesRef: Record<number, any> | null = null;
+let padVolumesRef: number[] | null = null;
 
-export function initMIDI(deps) {
+export function initMIDI(deps: MidiDeps): void {
     startPadFn = deps.startPad;
     stopPadFn = deps.stopPad;
     activeVoicesRef = deps.activeVoices;
     padVolumesRef = deps.padVolumes;
     
-    midiDeviceSelect = document.getElementById('midiDeviceSelect');
+    midiDeviceSelect = document.getElementById('midiDeviceSelect') as HTMLSelectElement;
     midiStatusEl = document.getElementById('midiStatus');
     
     if (midiDeviceSelect) {
-        midiDeviceSelect.addEventListener('change', (e) => selectedMidiId = e.target.value);
+        midiDeviceSelect.addEventListener('change', (e) => {
+            const target = e.target as HTMLSelectElement;
+            selectedMidiId = target.value;
+        });
     }
 }
 
-export function enableMIDI() {
+export function enableMIDI(): void {
     if (!navigator.requestMIDIAccess) {
         console.error("WebMIDI not supported in this environment.");
         return;
@@ -33,24 +43,25 @@ export function enableMIDI() {
     navigator.requestMIDIAccess().then(onMIDISuccess, onMIDIFailure);
 }
 
-function onMIDISuccess(midiAccess) {
+function onMIDISuccess(midiAccess: WebMidi.MIDIAccess): void {
     updateMidiStatus(midiAccess);
-    for (let input of midiAccess.inputs.values()) {
+    for (const input of midiAccess.inputs.values()) {
         input.onmidimessage = getMIDIMessage;
     }
-    midiAccess.onstatechange = (e) => {
+    midiAccess.onstatechange = (e: any) => {
         updateMidiStatus(midiAccess);
         if (e.port.type === 'input' && e.port.state === 'connected') {
-            e.port.onmidimessage = getMIDIMessage;
+            const input = e.port as WebMidi.MIDIInput;
+            input.onmidimessage = getMIDIMessage;
         }
     };
 }
 
-function updateMidiStatus(midiAccess) {
+function updateMidiStatus(midiAccess: WebMidi.MIDIAccess): void {
     if (!midiDeviceSelect || !midiStatusEl) return;
     midiDeviceSelect.innerHTML = '<option value="all">ALL INPUTS (Default)</option>';
     let deviceCount = 0;
-    for (let input of midiAccess.inputs.values()) {
+    for (const input of midiAccess.inputs.values()) {
         const option = document.createElement('option');
         option.value = input.id;
         option.text = input.name || `MIDI Device ${input.id}`;
@@ -67,14 +78,14 @@ function updateMidiStatus(midiAccess) {
     }
 }
 
-function onMIDIFailure() {
+function onMIDIFailure(): void {
     if (midiStatusEl) {
         midiStatusEl.innerText = "MIDI: FAIL";
         midiStatusEl.style.color = "red";
     }
 }
 
-function getMIDIMessage(message) {
+function getMIDIMessage(message: any): void {
     if (selectedMidiId !== 'all' && message.target.id !== selectedMidiId) return;
     const [command, note, velocity] = message.data;
     const cmd = command >> 4;
@@ -85,7 +96,7 @@ function getMIDIMessage(message) {
         const pad = MIDI_NOTE_TO_PAD[note];
         if (pad !== undefined && startPadFn) {
             startPadFn(pad);
-            if (activeVoicesRef && activeVoicesRef[pad] && activeVoicesRef[pad].gain) {
+            if (activeVoicesRef && activeVoicesRef[pad] && activeVoicesRef[pad].gain && padVolumesRef) {
                 const vol = (velocity / 127) * (padVolumesRef[pad] || 1);
                 try { activeVoicesRef[pad].gain.gain.setValueAtTime(vol, audioCtx.currentTime); } catch (e) {}
             }

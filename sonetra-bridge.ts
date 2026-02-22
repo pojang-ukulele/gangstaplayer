@@ -2,22 +2,24 @@
  * Sonetra Bridge - Manages the Python FastAPI backend for AI-powered transitions
  */
 
-const { spawn } = require('child_process');
-const path = require('path');
-const http = require('http');
-const fs = require('fs');
+import { spawn, ChildProcess } from 'child_process';
+import * as path from 'path';
+import * as http from 'http';
+import * as fs from 'fs';
 
 class SonetraBridge {
+    serverProcess: ChildProcess | null = null;
+    serverPort: number = 8765;
+    serverHost: string = 'localhost';
+    isRunning: boolean = false;
+    sonetraPath: string | null = null;
+    config: any;
+
     constructor() {
-        this.serverProcess = null;
-        this.serverPort = 8765;
-        this.serverHost = 'localhost';
-        this.isRunning = false;
-        this.sonetraPath = null;
         this.config = this._loadConfig();
     }
 
-    _loadConfig() {
+    _loadConfig(): any {
         try {
             const configPath = path.join(__dirname, 'config.json');
             if (fs.existsSync(configPath)) {
@@ -32,14 +34,14 @@ class SonetraBridge {
     /**
      * Find the Sonetra directory path
      */
-    _findSonetraPath() {
+    _findSonetraPath(): string | null {
         if (this.config.sonetraPath && fs.existsSync(this.config.sonetraPath)) {
             return this.config.sonetraPath;
         }
 
         const possiblePaths = [
             path.join(__dirname, 'Sonetra-AI-Mixer-main'),
-            path.join(process.resourcesPath || '', 'Sonetra-AI-Mixer-main'),
+            path.join((process as any).resourcesPath || '', 'Sonetra-AI-Mixer-main'),
         ];
 
         for (const p of possiblePaths) {
@@ -53,7 +55,7 @@ class SonetraBridge {
     /**
      * Start the Sonetra Python server
      */
-    async startServer() {
+    async startServer(): Promise<{ success: boolean; message?: string, port?: number, error?: string }> {
         if (this.isRunning) {
             console.log('[Sonetra] Server already running');
             return { success: true, message: 'Server already running' };
@@ -67,57 +69,10 @@ class SonetraBridge {
             };
         }
 
+        const pythonCmd = this._resolvePythonCmd();
+
         return new Promise((resolve) => {
-            const apiPath = path.join(this.sonetraPath, 'src', 'api');
-            
-            // Look for venv Python first (from Sonetra-AI-Mixer-main/venv)
-            const venvPythonPaths = [
-                path.join(this.sonetraPath, 'venv', 'Scripts', 'python.exe'),  // Windows venv
-                path.join(this.sonetraPath, 'venv', 'bin', 'python'),          // Unix venv
-            ];
-            
-            // Then portable Python
-            const portablePythonPaths = [
-                path.join(__dirname, 'python-embed', 'python.exe'),
-                path.join(process.resourcesPath || '', 'python-embed', 'python.exe'),
-                path.join(__dirname, 'python', 'python.exe'),
-            ];
-            
-            if (this.config.pythonPath && fs.existsSync(this.config.pythonPath)) {
-                pythonCmd = this.config.pythonPath;
-                console.log(`[Sonetra] Using config Python: ${pythonCmd}`);
-            }
-
-            // Check venv first
-            if (!pythonCmd) {
-                for (const p of venvPythonPaths) {
-                    if (fs.existsSync(p)) {
-                        pythonCmd = p;
-                        console.log(`[Sonetra] Using venv Python: ${p}`);
-                        break;
-                    }
-                }
-            }
-            
-            // Then check portable
-            if (!pythonCmd) {
-                for (const p of portablePythonPaths) {
-                    if (fs.existsSync(p)) {
-                        pythonCmd = p;
-                        console.log(`[Sonetra] Using portable Python: ${p}`);
-                        break;
-                    }
-                }
-            }
-            
-            // Fall back to system Python
-            if (!pythonCmd) {
-                pythonCmd = process.platform === 'win32' ? 'py' : 'python3';
-                console.log(`[Sonetra] Using system Python: ${pythonCmd}`);
-            }
-
-            // Run from src directory so all modules can be found
-            const srcPath = path.join(this.sonetraPath, 'src');
+            const srcPath = path.join(this.sonetraPath!, 'src');
 
             // Spawn uvicorn to run FastAPI (using lite version)
             const args = [
@@ -138,11 +93,11 @@ class SonetraBridge {
                     env: { ...process.env, PYTHONUNBUFFERED: '1' }
                 });
 
-                this.serverProcess.stdout.on('data', (data) => {
+                this.serverProcess.stdout?.on('data', (data) => {
                     console.log(`[Sonetra] ${data.toString().trim()}`);
                 });
 
-                this.serverProcess.stderr.on('data', (data) => {
+                this.serverProcess.stderr?.on('data', (data) => {
                     const msg = data.toString().trim();
                     console.log(`[Sonetra ERR] ${msg}`);
                     // Uvicorn logs to stderr, check for startup message
@@ -182,17 +137,58 @@ class SonetraBridge {
                     }
                 }, 3000);
 
-            } catch (err) {
+            } catch (err: any) {
                 console.error('[Sonetra] Spawn error:', err);
                 resolve({ success: false, error: err.message });
             }
         });
     }
 
+    private _resolvePythonCmd(): string {
+        let pythonCmd = '';
+
+        if (this.config.pythonPath && fs.existsSync(this.config.pythonPath)) {
+            pythonCmd = this.config.pythonPath;
+            console.log(`[Sonetra] Using config Python: ${pythonCmd}`);
+            return pythonCmd;
+        }
+
+        const venvPythonPaths = [
+            path.join(this.sonetraPath!, 'venv', 'Scripts', 'python.exe'),  // Windows venv
+            path.join(this.sonetraPath!, 'venv', 'bin', 'python'),          // Unix venv
+        ];
+        
+        for (const p of venvPythonPaths) {
+            if (fs.existsSync(p)) {
+                pythonCmd = p;
+                console.log(`[Sonetra] Using venv Python: ${p}`);
+                return pythonCmd;
+            }
+        }
+
+        const portablePythonPaths = [
+            path.join(__dirname, 'python-embed', 'python.exe'),
+            path.join((process as any).resourcesPath || '', 'python-embed', 'python.exe'),
+            path.join(__dirname, 'python', 'python.exe'),
+        ];
+
+        for (const p of portablePythonPaths) {
+            if (fs.existsSync(p)) {
+                pythonCmd = p;
+                console.log(`[Sonetra] Using portable Python: ${p}`);
+                return pythonCmd;
+            }
+        }
+
+        pythonCmd = process.platform === 'win32' ? 'py' : 'python3';
+        console.log(`[Sonetra] Using system Python: ${pythonCmd}`);
+        return pythonCmd;
+    }
+
     /**
      * Check if server is healthy
      */
-    async _checkHealth() {
+    async _checkHealth(): Promise<boolean> {
         return new Promise((resolve) => {
             const req = http.request({
                 hostname: this.serverHost,
@@ -213,13 +209,12 @@ class SonetraBridge {
     /**
      * Stop the server
      */
-    async stopServer() {
+    async stopServer(): Promise<{ success: boolean }> {
         if (this.serverProcess) {
             console.log('[Sonetra] Stopping server...');
             
-            // On Windows, we need to kill the process tree
             if (process.platform === 'win32') {
-                spawn('taskkill', ['/pid', this.serverProcess.pid, '/f', '/t']);
+                spawn('taskkill', ['/pid', String(this.serverProcess.pid), '/f', '/t']);
             } else {
                 this.serverProcess.kill('SIGTERM');
             }
@@ -233,7 +228,7 @@ class SonetraBridge {
     /**
      * Create a transition between two audio files
      */
-    async createTransition(track1Path, track2Path, style = 'smooth') {
+    async createTransition(track1Path: string, track2Path: string, style = 'smooth'): Promise<{ success: boolean, audioBuffer?: Buffer, error?: string }> {
         if (!this.isRunning) {
             return { success: false, error: 'Sonetra server not running' };
         }
@@ -242,11 +237,10 @@ class SonetraBridge {
             const FormData = require('form-data');
             const formData = new FormData();
             
-            // Read the audio files
             try {
                 formData.append('file1', fs.createReadStream(track1Path));
                 formData.append('file2', fs.createReadStream(track2Path));
-            } catch (err) {
+            } catch (err: any) {
                 resolve({ success: false, error: `Failed to read audio files: ${err.message}` });
                 return;
             }
@@ -261,12 +255,11 @@ class SonetraBridge {
             };
 
             const req = http.request(requestOptions, (res) => {
-                const chunks = [];
+                const chunks: Buffer[] = [];
                 
                 res.on('data', (chunk) => chunks.push(chunk));
                 res.on('end', () => {
                     if (res.statusCode === 200) {
-                        // Return the audio buffer
                         const audioBuffer = Buffer.concat(chunks);
                         resolve({ success: true, audioBuffer });
                     } else {
@@ -292,7 +285,7 @@ class SonetraBridge {
     /**
      * Analyze a single track for BPM, key, etc.
      */
-    async analyzeTrack(trackPath) {
+    async analyzeTrack(trackPath: string): Promise<{ success: boolean, analysis?: any, error?: string }> {
         if (!this.isRunning) {
             return { success: false, error: 'Sonetra server not running' };
         }
@@ -303,7 +296,7 @@ class SonetraBridge {
             
             try {
                 formData.append('file', fs.createReadStream(trackPath));
-            } catch (err) {
+            } catch (err: any) {
                 resolve({ success: false, error: `Failed to read audio file: ${err.message}` });
                 return;
             }
@@ -318,7 +311,7 @@ class SonetraBridge {
             };
 
             const req = http.request(requestOptions, (res) => {
-                const chunks = [];
+                const chunks: Buffer[] = [];
                 
                 res.on('data', (chunk) => chunks.push(chunk));
                 res.on('end', () => {
@@ -363,4 +356,4 @@ class SonetraBridge {
 // Singleton instance
 const sonetraBridge = new SonetraBridge();
 
-module.exports = sonetraBridge;
+export default sonetraBridge;

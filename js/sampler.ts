@@ -1,23 +1,31 @@
 // === SAMPLER MODULE ===
-import { KEYBOARD_MAP, DEFAULT_PAD_VOLUME } from './constants.js';
-import { audioCtx, masterGain, resumeAudioContext } from './audio.js';
-import { toast } from './toast.js';
+import { KEYBOARD_MAP, DEFAULT_PAD_VOLUME } from './constants';
+import { audioCtx, masterGain, resumeAudioContext } from './audio';
+import { toast } from './toast';
 
-export const padBuffers = {};
-export const padPaths = {};
-export const activeVoices = {};
-export const padVolumes = new Array(16).fill(DEFAULT_PAD_VOLUME);
-export const padBPMs = {};
-export const padSyncState = {};
+interface SamplerDeps {
+    fsBridge: any;
+    bridge: any;
+    detectBPM: (buffer: AudioBuffer) => Promise<number>;
+    masterBPMRef: { value: number };
+    tempoSlider: HTMLInputElement;
+}
 
-let padGrid = null;
-let fsBridgeRef = null;
-let bridgeRef = null;
-let detectBPMFn = null;
+export const padBuffers: Record<number, AudioBuffer> = {};
+export const padPaths: Record<number, string> = {};
+export const activeVoices: Record<number, { source: AudioBufferSourceNode, gain: GainNode } | null> = {};
+export const padVolumes: number[] = new Array(16).fill(DEFAULT_PAD_VOLUME);
+export const padBPMs: Record<number, number> = {};
+export const padSyncState: Record<number, boolean> = {};
+
+let padGrid: HTMLElement | null = null;
+let fsBridgeRef: any = null;
+let bridgeRef: any = null;
+let detectBPMFn: ((buffer: AudioBuffer) => Promise<number>) | null = null;
 let masterBPMRef = { value: 0 };
-let tempoSliderRef = null;
+let tempoSliderRef: HTMLInputElement | null = null;
 
-export function initSampler(deps) {
+export function initSampler(deps: SamplerDeps): void {
     fsBridgeRef = deps.fsBridge;
     bridgeRef = deps.bridge;
     detectBPMFn = deps.detectBPM;
@@ -26,15 +34,15 @@ export function initSampler(deps) {
     padGrid = document.getElementById('padGrid');
 }
 
-export function getPadGrid() { return padGrid; }
+export function getPadGrid(): HTMLElement | null { return padGrid; }
 
-function updatePadVisuals(index, pathOrFile) {
+function updatePadVisuals(index: number, pathOrFile: string | { name: string }): void {
     const padElement = padGrid?.children[index]?.querySelector('.pad');
     if (padElement) {
         padElement.classList.add('loaded');
         const fullName = typeof pathOrFile === 'string' ? pathOrFile : (pathOrFile.name || "Sample");
         // Extract filename and truncate for premium fit
-        const fileName = fullName.split(/[\\/]/).pop().split('.')[0];
+        const fileName = fullName.split(/[\\/]/).pop()?.split('.')[0] || "Sample";
         const shortName = fileName.length > 10 ? fileName.substring(0, 10) + '…' : fileName;
         
         let span = padElement.querySelector('span');
@@ -46,7 +54,7 @@ function updatePadVisuals(index, pathOrFile) {
     }
 }
 
-export async function loadSampleFile(file, index) {
+export async function loadSampleFile(file: File, index: number): Promise<void> {
     try {
         const arrayBuffer = await file.arrayBuffer();
         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
@@ -57,7 +65,7 @@ export async function loadSampleFile(file, index) {
     } catch (e) { console.error("Sample load failed:", e); }
 }
 
-export async function loadSampleFromPath(path, index) {
+export async function loadSampleFromPath(path: string, index: number): Promise<void> {
     try {
         const rawData = await fsBridgeRef.readFile(path);
         const arrayBuffer = rawData.buffer || rawData;
@@ -69,7 +77,7 @@ export async function loadSampleFromPath(path, index) {
     } catch (e) { console.error("Sample load from path failed:", e); }
 }
 
-export function startPad(index) {
+export function startPad(index: number): void {
     if (!padBuffers[index]) return;
     resumeAudioContext();
     const pad = padGrid?.children[index]?.querySelector('.pad');
@@ -77,8 +85,9 @@ export function startPad(index) {
         pad.classList.add('active');
         pad.setAttribute('aria-pressed', 'true');
     }
-    if (activeVoices[index]) {
-        try { activeVoices[index].source.stop(); } catch (e) {}
+    const currentVoice = activeVoices[index];
+    if (currentVoice) {
+        try { currentVoice.source.stop(); } catch (e) {}
     }
     const source = audioCtx.createBufferSource();
     source.buffer = padBuffers[index];
@@ -97,9 +106,10 @@ export function startPad(index) {
     activeVoices[index] = { source, gain: gainNode };
 }
 
-export function stopPad(index) {
-    if (activeVoices[index]) {
-        try { activeVoices[index].source.stop(); } catch (e) {}
+export function stopPad(index: number): void {
+    const currentVoice = activeVoices[index];
+    if (currentVoice) {
+        try { currentVoice.source.stop(); } catch (e) {}
         activeVoices[index] = null;
     }
     const pad = padGrid?.children[index]?.querySelector('.pad');
@@ -109,15 +119,15 @@ export function stopPad(index) {
     }
 }
 
-export function toggleSync(index) { padSyncState[index] = !padSyncState[index]; }
+export function toggleSync(index: number): void { padSyncState[index] = !padSyncState[index]; }
 
-export function createPadGrid() {
+export function createPadGrid(): void {
     if (!padGrid) return;
     padGrid.innerHTML = '';
     for (let i = 0; i < 16; i++) {
         const wrapper = document.createElement('div');
         wrapper.className = 'pad-wrapper';
-        wrapper.style.position = 'relative'; // Ensure positioning context
+        wrapper.style.position = 'relative';
 
         const pad = document.createElement('div');
         pad.className = 'pad';
@@ -132,9 +142,8 @@ export function createPadGrid() {
         recBtn.className = 'rec-btn';
         recBtn.title = 'Hold to Record';
         
-        // Mouse/Touch Handlers for Rec Button
         recBtn.addEventListener('mousedown', (e) => {
-            e.stopPropagation(); // Don't trigger pad play
+            e.stopPropagation();
             startRecording(i);
         });
         recBtn.addEventListener('mouseup', (e) => {
@@ -164,9 +173,8 @@ export function createPadGrid() {
             e.stopPropagation();
             pad.classList.remove('drag-over');
             if (e.dataTransfer && e.dataTransfer.files.length > 0) {
-                // Load the dropped file
                 const file = e.dataTransfer.files[0];
-                loadSampleFile(file, i);
+                if (file) loadSampleFile(file, i);
             }
         });
 
@@ -176,26 +184,26 @@ export function createPadGrid() {
         volSlider.min = '0';
         volSlider.max = '1';
         volSlider.step = '0.01';
-        volSlider.value = padVolumes[i];
+        volSlider.value = padVolumes[i].toString();
         volSlider.addEventListener('input', () => {
             padVolumes[i] = parseFloat(volSlider.value);
-            if (activeVoices[i]) activeVoices[i].gain.gain.setValueAtTime(padVolumes[i], audioCtx.currentTime);
+            const currentVoice = activeVoices[i];
+            if (currentVoice) currentVoice.gain.gain.setValueAtTime(padVolumes[i], audioCtx.currentTime);
         });
         
-        pad.appendChild(recBtn); // Move Rec Button INSIDE Pad so they animate together
+        pad.appendChild(recBtn);
         wrapper.appendChild(pad);
         wrapper.appendChild(volSlider);
         padGrid.appendChild(wrapper);
     }
 }
 
-export function setupPadKeyboardHandlers() {
+export function setupPadKeyboardHandlers(): void {
     document.addEventListener('keydown', (e) => {
         if (e.repeat) return;
         const index = KEYBOARD_MAP.indexOf(e.key.toLowerCase());
         if (index !== -1) {
             if (e.ctrlKey) {
-                // REC SHORTCUT
                 startRecording(index);
             } else if (!e.altKey && padBuffers[index]) {
                 startPad(index);
@@ -205,13 +213,11 @@ export function setupPadKeyboardHandlers() {
     document.addEventListener('keyup', (e) => {
         const index = KEYBOARD_MAP.indexOf(e.key.toLowerCase());
         if (index !== -1) {
-            // Check if we were recording this pad
             if (activeRecorders[index]) stopRecording(index);
             else stopPad(index);
         }
     });
     
-    // Wire up Kit Buttons
     const btnSaveKit = document.getElementById('btnSaveKit');
     const btnLoadKit = document.getElementById('btnLoadKit');
     if (btnSaveKit) btnSaveKit.addEventListener('click', saveKit);
@@ -219,28 +225,26 @@ export function setupPadKeyboardHandlers() {
 }
 
 // === RECORDING LOGIC ===
-let activeRecorders = {}; 
+let activeRecorders: Record<number, MediaRecorder> = {}; 
 
-async function startRecording(index) {
-    if (activeRecorders[index]) return; // Already recording via another method
+async function startRecording(index: number): Promise<void> {
+    if (activeRecorders[index]) return;
     
     try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         const mediaRecorder = new MediaRecorder(stream);
-        const chunks = [];
+        const chunks: Blob[] = [];
 
         mediaRecorder.ondataavailable = (e) => chunks.push(e.data);
         mediaRecorder.onstop = async () => {
-            const blob = new Blob(chunks, { type: 'audio/webm' }); // Chrome/Electron records to WebM
+            const blob = new Blob(chunks, { type: 'audio/webm' }); 
             const arrayBuffer = await blob.arrayBuffer();
              
-             // Decode and save to buffer
              audioCtx.decodeAudioData(arrayBuffer).then(decodedBuffer => {
                  padBuffers[index] = decodedBuffer;
-                 padPaths[index] = `Recorded Sample ${new Date().toLocaleTimeString()}`; // Dummy name
+                 padPaths[index] = `Recorded Sample ${new Date().toLocaleTimeString()}`;
                  updatePadVisuals(index, { name: "RECORDING" }); 
                  
-                 // Stop all tracks to release mic
                  stream.getTracks().forEach(track => track.stop());
              }).catch(e => console.error("Decode Rec Error", e));
 
@@ -258,13 +262,14 @@ async function startRecording(index) {
     }
 }
 
-function stopRecording(index) {
-    if (activeRecorders[index] && activeRecorders[index].state !== 'inactive') {
-        activeRecorders[index].stop();
+function stopRecording(index: number): void {
+    const recorder = activeRecorders[index];
+    if (recorder && recorder.state !== 'inactive') {
+        recorder.stop();
     }
 }
 
-function updateRecVisuals(index, isRecording) {
+function updateRecVisuals(index: number, isRecording: boolean): void {
     const padWrapper = padGrid?.children[index];
     const recBtn = padWrapper?.querySelector('.rec-btn');
     if (recBtn) {
@@ -273,16 +278,15 @@ function updateRecVisuals(index, isRecording) {
     }
 }
 
-
 // === KIT PERSISTENCE ===
-async function saveKit() {
+async function saveKit(): Promise<void> {
     try {
         const path = await bridgeRef.saveKit();
         if (!path) return;
 
         const kit = {
             name: "My Gangsta Kit",
-            pads: []
+            pads: [] as Array<{ index: number, path: string, vol: number }>
         };
 
         for (let i = 0; i < 16; i++) {
@@ -303,30 +307,23 @@ async function saveKit() {
     }
 }
 
-async function loadKitDialog() {
+async function loadKitDialog(): Promise<void> {
     try {
         const path = await bridgeRef.loadKit();
         if (!path) return;
         
         const data = await fsBridgeRef.readFile(path);
-        // data is buffer (Uint8Array), decode to string
         const jsonStr = new TextDecoder().decode(data);
         const kit = JSON.parse(jsonStr);
         
         if (kit.pads && Array.isArray(kit.pads)) {
-             // Clear current? Maybe optional.
-             kit.pads.forEach(p => {
+             kit.pads.forEach((p: { index: number, path: string, vol?: number }) => {
                  if (p.path) {
                      loadSampleFromPath(p.path, p.index).then(() => {
                          if (p.vol !== undefined) {
                              padVolumes[p.index] = p.vol;
-                             // Update slider UI if exists
-                             // This is hard blindly without ref to slider elements.
-                             // But createPadGrid regenerates them using padVolumes, so we could re-render grid?
-                             // Or better: update active voice if playing.
-                             // Ideally we update the specific slider input.
-                             const slider = padGrid?.children[p.index]?.querySelector('.pad-slider');
-                             if (slider) slider.value = p.vol;
+                             const slider = padGrid?.children[p.index]?.querySelector('.pad-slider') as HTMLInputElement;
+                             if (slider) slider.value = p.vol.toString();
                          }
                      });
                  }
