@@ -24,6 +24,15 @@ export interface AppStateData {
     isAutoMixEnabled: boolean;
     isCrossfadeInProgress: boolean;
     blendingIndex: number;
+    isMidiActive: boolean;
+    // MIDI & Key Mapping
+    padMidiMap: Record<number, number>; 
+    padKeyMap: string[]; 
+    controlMidiMap: Record<number, string>; 
+    isLearningMidi: boolean;
+    midiLearnTarget: { type: 'pad' | 'control', id: number | string } | null;
+    isLearningKey: boolean;
+    keyLearnTargetPad: number | null;
 }
 
 type Listener<T> = (value: T, state: AppStateData) => void;
@@ -40,6 +49,16 @@ class ReactiveStore implements AppStateData {
     isAutoMixEnabled = false;
     isCrossfadeInProgress = false;
     blendingIndex = -1;
+    isMidiActive = false;
+
+    // MIDI & Key Mapping Defaults
+    padMidiMap: Record<number, number> = { 36: 0, 37: 1, 38: 2, 39: 3, 40: 4, 41: 5, 42: 6, 43: 7, 44: 8, 45: 9, 46: 10, 47: 11, 48: 12, 49: 13, 50: 14, 51: 15 };
+    padKeyMap: string[] = ['1', '2', '3', '4', 'q', 'w', 'e', 'r', 'a', 's', 'd', 'f', 'z', 'x', 'c', 'v'];
+    controlMidiMap: Record<number, string> = { 1: 'masterVol', 7: 'masterVol', 10: 'tempoSlider' }; // Common CCs
+    isLearningMidi = false;
+    midiLearnTarget: { type: 'pad' | 'control', id: number | string } | null = null;
+    isLearningKey = false;
+    keyLearnTargetPad: number | null = null;
 
     // === PUB/SUB INTERNALS ===
     private listeners: Map<keyof AppStateData, Set<Listener<any>>> = new Map();

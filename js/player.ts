@@ -1,12 +1,14 @@
 // === PLAYER MODULE ===
 import { BPM_DETECTION_THRESHOLD, BPM_MIN_STEP_SECONDS } from './constants';
-import { audioCtx, resumeAudioContext, masterGain } from './audio';
+import { audioCtx, resumeAudioContext, masterGain, createAudioBuffer } from './audio';
 import { settings } from './settings';
 import { state, Track, PlaybackMode, LoopMode } from './state';
 import { detectBPMWorker } from './worker-client';
+import { decoderPool } from './decoder-pool';
 import { toast } from './toast';
 import { engine } from './audio-engine';
 import { logger } from './logger';
+import { WaveformRenderer } from './waveform-engine';
 
 interface PlayerDeps {
     playlist: Track[];
@@ -72,6 +74,7 @@ let tempoVal: HTMLElement | null = null;
 let autoMixBtn: HTMLElement | null = null;
 let masterVol: HTMLInputElement | null = null;
 let volKnob: HTMLElement | null = null;
+let waveformRenderer: WaveformRenderer | null = null;
 
 let playlistRef: Track[] | null = null;
 let renderPlaylistFn: (() => void) | null = null;
@@ -145,6 +148,13 @@ export function initPlayer(deps: PlayerDeps): void {
         engine.main.audio.loop = (mode === 'one');
     });
 
+    const wfCanvas = document.getElementById('waveformCanvas') as HTMLCanvasElement;
+    if (wfCanvas) {
+        waveformRenderer = new WaveformRenderer(wfCanvas);
+        waveformRenderer.resize();
+        window.addEventListener('resize', () => waveformRenderer?.resize());
+    }
+
     setupPlayerHandlers();
 }
 
@@ -177,34 +187,44 @@ export async function loadTrack(index: number): Promise<void> {
     engine.main.load(safeUrl);
     engine.main.audio.playbackRate = tempoSlider ? parseFloat(tempoSlider.value) : 1;
     
-    if (track.bpm !== null && track.bpm !== undefined) {
-        state.update({ masterBPM: track.bpm });
-        const bpmText = state.masterBPM > 0 ? `[${state.masterBPM} BPM]` : "[BPM: --]";
-        if (trackTitle) trackTitle.innerText = `${track.name} ${bpmText}`;
-    } else {
-        state.update({ masterBPM: 0 });
-        if (trackTitle) trackTitle.innerText = `${track.name} [Analyzing...]`;
+    const hasBpm = track.bpm !== null && track.bpm !== undefined;
+    state.update({ masterBPM: hasBpm ? (track.bpm as number) : 0 });
+
+    if (trackTitle) {
+        trackTitle.innerText = `${track.name} [${hasBpm ? track.bpm + ' BPM' : 'ANALYZING...'}]`;
+    }
+
+    // Single-pass high-performance decoding
+    (async () => {
         try {
             const rawData = await (window as any).fileSystem.readFile(track.path);
-            const arrayBuffer = rawData.buffer || rawData;
-            const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-            const detectedValue = await detectBPMWorker(audioBuffer);
-            track.bpm = detectedValue;
-            state.update({ masterBPM: detectedValue });
+            const arrayBuffer = (rawData.buffer || rawData).slice(0);
+            
+            // Use background worker pool for zero-stutter decoding
+            const decodeResult = await decoderPool.decode(arrayBuffer);
+            const audioBuffer = createAudioBuffer(decodeResult);
+            
+            // 1. Update Waveform
+            if (waveformRenderer) waveformRenderer.setWaveform(audioBuffer.getChannelData(0));
+
+            // 2. Detect BPM if missing
+            if (!hasBpm) {
+                const detectedValue = await detectBPMWorker(audioBuffer);
+                track.bpm = detectedValue;
+                state.update({ masterBPM: detectedValue });
+                logger.info(`[Player] Async analysis complete: ${detectedValue} BPM`);
+            }
+
+            // 3. Final display update
             if (trackTitle && state.currentTrackIndex === index) {
                 const bpmTxt = state.masterBPM > 0 ? `[${state.masterBPM} BPM]` : "[BPM: --]";
                 trackTitle.innerText = `${track.name} ${bpmTxt}`;
             }
-            logger.info(`[Player] Analysis finished for ${track.name}: ${detectedValue} BPM`);
         } catch (e) {
-            logger.error("[Player] BPM Analysis failed", e);
-            toast.error("BPM ANALYSIS FAILED");
-            track.bpm = 0;
-            if (trackTitle && state.currentTrackIndex === index) {
-                trackTitle.innerText = track.name + " [BPM: Error]";
-            }
+            logger.error("[Player] Load/Analysis pipeline failed", e);
+            if (!hasBpm && trackTitle) trackTitle.innerText = `${track.name} [BPM Error]`;
         }
-    }
+    })();
 }
 
 function updateControlsLock(locked: boolean): void {
@@ -363,6 +383,7 @@ export function setupPlayerHandlers(): void {
             const progress = (engine.main.audio.currentTime / engine.main.audio.duration) * 100;
             if (progressBar) progressBar.value = progress.toString();
             if (timeDisplay) timeDisplay.innerText = formatTime(engine.main.audio.currentTime);
+            if (waveformRenderer) waveformRenderer.render(engine.main.audio.currentTime / engine.main.audio.duration);
 
             if (state.isAutoMixEnabled && !state.isCrossfadeInProgress && engine.main.audio.duration > settings.autoMix.trackDuration * 2) {
                 if (engine.main.audio.currentTime >= engine.main.audio.duration - settings.autoMix.trackDuration) {

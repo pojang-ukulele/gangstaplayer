@@ -1,6 +1,7 @@
 // === VISUALS & LIGHTS MODULE ===
 import { VISUALIZER_BARS } from './constants';
-import { analyser, masterGain, audioCtx, resumeAudioContext } from './audio';
+import { analyser, masterGain, audioCtx, resumeAudioContext, createAudioBuffer } from './audio';
+import { decoderPool } from './decoder-pool';
 
 const dataArray = new Uint8Array(analyser.frequencyBinCount);
 const visualizerBars: HTMLElement[] = [];
@@ -127,12 +128,17 @@ function masterLoop(): void {
     }
 }
 
+
+
 export function playStartupSound(): void {
     console.log("[Visuals] Triggering startup sound...");
     resumeAudioContext().then(() => {
         fetch('assets/gun-load.wav')
             .then(response => response.arrayBuffer())
-            .then(arrayBuffer => audioCtx.decodeAudioData(arrayBuffer))
+            .then(async arrayBuffer => {
+                const decodeResult = await decoderPool.decode(arrayBuffer);
+                return createAudioBuffer(decodeResult);
+            })
             .then(audioBuffer => {
                 const source = audioCtx.createBufferSource();
                 const gain = audioCtx.createGain();

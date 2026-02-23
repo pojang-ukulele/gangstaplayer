@@ -11,7 +11,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   setFullScreen: (flag: boolean) => ipcRenderer.send('app:set-fullscreen', flag),
   openSampleDialog: () => ipcRenderer.invoke('dialog:open-sample'),
   appReadyToShow: () => ipcRenderer.send('app:ready-to-show'),
-  openExternal: (path: string) => ipcRenderer.invoke('app:open-external', path)
+  openExternal: (path: string) => ipcRenderer.invoke('app:open-external', path),
+  generateCrashReport: (state: any) => ipcRenderer.invoke('app:generate-crash-report', state)
 });
 
 contextBridge.exposeInMainWorld('fileSystem', {
@@ -36,4 +37,11 @@ contextBridge.exposeInMainWorld('sonetra', {
     ipcRenderer.invoke('sonetra:get-cached-transition', track1Path, track2Path),
   precomputeTransition: (track1Path: string, track2Path: string) =>
     ipcRenderer.invoke('sonetra:precompute-transition', track1Path, track2Path)
+});
+// Database Bridge
+contextBridge.exposeInMainWorld('database', {
+  upsertTrack: (track: any) => ipcRenderer.invoke('db:upsert-track', track),
+  getTrack: (path: string) => ipcRenderer.invoke('db:get-track', path),
+  searchTracks: (query: string) => ipcRenderer.invoke('db:search-tracks', query),
+  getAllTracks: () => ipcRenderer.invoke('db:get-all-tracks')
 });

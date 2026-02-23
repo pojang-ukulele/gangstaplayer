@@ -21,6 +21,7 @@ import { engine } from './audio-engine';
 import { state } from './state';
 import { toast } from './toast';
 import { logger } from './logger';
+import { HighFidelityRecorder } from './recorder-client';
 
 declare global {
     interface Window {
@@ -92,19 +93,24 @@ async function initApp() {
                     e.preventDefault();
                     e.stopPropagation();
                     if (padBuffers[i]) {
-                        if (ctxSync) ctxSync.classList.remove('hidden');
-                        if (padCtxDivider) padCtxDivider.classList.remove('hidden');
-                        if (padSyncState[i] && ctxSync) {
-                            ctxSync.classList.add('sync-active');
-                            ctxSync.innerText = 'SYNC ✓';
-                        } else if (ctxSync) {
-                            ctxSync.classList.remove('sync-active');
-                            ctxSync.innerText = 'SYNC';
+                        if (ctxSync) {
+                            ctxSync.classList.remove('hidden');
+                            if (padSyncState[i]) {
+                                ctxSync.classList.add('sync-active');
+                                ctxSync.innerText = 'SYNC ✓';
+                            } else {
+                                ctxSync.classList.remove('sync-active');
+                                ctxSync.innerText = 'SYNC';
+                            }
                         }
                     } else {
                         if (ctxSync) ctxSync.classList.add('hidden');
-                        if (padCtxDivider) padCtxDivider.classList.add('hidden');
                     }
+                    if (padCtxDivider) padCtxDivider.classList.toggle('hidden', !padBuffers[i]);
+                    
+                    const ctxPadMidiLearn = document.getElementById('ctxPadMidiLearn');
+                    if (ctxPadMidiLearn) ctxPadMidiLearn.classList.toggle('hidden', !state.isMidiActive);
+
                     padContextMenu.classList.remove('hidden');
                     padContextMenu.setAttribute('aria-hidden', 'false');
                     padContextMenu.style.left = e.pageX + 'px';
@@ -138,6 +144,58 @@ async function initApp() {
         });
     }
 
+    const ctxPadMidiLearn = document.getElementById('ctxPadMidiLearn');
+    const ctxPadKeyBind = document.getElementById('ctxPadKeyBind');
+
+    if (ctxPadMidiLearn && padContextMenu) {
+        ctxPadMidiLearn.addEventListener('click', () => {
+             const index = parseInt(padContextMenu.dataset.padIndex || "0");
+             state.update({ isLearningMidi: true, midiLearnTarget: { type: 'pad', id: index } });
+             toast.info(`PRESS MIDI NOTE FOR PAD ${index + 1}...`);
+        });
+    }
+
+    if (ctxPadKeyBind && padContextMenu) {
+        ctxPadKeyBind.addEventListener('click', () => {
+             const index = parseInt(padContextMenu.dataset.padIndex || "0");
+             state.update({ isLearningKey: true, keyLearnTargetPad: index });
+             toast.info(`PRESS COMPUTER KEY FOR PAD ${index + 1}...`);
+        });
+    }
+
+    // Slider Context Menus
+    const sliders = ['masterVol', 'tempoSlider'];
+    const controlContextMenu = document.getElementById('controlContextMenu');
+    const ctxControlMidiLearn = document.getElementById('ctxControlMidiLearn');
+
+    sliders.forEach(id => {
+        const el = document.getElementById(id);
+        if (el && controlContextMenu) {
+            el.addEventListener('contextmenu', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                
+                // Hide other menus
+                document.dispatchEvent(new Event('click'));
+
+                if (ctxControlMidiLearn) ctxControlMidiLearn.classList.toggle('hidden', !state.isMidiActive);
+
+                controlContextMenu.classList.remove('hidden');
+                controlContextMenu.style.left = e.pageX + 'px';
+                controlContextMenu.style.top = e.pageY + 'px';
+                controlContextMenu.dataset.controlId = id;
+            });
+        }
+    });
+
+    if (ctxControlMidiLearn && controlContextMenu) {
+        ctxControlMidiLearn.addEventListener('click', () => {
+             const id = controlContextMenu.dataset.controlId || "";
+             state.update({ isLearningMidi: true, midiLearnTarget: { type: 'control', id: id } });
+             toast.info(`MOVE MIDI KNOB FOR ${id.toUpperCase()}...`);
+        });
+    }
+
     // === GLOBAL KEYBOARD SHORTCUTS ===
     document.addEventListener('keydown', (e) => {
         // Ignore if user is typing in an input
@@ -166,65 +224,52 @@ async function initApp() {
     playStartupSound();
     if (bridge?.appReadyToShow) bridge.appReadyToShow();
 
-    // === MASTER RECORDING LOGIC ===
+    // === HIGH-FIDELITY MASTER RECORDING LOGIC ===
     const recBtn = document.getElementById('masterRecBtn');
-    let mediaRecorder: MediaRecorder | null = null;
-    let recordedChunks: Blob[] = [];
+    let hiFiRecorder: HighFidelityRecorder | null = null;
     let isRecording = false;
 
     if (recBtn) {
         recBtn.addEventListener('click', async () => {
             if (!isRecording) {
                 // START RECORDING
-                if (!mediaRecorder) {
-                    const dest = audioCtx.createMediaStreamDestination();
-                    masterGain.connect(dest);
-                    mediaRecorder = new MediaRecorder(dest.stream);
+                try {
+                    if (!hiFiRecorder) {
+                        hiFiRecorder = new HighFidelityRecorder(masterGain);
+                        await hiFiRecorder.init();
+                    }
                     
-                    mediaRecorder.ondataavailable = (e) => {
-                        if (e.data.size > 0) recordedChunks.push(e.data);
-                    };
-                    
-                    mediaRecorder.onstop = async () => {
-                        try {
-                            const webmBlob = new Blob(recordedChunks, { type: 'audio/webm' });
-                            recordedChunks = [];
-                            
-                            const arrayBuffer = await webmBlob.arrayBuffer();
-                            const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-                            
-                            const wavBlob = await bufferToWave(audioBuffer);
-                            const wavBuffer = await wavBlob.arrayBuffer();
-
-                            const path = await bridge.saveAudioDialog();
-                            if (path) {
-                                 const uint8 = new Uint8Array(wavBuffer);
-                                 // IPC Buffer Fix (Double Slice to be absolutely safe)
-                                 const safeBuffer = uint8.buffer.slice(uint8.byteOffset, uint8.byteOffset + uint8.byteLength);
-                                 await fsBridge.saveFile(path, new Uint8Array(safeBuffer));
-                                 toast.success("RECORDING SAVED TO DISK");
-                            }
-                        } catch (e) {
-                            logger.error("[MasterRec] Save failed", e);
-                            toast.error("COULD NOT SAVE RECORDING");
-                        } finally {
-                            recBtn.classList.remove('recording');
-                            recBtn.innerText = "REC";
-                            isRecording = false;
-                        }
-                    };
+                    hiFiRecorder.start();
+                    isRecording = true;
+                    recBtn.classList.add('recording');
+                    recBtn.innerText = "STOP";
+                } catch (e) {
+                    logger.error("[MasterRec] Start failed", e);
+                    toast.error("COULD NOT START HI-FI RECORDER");
                 }
-                
-                recordedChunks = [];
-                mediaRecorder.start();
-                isRecording = true;
-                recBtn.classList.add('recording');
-                recBtn.innerText = "STOP";
-                
             } else {
                 // STOP RECORDING
-                if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-                    mediaRecorder.stop();
+                if (hiFiRecorder) {
+                    try {
+                        const wavBlob = await hiFiRecorder.stop();
+                        const wavBuffer = await wavBlob.arrayBuffer();
+
+                        const path = await bridge.saveAudioDialog();
+                        if (path) {
+                             const uint8 = new Uint8Array(wavBuffer);
+                             // IPC Buffer Alignment Fix
+                             const safeBuffer = uint8.buffer.slice(uint8.byteOffset, uint8.byteOffset + uint8.byteLength);
+                             const success = await fsBridge.saveFile(path, new Uint8Array(safeBuffer));
+                             if (success) toast.success("HI-FI RECORDING SAVED");
+                        }
+                    } catch (e) {
+                        logger.error("[MasterRec] Stop/Save failed", e);
+                        toast.error("COULD NOT SAVE HI-FI RECORDING");
+                    } finally {
+                        recBtn.classList.remove('recording');
+                        recBtn.innerText = "REC";
+                        isRecording = false;
+                    }
                 }
             }
         });
@@ -355,7 +400,34 @@ async function initApp() {
             loopContextMenu.classList.add('hidden');
             loopContextMenu.setAttribute('aria-hidden', 'true');
         }
+        if (controlContextMenu) {
+            controlContextMenu.classList.add('hidden');
+        }
     });
+    
+    // === GURU CRASH PROTECTION (RENDERER) ===
+    window.onerror = (message, source, lineno, colno, error) => {
+        logger.error(`[Renderer Crash] ${message} at ${source}:${lineno}:${colno}`);
+        logger.generateCrashReport({
+            type: 'RENDERER_ERROR',
+            message,
+            source,
+            lineno,
+            colno,
+            stack: error?.stack,
+            appState: state
+        });
+        return false;
+    };
+
+    window.onunhandledrejection = (event) => {
+        logger.error(`[Renderer Rejection] ${event.reason}`);
+        logger.generateCrashReport({
+            type: 'RENDERER_REJECTION',
+            reason: event.reason,
+            appState: state
+        });
+    };
 }
 
 function applyPlatformStyles() {

@@ -29,7 +29,7 @@ async function build() {
         target: 'node20',
         outfile: path.join(BUILD_DIR, 'main.js'),
         minify: true,
-        external: ['electron', 'fsevents']
+        external: ['electron', 'fsevents', 'better-sqlite3']
     });
 
     console.log('Building Preload...');
@@ -90,6 +90,28 @@ async function build() {
             bundle: true,
             platform: 'browser',
             outfile: path.join(BUILD_DIR, 'js', 'workers', 'gangsta-processor.js'),
+            minify: true,
+        });
+    }
+
+    const recorderEntry = resolveEntry('js/workers/recorder-processor.js');
+    if (fs.existsSync(recorderEntry)) {
+        await esbuild.build({
+            entryPoints: [recorderEntry],
+            bundle: true,
+            platform: 'browser',
+            outfile: path.join(BUILD_DIR, 'js', 'workers', 'recorder-processor.js'),
+            minify: true,
+        });
+    }
+
+    const decoderEntry = resolveEntry('js/workers/decoder-worker.js');
+    if (fs.existsSync(decoderEntry)) {
+        await esbuild.build({
+            entryPoints: [decoderEntry],
+            bundle: true,
+            platform: 'browser',
+            outfile: path.join(BUILD_DIR, 'js', 'workers', 'decoder-worker.js'),
             minify: true,
         });
     }

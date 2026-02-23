@@ -1,5 +1,7 @@
-import { KEYBOARD_MAP, DEFAULT_PAD_VOLUME } from './constants';
-import { audioCtx, masterGain, resumeAudioContext } from './audio';
+import { DEFAULT_PAD_VOLUME } from './constants';
+import { state } from './state';
+import { audioCtx, masterGain, resumeAudioContext, createAudioBuffer } from './audio';
+import { decoderPool } from './decoder-pool';
 import { toast } from './toast';
 import { logger } from './logger';
 
@@ -32,36 +34,38 @@ export function initSampler(deps: SamplerDeps): void {
     masterBPMRef = deps.masterBPMRef;
     tempoSliderRef = deps.tempoSlider;
     padGrid = document.getElementById('padGrid');
+    
+    // Subscribe to mapping changes
+    state.subscribe('padKeyMap', () => {
+        if (padGrid) {
+            for (let i = 0; i < 16; i++) updatePadVisuals(i);
+        }
+    });
+
+    createPadGrid();
 }
 
 export function getPadGrid(): HTMLElement | null { return padGrid; }
 
-function updatePadVisuals(index: number, pathOrFile: string | { name: string }): void {
-    const padElement = padGrid?.children[index]?.querySelector('.pad');
-    if (padElement) {
-        padElement.classList.add('loaded');
-        const fullName = typeof pathOrFile === 'string' ? pathOrFile : (pathOrFile.name || "Sample");
-        // Extract filename and truncate for premium fit
-        const fileName = fullName.split(/[\\/]/).pop()?.split('.')[0] || "Sample";
-        const shortName = fileName.length > 10 ? fileName.substring(0, 10) + '…' : fileName;
-        
-        let span = padElement.querySelector('span');
-        if (!span) {
-            span = document.createElement('span');
-            padElement.appendChild(span);
-        }
-        span.innerText = shortName.toUpperCase();
-    }
+function updatePadVisuals(index: number): void {
+    if (!padGrid) return;
+    const wrapper = padGrid.children[index] as HTMLElement;
+    if (wrapper) renderPad(index, wrapper);
 }
 
 export async function loadSampleFile(file: File, index: number): Promise<void> {
     try {
         logger.info(`[Sampler] Loading file to pad ${index}: ${file.name}`);
         const arrayBuffer = await file.arrayBuffer();
-        const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+        
+        // Background decoding like a pro
+        const decodeResult = await decoderPool.decode(arrayBuffer);
+        const audioBuffer = createAudioBuffer(decodeResult);
+        
         padBuffers[index] = audioBuffer;
         padPaths[index] = file.name;
-        updatePadVisuals(index, file.name);
+        updatePadVisuals(index);
+        
         if (detectBPMFn) {
             const bpm = await detectBPMFn(audioBuffer);
             padBPMs[index] = bpm;
@@ -78,34 +82,57 @@ export async function loadSampleFromPath(path: string, index: number): Promise<v
         logger.info(`[Sampler] Loading path to pad ${index}: ${path}`);
         const rawData = await fsBridgeRef.readFile(path);
         if (!rawData) {
-            logger.error(`[Sampler] Read failed for path: ${path} (Check security guards)`);
+            logger.error(`[Sampler] Read failed for path: ${path}`);
             return;
         }
-        // CRITICAL FIX: Ensure we use a clean slice of the ArrayBuffer
         const arrayBuffer = rawData.buffer.slice(rawData.byteOffset, rawData.byteOffset + rawData.byteLength);
-        const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+        
+        // Background decoding like a pro
+        const decodeResult = await decoderPool.decode(arrayBuffer);
+        const audioBuffer = createAudioBuffer(decodeResult);
+
         padBuffers[index] = audioBuffer;
         padPaths[index] = path;
-        updatePadVisuals(index, path);
+        updatePadVisuals(index);
         if (detectBPMFn) {
             const bpm = await detectBPMFn(audioBuffer);
             padBPMs[index] = bpm;
-            logger.info(`[Sampler] Pad ${index} BPM: ${bpm}`);
         }
     } catch (e) { 
         logger.error(`[Sampler] Pad ${index} path load failed:`, e);
-        toast.error("SAMPLE LOAD FAILED");
     }
 }
 
 export function startPad(index: number): void {
     if (!padBuffers[index]) return;
     resumeAudioContext();
-    const pad = padGrid?.children[index]?.querySelector('.pad');
-    if (pad) {
-        pad.classList.add('active');
-        pad.setAttribute('aria-pressed', 'true');
+    
+    // Stop previous instance if playing
+    stopPad(index);
+
+    const source = audioCtx.createBufferSource();
+    source.buffer = padBuffers[index];
+    source.loop = true;
+    
+    const gainNode = audioCtx.createGain();
+    const currentVol = padVolumes[index] !== undefined ? padVolumes[index] : DEFAULT_PAD_VOLUME;
+    gainNode.gain.setValueAtTime(currentVol, audioCtx.currentTime);
+    
+    let rate = tempoSliderRef ? parseFloat(tempoSliderRef.value) : 1;
+    if (padSyncState[index] && masterBPMRef.value > 0 && padBPMs[index] > 0) {
+        rate = (masterBPMRef.value / padBPMs[index]) * rate;
     }
+    source.playbackRate.value = rate;
+    
+    source.connect(gainNode);
+    gainNode.connect(masterGain);
+    source.start(0);
+    
+    activeVoices[index] = { source, gain: gainNode };
+    updatePadVisuals(index);
+}
+
+export function stopPad(index: number): void {
     const currentVoice = activeVoices[index];
     if (currentVoice) {
         try { 
@@ -113,120 +140,105 @@ export function startPad(index: number): void {
             currentVoice.source.disconnect();
             currentVoice.gain.disconnect();
         } catch (e) {}
-    }
-    const source = audioCtx.createBufferSource();
-    source.buffer = padBuffers[index];
-    source.loop = true;
-    const gainNode = audioCtx.createGain();
-    const currentVol = padVolumes[index] !== undefined ? padVolumes[index] : DEFAULT_PAD_VOLUME;
-    gainNode.gain.setValueAtTime(currentVol, audioCtx.currentTime);
-    let rate = tempoSliderRef ? parseFloat(tempoSliderRef.value) : 1;
-    if (padSyncState[index] && masterBPMRef.value > 0 && padBPMs[index] > 0) {
-        rate = (masterBPMRef.value / padBPMs[index]) * rate;
-    }
-    source.playbackRate.value = rate;
-    source.connect(gainNode);
-    gainNode.connect(masterGain);
-    source.start(0);
-    activeVoices[index] = { source, gain: gainNode };
-}
-
-export function stopPad(index: number): void {
-    const currentVoice = activeVoices[index];
-    if (currentVoice) {
-        try { currentVoice.source.stop(); } catch (e) {}
         activeVoices[index] = null;
     }
-    const pad = padGrid?.children[index]?.querySelector('.pad');
-    if (pad) {
-        pad.classList.remove('active');
-        pad.setAttribute('aria-pressed', 'false');
-    }
+    updatePadVisuals(index);
 }
 
-export function toggleSync(index: number): void { padSyncState[index] = !padSyncState[index]; }
+export function toggleSync(index: number): void { 
+    padSyncState[index] = !padSyncState[index]; 
+    updatePadVisuals(index);
+}
 
 export function createPadGrid(): void {
     if (!padGrid) return;
     padGrid.innerHTML = '';
     for (let i = 0; i < 16; i++) {
-        const wrapper = document.createElement('div');
+        const wrapper = renderPad(i);
+        padGrid.appendChild(wrapper);
+    }
+}
+
+function renderPad(index: number, existing?: HTMLElement): HTMLElement {
+    const wrapper = (existing || document.createElement('div')) as HTMLElement;
+    if (!existing) {
         wrapper.className = 'pad-wrapper';
         wrapper.style.position = 'relative';
+        const currentKey = state.padKeyMap[index] || "?";
+        wrapper.innerHTML = `
+            <div class="pad" data-key="${currentKey}" role="button" aria-pressed="false" tabindex="0">
+                <span>${currentKey.toUpperCase()}</span>
+                <div class="rec-btn" title="Hold to Record"></div>
+            </div>
+            <input type="range" class="pad-slider" min="0" max="1" step="0.01">
+        `;
 
-        const pad = document.createElement('div');
-        pad.className = 'pad';
-        pad.dataset.key = KEYBOARD_MAP[i];
-        pad.innerHTML = `<span>${KEYBOARD_MAP[i].toUpperCase()}</span>`;
-        pad.setAttribute('role', 'button');
-        pad.setAttribute('aria-pressed', 'false');
-        pad.setAttribute('tabindex', '0');
+        const pad = wrapper.querySelector('.pad') as HTMLElement;
+        const recBtn = wrapper.querySelector('.rec-btn') as HTMLElement;
+        const volSlider = wrapper.querySelector('.pad-slider') as HTMLInputElement;
 
-        // REC BUTTON
-        const recBtn = document.createElement('div');
-        recBtn.className = 'rec-btn';
-        recBtn.title = 'Hold to Record';
-        
-        recBtn.addEventListener('mousedown', (e) => {
-            e.stopPropagation();
-            startRecording(i);
-        });
-        recBtn.addEventListener('mouseup', (e) => {
-            e.stopPropagation();
-            stopRecording(i);
-        });
-        recBtn.addEventListener('mouseleave', (e) => {
-            e.stopPropagation();
-            stopRecording(i);
-        });
+        recBtn.addEventListener('mousedown', (e) => { e.stopPropagation(); startRecording(index); });
+        recBtn.addEventListener('mouseup', (e) => { e.stopPropagation(); stopRecording(index); });
+        recBtn.addEventListener('mouseleave', (e) => { e.stopPropagation(); stopRecording(index); });
 
-        // DRAG & DROP
-        pad.addEventListener('dragover', (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            pad.classList.add('drag-over');
-        });
-
-        pad.addEventListener('dragleave', (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            pad.classList.remove('drag-over');
-        });
-
-        pad.addEventListener('drop', (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            pad.classList.remove('drag-over');
+        pad.addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); pad.classList.add('drag-over'); });
+        pad.addEventListener('dragleave', (e) => { e.preventDefault(); e.stopPropagation(); pad.classList.remove('drag-over'); });
+        pad.addEventListener('drop', (e) => { e.preventDefault(); e.stopPropagation(); pad.classList.remove('drag-over'); 
             if (e.dataTransfer && e.dataTransfer.files.length > 0) {
                 const file = e.dataTransfer.files[0];
-                if (file) loadSampleFile(file, i);
+                if (file) loadSampleFile(file, index);
             }
         });
 
-        const volSlider = document.createElement('input');
-        volSlider.type = 'range';
-        volSlider.className = 'pad-slider';
-        volSlider.min = '0';
-        volSlider.max = '1';
-        volSlider.step = '0.01';
-        volSlider.value = padVolumes[i].toString();
         volSlider.addEventListener('input', () => {
-            padVolumes[i] = parseFloat(volSlider.value);
-            const currentVoice = activeVoices[i];
-            if (currentVoice) currentVoice.gain.gain.setValueAtTime(padVolumes[i], audioCtx.currentTime);
+            padVolumes[index] = parseFloat(volSlider.value);
+            const currentVoice = activeVoices[index];
+            if (currentVoice) currentVoice.gain.gain.setValueAtTime(padVolumes[index], audioCtx.currentTime);
         });
-        
-        pad.appendChild(recBtn);
-        wrapper.appendChild(pad);
-        wrapper.appendChild(volSlider);
-        padGrid.appendChild(wrapper);
     }
+
+    const pad = wrapper.querySelector('.pad') as HTMLElement;
+    const volSlider = wrapper.querySelector('.pad-slider') as HTMLInputElement;
+
+    // UPDATE VISUALS
+    pad.classList.toggle('loaded', !!padBuffers[index]);
+    pad.classList.toggle('active', !!activeVoices[index]);
+    pad.setAttribute('aria-pressed', activeVoices[index] ? 'true' : 'false');
+
+    let span = pad.querySelector('span');
+    if (span) {
+        if (padBuffers[index]) {
+            const fullName = padPaths[index];
+            const fileName = fullName.split(/[\\/]/).pop()?.split('.')[0] || "Sample";
+            const shortName = fileName.length > 10 ? fileName.substring(0, 10) + '…' : fileName;
+            span.innerText = shortName.toUpperCase();
+        } else {
+            const currentKey = state.padKeyMap[index] || "?";
+            span.innerText = currentKey.toUpperCase();
+        }
+    }
+
+    volSlider.value = padVolumes[index].toString();
+
+    return wrapper;
 }
 
 export function setupPadKeyboardHandlers(): void {
     document.addEventListener('keydown', (e) => {
         if (e.repeat) return;
-        const index = KEYBOARD_MAP.indexOf(e.key.toLowerCase());
+        
+        // Handle Key Learn Mode
+        if (state.isLearningKey && state.keyLearnTargetPad !== null) {
+            e.preventDefault();
+            const padIndex = state.keyLearnTargetPad;
+            const newMap = [...state.padKeyMap];
+            newMap[padIndex] = e.key.toLowerCase();
+            state.update({ padKeyMap: newMap, isLearningKey: false, keyLearnTargetPad: null });
+            toast.success(`PAD ${padIndex + 1} BOUND TO KEY "${e.key.toUpperCase()}"`);
+            return;
+        }
+
+        const index = state.padKeyMap.indexOf(e.key.toLowerCase());
         if (index !== -1) {
             if (e.ctrlKey) {
                 startRecording(index);
@@ -236,7 +248,7 @@ export function setupPadKeyboardHandlers(): void {
         }
     });
     document.addEventListener('keyup', (e) => {
-        const index = KEYBOARD_MAP.indexOf(e.key.toLowerCase());
+        const index = state.padKeyMap.indexOf(e.key.toLowerCase());
         if (index !== -1) {
             if (activeRecorders[index]) stopRecording(index);
             else stopPad(index);
@@ -270,7 +282,7 @@ async function startRecording(index: number): Promise<void> {
                 const decodedBuffer = await audioCtx.decodeAudioData(arrayBuffer);
                 padBuffers[index] = decodedBuffer;
                 padPaths[index] = `REC_${Date.now()}`;
-                updatePadVisuals(index, { name: "RECORDING" });
+                updatePadVisuals(index);
                 logger.debug(`[Sampler] Recording on pad ${index} successful`);
              } catch (e) {
                 logger.error(`[Sampler] Recording decode failed on pad ${index}`, e);

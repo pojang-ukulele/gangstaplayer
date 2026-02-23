@@ -3,6 +3,8 @@ import * as path from 'path';
 import * as fs from 'fs';
 
 import sonetraBridge from './sonetra-bridge';
+import { dbManager } from './db-manager';
+import { logManager, LogLevel } from './log-manager';
 
 // Transition cache for pre-computed transitions
 const MAX_CACHE_SIZE = 50;
@@ -29,15 +31,7 @@ function validatePath(p: string): string | null {
 }
 
 function logToDisk(level: string, message: string) {
-  try {
-    const userDataPath = app.getPath('userData');
-    const logPath = path.join(userDataPath, 'gangsta_log.txt');
-    const timestamp = new Date().toISOString();
-    const logEntry = `[${timestamp}] [MAIN] [${level.toUpperCase()}] ${message}\n`;
-    fs.appendFileSync(logPath, logEntry);
-  } catch (e) {
-    // Fail silent for logging
-  }
+  logManager.log(level as LogLevel, 'MAIN', message);
 }
 
 // FORCE AUTOPLAY
@@ -159,21 +153,16 @@ function createWindow() {
 
   // Persistent Logging Handlers
   ipcMain.handle('fs:append-log', async (_event, level: string, message: string) => {
-    try {
-      const userDataPath = app.getPath('userData');
-      const logPath = path.join(userDataPath, 'gangsta_log.txt');
-      const timestamp = new Date().toISOString();
-      const logEntry = `[${timestamp}] [${level.toUpperCase()}] ${message}\n`;
-      fs.appendFileSync(logPath, logEntry);
-      return true;
-    } catch (e) {
-      console.error('Failed to write log', e);
-      return false;
-    }
+    logManager.log(level as LogLevel, 'RENDERER', message);
+    return true;
   });
 
   ipcMain.handle('fs:get-log-path', async () => {
-    return path.join(app.getPath('userData'), 'gangsta_log.txt');
+    return logManager.getLogPath();
+  });
+
+  ipcMain.handle('app:generate-crash-report', async (_event, stateSnapshot) => {
+    return await logManager.generatePostMortem(stateSnapshot);
   });
 
   ipcMain.handle('dialog:open-sample', async () => {
@@ -246,10 +235,47 @@ function createWindow() {
     return result;
   });
 
+  // ==================== DATABASE HANDLERS ====================
+  
+  ipcMain.handle('db:upsert-track', async (_event, track) => {
+    try {
+      return dbManager.upsertTrack(track);
+    } catch (e) {
+      logToDisk('ERROR', `DB Upsert failed: ${e}`);
+      return null;
+    }
+  });
+
+  ipcMain.handle('db:get-track', async (_event, path) => {
+    return dbManager.getTrackByPath(path);
+  });
+
+  ipcMain.handle('db:search-tracks', async (_event, query) => {
+    return dbManager.searchTracks(query);
+  });
+
+  ipcMain.handle('db:get-all-tracks', async (_event) => {
+    return dbManager.getAllTracks();
+  });
+
+  ipcMain.on('app:close', () => { 
+    dbManager.close();
+    win.close(); 
+  });
+  
   win.on('close', async () => {
+    dbManager.close();
     if (sonetraBridge) {
       await sonetraBridge.stopServer();
     }
+  });
+
+  // GURU CRASH PROTECTION
+  process.on('uncaughtException', async (error) => {
+    logToDisk('ERROR', `UNCAUGHT EXCEPTION: ${error.stack || error}`);
+    const report = await logManager.generatePostMortem({ type: 'CRASH_UNCAUGHT_EXCEPTION' });
+    console.error(`GURU ERROR: Crash report generated at ${report}`);
+    app.exit(1);
   });
 }
 

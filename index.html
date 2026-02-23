@@ -58,10 +58,10 @@
         <div class="player-section">
             <!-- REMOVED: TAPE DECK LABEL -->
             <div class="screen">
+                <canvas id="waveformCanvas" class="waveform-canvas"></canvas>
                 <span id="trackTitle">INSERT TAPE...</span>
                 <!-- BPM merged into trackTitle -->
                 <div class="visualizer" id="visualizer"></div>
-
             </div>
             <div class="progress-container">
                 <span id="currentTime" class="time-display">0:00</span>
@@ -88,6 +88,10 @@
                 [+] LOAD AUDIO
                 <input type="file" id="playlistInput" multiple accept="audio/*" class="hidden-input">
             </label>
+            <div class="playlist-search-container">
+                <span class="search-icon">🔍</span>
+                <input type="text" id="playlistSearch" placeholder="SEARCH LIBRARY (INSTANT)..." class="playlist-search-input">
+            </div>
             <ul class="playlist" id="playlist"></ul>
             <div class="chopper-section">
                 <div id="chopperTitle" class="label-text chopper-title">CHOPPER AND SCREWER</div>
@@ -256,6 +260,9 @@
         <div class="context-item" id="ctxLoadSample" role="menuitem" tabindex="-1">LOAD SAMPLE</div>
         <div id="padCtxDivider" class="context-divider hidden" role="separator"></div>
         <div class="context-item hidden" id="ctxSync" role="menuitem" tabindex="-1">SYNC</div>
+        <div class="context-divider"></div>
+        <div class="context-item" id="ctxPadMidiLearn" role="menuitem" tabindex="-1">MIDI LEARN (BIND CONTROLLER)</div>
+        <div class="context-item" id="ctxPadKeyBind" role="menuitem" tabindex="-1">BIND KEY (COMPUTER KEYBOARD)</div>
     </div>
 
     <!-- NEW: Play Button Context Menu -->
@@ -269,6 +276,10 @@
         <div class="context-item" id="ctxLoopOff" role="menuitem" tabindex="-1">LOOP OFF ✓</div>
         <div class="context-item" id="ctxLoopOne" role="menuitem" tabindex="-1">LOOP CURRENT TRACK</div>
         <div class="context-item" id="ctxLoopAll" role="menuitem" tabindex="-1">LOOP PLAYLIST</div>
+    </div>
+    
+    <div id="controlContextMenu" class="context-menu hidden" role="menu">
+        <div class="context-item" id="ctxControlMidiLearn" role="menuitem" tabindex="-1">MIDI LEARN (BIND CC)</div>
     </div>
 
     <!-- FOOTER CONTROLS -->

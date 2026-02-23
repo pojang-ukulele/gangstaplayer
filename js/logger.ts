@@ -43,6 +43,18 @@ class GangstaLogger {
         }
         return 'UNKNOWN';
     }
+
+    async generateCrashReport(stateSnapshot: any) {
+        if ((window as any).electronAPI && (window as any).electronAPI.generateCrashReport) {
+            try {
+                const reportPath = await (window as any).electronAPI.generateCrashReport(stateSnapshot);
+                this.error('CRITICAL: Render process crash detected. Diagnostic report generated at:', reportPath);
+                return reportPath;
+            } catch (e) {
+                console.error('[Logger] Failed to generate crash report', e);
+            }
+        }
+    }
 }
 
 export const logger = new GangstaLogger();

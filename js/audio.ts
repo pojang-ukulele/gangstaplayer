@@ -43,9 +43,29 @@ export async function initWorklets(): Promise<void> {
     if (isWorkletRegistered) return;
     try {
         await audioCtx.audioWorklet.addModule('js/workers/gangsta-processor.js');
+        await audioCtx.audioWorklet.addModule('js/workers/recorder-processor.js');
         isWorkletRegistered = true;
-        console.log('[Audio] GangstaWorklet Registered');
+        console.log('[Audio] Worklets Registered');
     } catch (e) {
         console.error('[Audio] Worklet registration failed', e);
     }
+}
+
+export interface DecodeResult {
+    numberOfChannels: number;
+    sampleRate: number;
+    length: number;
+    duration: number;
+    channels: Float32Array[];
+}
+
+/**
+ * Reconstructs an AudioBuffer from background-decoded PCM data
+ */
+export function createAudioBuffer(data: DecodeResult): AudioBuffer {
+    const buffer = audioCtx.createBuffer(data.numberOfChannels, data.length, data.sampleRate);
+    for (let i = 0; i < data.numberOfChannels; i++) {
+        buffer.copyToChannel(data.channels[i] as any, i);
+    }
+    return buffer;
 }

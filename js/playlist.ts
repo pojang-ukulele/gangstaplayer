@@ -1,7 +1,9 @@
 import { DRAG_THRESHOLD_PX } from './constants';
-import { audioCtx } from './audio';
+import { audioCtx, createAudioBuffer } from './audio';
+import { decoderPool } from './decoder-pool';
 import { detectBPMWorker } from './worker-client';
 import { state, Track } from './state';
+import { VirtualScroller } from './reactive/ui';
 
 interface PlaylistDeps {
     loadTrack: (index: number) => Promise<void>;
@@ -20,6 +22,8 @@ let contextMenu: HTMLElement | null = null;
 
 let loadTrackFn: ((index: number) => Promise<void>) | null = null;
 let playTrackFn: (() => void) | null = null;
+let vScroller: VirtualScroller<Track> | null = null;
+const ITEM_HEIGHT = 40; // Pixels
 
 export function initPlaylist(deps: PlaylistDeps): void {
     loadTrackFn = deps.loadTrack;
@@ -27,13 +31,53 @@ export function initPlaylist(deps: PlaylistDeps): void {
     playlistEl = document.getElementById('playlist');
     playlistInput = document.getElementById('playlistInput') as HTMLInputElement;
     contextMenu = document.getElementById('contextMenu');
+    const searchInput = document.getElementById('playlistSearch') as HTMLInputElement;
+
+    // === INITIAL LOAD FROM DB ===
+    const db = (window as any).database;
+    if (db) {
+        db.getAllTracks().then((tracks: Track[]) => {
+            if (tracks && tracks.length > 0) {
+                state.update({ playlist: tracks });
+            }
+        });
+    }
+
+    if (searchInput) {
+        searchInput.addEventListener('input', async () => {
+            const query = searchInput.value;
+            if (db && query.length > 0) {
+                const results = await db.searchTracks(query);
+                state.update({ playlist: results });
+            } else if (db) {
+                const all = await db.getAllTracks();
+                state.update({ playlist: all });
+            }
+        });
+    }
 
     // === REACTIVE SUBSCRIPTIONS ===
-    const updateUI = () => renderPlaylist();
-    state.subscribe('playlist', updateUI);
-    state.subscribe('selectedIndices', updateUI);
-    state.subscribe('currentTrackIndex', updateUI);
-    state.subscribe('blendingIndex', updateUI);
+    state.subscribe('playlist', (playlist) => {
+        if (vScroller) vScroller.updateItems(playlist);
+    });
+    
+    const refreshSelection = () => {
+        if (vScroller) vScroller.refresh(true);
+    };
+
+    state.subscribe('selectedIndices', refreshSelection);
+    state.subscribe('currentTrackIndex', refreshSelection);
+    state.subscribe('blendingIndex', refreshSelection);
+    
+    // Initial vScroller setup
+    if (playlistEl) {
+        vScroller = new VirtualScroller({
+            container: playlistEl,
+            items: state.playlist,
+            itemHeight: ITEM_HEIGHT,
+            renderItem: (track, index, existing) => renderTrackRow(track, index, existing)
+        });
+    }
 }
 
 export function setBlendingIndex(index: number): void {
@@ -45,17 +89,48 @@ export function setBlendingIndex(index: number): void {
  */
 async function analyzeTrackInBackground(track: Track): Promise<void> {
     try {
+        const db = (window as any).database;
+        
+        // 1. Check DB Cache first
+        if (db) {
+            const cached = await db.getTrack(track.path);
+            if (cached && cached.bpm > 0) {
+                track.bpm = cached.bpm;
+                track.duration = cached.duration;
+                state.update({ playlist: [...state.playlist] });
+                return;
+            }
+        }
+
         const rawData = await (window as any).fileSystem.readFile(track.path);
         if (!rawData) {
             console.warn(`[Playlist] Analysis skipped for ${track.name} (File unreadable)`);
             return;
         }
-        // CRITICAL FIX: Ensure we use a clean slice of the ArrayBuffer
+
+
         const arrayBuffer = rawData.buffer.slice(rawData.byteOffset, rawData.byteOffset + rawData.byteLength);
-        const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+        
+        // Background decoding like a pro
+        const decodeResult = await decoderPool.decode(arrayBuffer);
+        const audioBuffer = createAudioBuffer(decodeResult);
+
         const bpm = await detectBPMWorker(audioBuffer);
+        
         track.bpm = bpm; 
-        // Trigger reactive update by re-setting playlist
+        track.duration = audioBuffer.duration;
+
+        // 2. Persist to DB
+        if (db) {
+            await db.upsertTrack({
+                id: track.id,
+                path: track.path,
+                name: track.name,
+                duration: track.duration,
+                bpm: track.bpm
+            });
+        }
+
         state.update({ playlist: [...state.playlist] });
     } catch (e) {
         console.error(`[Playlist] Failed to analyze ${track.name}`, e);
@@ -77,6 +152,19 @@ export function addTracksToPlaylist(files: File[]): void {
             bpm: undefined 
         };
         currentPlaylist.push(track);
+        
+        // Instant DB Indexing (metadata comes later via analysis)
+        const db = (window as any).database;
+        if (db) {
+            db.upsertTrack({
+                id: track.id,
+                path: track.path,
+                name: track.name,
+                duration: 0,
+                bpm: 0
+            });
+        }
+
         analyzeTrackInBackground(track);
     });
 
@@ -93,105 +181,103 @@ export function addTracksToPlaylist(files: File[]): void {
     }
 }
 
-export function renderPlaylist(): void {
-    if (!playlistEl) return;
-    playlistEl.innerHTML = '';
-    state.playlist.forEach((track, index) => {
-        const li = document.createElement('li');
-        
-        let bpmSuffix = " [...]";
-        if (track.bpm !== null && track.bpm !== undefined) {
-            bpmSuffix = track.bpm > 0 ? ` [${track.bpm} BPM]` : " [BPM: --]";
-        }
-        
-        let blendSuffix = "";
-        if (index === state.blendingIndex) {
-            blendSuffix = " [MIXING IN...]";
-            li.classList.add('blending');
-        }
+function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HTMLElement {
+    const li = (existing || document.createElement('li')) as HTMLElement;
+    
+    let bpmSuffix = " [...]";
+    if (track.bpm !== null && track.bpm !== undefined) {
+        bpmSuffix = track.bpm > 0 ? ` [${track.bpm} BPM]` : " [BPM: --]";
+    }
+    
+    let blendSuffix = "";
+    li.classList.remove('blending', 'selected', 'playing');
 
-        li.innerText = track.name + bpmSuffix + blendSuffix;
-        
-        if (state.selectedIndices.includes(index)) li.classList.add('selected');
-        if (index === state.currentTrackIndex) li.classList.add('playing');
-        
+    if (index === state.blendingIndex) {
+        blendSuffix = " [MIXING IN...]";
+        li.classList.add('blending');
+    }
+
+    li.innerText = track.name + bpmSuffix + blendSuffix;
+    
+    if (state.selectedIndices.includes(index)) li.classList.add('selected');
+    if (index === state.currentTrackIndex) li.classList.add('playing');
+    
+    // Only add listeners if it's a new element
+    if (!existing) {
         li.addEventListener('click', (e) => {
-            e.stopPropagation(); // Prevent background click from deselecting
+            e.stopPropagation();
+            const idx = parseInt(li.dataset.index || "0");
             
             const currentSelected = [...state.selectedIndices];
             if (e.ctrlKey || e.metaKey) {
-                const i = currentSelected.indexOf(index);
+                const i = currentSelected.indexOf(idx);
                 if (i !== -1) currentSelected.splice(i, 1); 
-                else currentSelected.push(index);
-                anchorIndex = index;
-                pivotIndex = index;
+                else currentSelected.push(idx);
+                anchorIndex = idx;
+                pivotIndex = idx;
                 state.update({ selectedIndices: currentSelected });
             } else if (e.shiftKey) {
-                if (pivotIndex === -1) pivotIndex = anchorIndex !== -1 ? anchorIndex : index;
-                
-                const s = Math.min(pivotIndex, index);
-                const e_ = Math.max(pivotIndex, index);
+                if (pivotIndex === -1) pivotIndex = anchorIndex !== -1 ? anchorIndex : idx;
+                const s = Math.min(pivotIndex, idx);
+                const e_ = Math.max(pivotIndex, idx);
                 const range = Array.from({length: e_ - s + 1}, (_, i) => s + i);
                 state.update({ selectedIndices: range });
-                anchorIndex = index;
+                anchorIndex = idx;
             } else {
-                state.update({ selectedIndices: [index] });
-                anchorIndex = index;
-                pivotIndex = index;
+                state.update({ selectedIndices: [idx] });
+                anchorIndex = idx;
+                pivotIndex = idx;
             }
-            renderPlaylist();
         });
 
         li.addEventListener('dblclick', (e) => {
             e.stopPropagation();
+            const idx = parseInt(li.dataset.index || "0");
             if (loadTrackFn) {
-                loadTrackFn(index).then(() => {
+                loadTrackFn(idx).then(() => {
                     if (playTrackFn) playTrackFn();
-                }).catch(err => console.error("DblClick Playback Failed:", err));
+                });
             }
         });
 
         li.addEventListener('mousedown', (e) => {
             if (e.button === 0) { 
-                draggedIndex = index; 
+                draggedIndex = parseInt(li.dataset.index || "0"); 
                 dragStartY = e.clientY; 
             } 
         });
 
-        // Right-Click Context Menu
         li.addEventListener('contextmenu', (e) => {
-             e.preventDefault();
-             e.stopPropagation();
-             // 1. Select if not selected
-             if (!state.selectedIndices.includes(index)) {
-                 state.update({ selectedIndices: [index] });
-                 anchorIndex = index;
-                 pivotIndex = index;
-             }
-             
-             // 2. Show Menu
-             const menu = document.getElementById('contextMenu');
-             if (menu) {
-                 menu.classList.remove('hidden');
-                 menu.style.display = 'block'; // Force visibility
-                 menu.style.zIndex = '9999';
-                 
-                 // Bounds
-                 let x = e.pageX;
-                 let y = e.pageY;
-                 if (x + 180 > window.innerWidth) x = window.innerWidth - 180;
-                 if (y + 150 > window.innerHeight) y = window.innerHeight - 150;
-                 
-                 menu.style.left = x + 'px';
-                 menu.style.top = y + 'px';
-                 
-                 // Store index for actions
-                 menu.dataset.removeIndex = index.toString(); 
-             }
+            e.preventDefault();
+            e.stopPropagation();
+            const idx = parseInt(li.dataset.index || "0");
+            if (!state.selectedIndices.includes(idx)) {
+                state.update({ selectedIndices: [idx] });
+                anchorIndex = idx;
+                pivotIndex = idx;
+            }
+            const menu = document.getElementById('contextMenu');
+            if (menu) {
+                menu.classList.remove('hidden');
+                menu.style.display = 'block';
+                menu.style.zIndex = '9999';
+                let x = e.pageX;
+                let y = e.pageY;
+                if (x + 180 > window.innerWidth) x = window.innerWidth - 180;
+                if (y + 150 > window.innerHeight) y = window.innerHeight - 150;
+                menu.style.left = x + 'px';
+                menu.style.top = y + 'px';
+                menu.dataset.removeIndex = idx.toString(); 
+            }
         });
+    }
 
-        if (playlistEl) playlistEl.appendChild(li);
-    });
+    li.dataset.index = index.toString();
+    return li;
+}
+
+export function renderPlaylist(): void {
+    if (vScroller) vScroller.refresh(true);
 }
 
 // === NEW: KEYBOARD NAVIGATION ===
@@ -236,8 +322,8 @@ export function handlePlaylistNavigation(e: KeyboardEvent): void {
     }
     
     // Scroll into view
-    if (playlistEl && playlistEl.children[anchorIndex]) {
-        (playlistEl.children[anchorIndex] as HTMLElement).scrollIntoView({ block: 'nearest' });
+    if (vScroller) {
+        vScroller.scrollTo(anchorIndex);
     }
 }
 
