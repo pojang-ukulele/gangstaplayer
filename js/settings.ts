@@ -19,11 +19,7 @@ interface Settings {
     autoMix: AutoMixSettings;
 }
 
-declare global {
-    interface Window {
-        electronAPI: any;
-    }
-}
+import './types';
 
 const bridge = window.electronAPI;
 
@@ -71,6 +67,19 @@ export function initSettings(deps: { setAutoMixEnabled: (enabled: boolean) => vo
 
     setupSettingsHandlers();
     loadSettings();
+
+    // Escape key closes topmost modal
+    document.addEventListener('keydown', (e) => {
+        if (e.key !== 'Escape') return;
+        const modals = ['confirmModal', 'autoMixModal', 'helpModal', 'settingsModal'];
+        for (const id of modals) {
+            const modal = document.getElementById(id);
+            if (modal && modal.style.display === 'block') {
+                modal.style.display = 'none';
+                break;
+            }
+        }
+    });
 }
 
 export function loadSettings(): void {
@@ -183,7 +192,6 @@ export function setupSettingsHandlers(): void {
 
     if (openHelpBtn && helpModal) {
         openHelpBtn.addEventListener('click', () => {
-            console.log("Opening Help Modal");
             helpModal.style.display = 'block';
         });
     }

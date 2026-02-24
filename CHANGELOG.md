@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## [v4.17.0] - 2026-02-24 - "Optimization Pass"
+
+### 🛡️ Code Quality & Refactoring
+
+- **Decomposed App Orchestrator**: Split the massive `initApp` function into focused modules (Context Menus, Master Recording, Global Shortcuts).
+- **TypeScript Strictness**: Substituted legacy inline global Window augmentation with a strictly typed `ElectronAPI` shared interface.
+- **State Engine Efficiencies**: Replaced slow `JSON.stringify` dependency within `ReactiveStore` with lightning-fast shallow referential checks, optimizing the real-time audio loop.
+- **UI Modularization**: Extracted modal utilities (e.g., `showConfirm`) out of the `player` module to a dedicated `/js/modals.ts`. Separated `debounce`/`throttle` to `/js/utils.ts`.
+- **Keyboard Polish**: Added a global `Escape` key close handler that properly clears the topmost active modal.
+- **Production Build Toggle**: Implemented an overarching `--prod` flag in the custom `esbuild` script to guarantee complete bundle minification for dist builds while preserving readable sources for dev.
+
 ## [v4.16.0] - 2026-02-23 - "Guru Precision Update"
 
 ### 🛡️ Integrity & Performance Refinements

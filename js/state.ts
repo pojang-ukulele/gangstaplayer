@@ -92,10 +92,8 @@ class ReactiveStore implements AppStateData {
         for (const [key, value] of Object.entries(patch)) {
             const k = key as keyof AppStateData;
             
-            // Check for equality (including shallow array check for playlist/selectedIndices)
-            const isDifferent = Array.isArray(value) 
-                ? JSON.stringify(this[k]) !== JSON.stringify(value)
-                : this[k] !== value;
+            // Reference equality check (arrays should be new refs when changed)
+            const isDifferent = (this as any)[k] !== value;
 
             if (isDifferent) {
                 (this as any)[k] = value;

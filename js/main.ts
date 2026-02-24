@@ -23,12 +23,7 @@ import { toast } from './toast';
 import { logger } from './logger';
 import { HighFidelityRecorder } from './recorder-client';
 
-declare global {
-    interface Window {
-        electronAPI: any;
-        fileSystem: any;
-    }
-}
+import './types';
 
 const bridge = window.electronAPI;
 const fsBridge = window.fileSystem;
