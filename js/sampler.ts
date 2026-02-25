@@ -1,7 +1,7 @@
 import { DEFAULT_PAD_VOLUME } from './constants';
 import { state } from './state';
-import { audioCtx, masterGain, resumeAudioContext, createAudioBuffer } from './audio';
-import { decoderPool } from './decoder-pool';
+import { audioCtx, masterGain, resumeAudioContext } from './audio';
+import { engine } from './audio-engine';
 import { toast } from './toast';
 import { logger } from './logger';
 
@@ -53,17 +53,26 @@ function updatePadVisuals(index: number): void {
     if (wrapper) renderPad(index, wrapper);
 }
 
+function setPadLoading(index: number, loading: boolean): void {
+    if (!padGrid) return;
+    const pad = padGrid.children[index]?.querySelector('.pad') as HTMLElement;
+    if (pad) {
+        pad.classList.toggle('loading', loading);
+    }
+}
+
 export async function loadSampleFile(file: File, index: number): Promise<void> {
+    setPadLoading(index, true);
     try {
         logger.info(`[Sampler] Loading file to pad ${index}: ${file.name}`);
         const arrayBuffer = await file.arrayBuffer();
         
-        // Background decoding like a pro
-        const decodeResult = await decoderPool.decode(arrayBuffer);
-        const audioBuffer = createAudioBuffer(decodeResult);
+        // Use native decoder directly (no worker pool — most reliable for one-shot samples)
+        const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
         
         padBuffers[index] = audioBuffer;
         padPaths[index] = file.name;
+        logger.info(`[Sampler] Pad ${index}: Buffer set from file (${audioBuffer.duration.toFixed(2)}s)`);
         updatePadVisuals(index);
         
         if (detectBPMFn) {
@@ -71,13 +80,17 @@ export async function loadSampleFile(file: File, index: number): Promise<void> {
             padBPMs[index] = bpm;
             logger.info(`[Sampler] Pad ${index} BPM: ${bpm}`);
         }
-    } catch (e) { 
-        logger.error(`[Sampler] Pad ${index} load failed:`, e);
+    } catch (e: any) { 
+        logger.error(`[Sampler] Pad ${index} load failed: ${e.message || e}`);
+        console.error(`[Sampler] Pad ${index} file load FAILED:`, e);
         toast.error("SAMPLE LOAD FAILED");
+    } finally {
+        setPadLoading(index, false);
     }
 }
 
 export async function loadSampleFromPath(path: string, index: number): Promise<void> {
+    setPadLoading(index, true);
     try {
         logger.info(`[Sampler] Loading path to pad ${index}: ${path}`);
         const rawData = await fsBridgeRef.readFile(path);
@@ -85,25 +98,40 @@ export async function loadSampleFromPath(path: string, index: number): Promise<v
             logger.error(`[Sampler] Read failed for path: ${path}`);
             return;
         }
-        const arrayBuffer = rawData.buffer.slice(rawData.byteOffset, rawData.byteOffset + rawData.byteLength);
         
-        // Background decoding like a pro
-        const decodeResult = await decoderPool.decode(arrayBuffer);
-        const audioBuffer = createAudioBuffer(decodeResult);
+        // Robust buffer alignment
+        let arrayBuffer: ArrayBuffer;
+        if (rawData instanceof ArrayBuffer) {
+            arrayBuffer = rawData.slice(0);
+        } else if (rawData.buffer instanceof ArrayBuffer) {
+            arrayBuffer = rawData.buffer.slice(rawData.byteOffset, rawData.byteOffset + rawData.byteLength);
+        } else {
+            arrayBuffer = Uint8Array.from(rawData).buffer;
+        }
+        
+        logger.info(`[Sampler] Pad ${index}: Got ${arrayBuffer.byteLength} bytes, decoding...`);
+        
+        // Use native decoder directly
+        const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
 
         padBuffers[index] = audioBuffer;
         padPaths[index] = path;
+        logger.info(`[Sampler] Pad ${index}: Buffer set (${audioBuffer.duration.toFixed(2)}s, ${audioBuffer.sampleRate}Hz)`);
         updatePadVisuals(index);
         if (detectBPMFn) {
             const bpm = await detectBPMFn(audioBuffer);
             padBPMs[index] = bpm;
         }
-    } catch (e) { 
-        logger.error(`[Sampler] Pad ${index} path load failed:`, e);
+    } catch (e: any) { 
+        logger.error(`[Sampler] Pad ${index} path load failed: ${e.message || e}`);
+        console.error(`[Sampler] Pad ${index} path load FAILED:`, e);
+    } finally {
+        setPadLoading(index, false);
     }
 }
 
 export function startPad(index: number): void {
+    console.log(`[Sampler] startPad(${index}) called. Buffer exists: ${!!padBuffers[index]}`);
     if (!padBuffers[index]) return;
     resumeAudioContext();
     
@@ -119,14 +147,30 @@ export function startPad(index: number): void {
     gainNode.gain.setValueAtTime(currentVol, audioCtx.currentTime);
     
     let rate = tempoSliderRef ? parseFloat(tempoSliderRef.value) : 1;
+    let startOffset = 0;
+    
     if (padSyncState[index] && masterBPMRef.value > 0 && padBPMs[index] > 0) {
+        // Adjust playback rate to match master BPM
         rate = (masterBPMRef.value / padBPMs[index]) * rate;
+        
+        // Beat-quantized start: snap to nearest beat in the master timeline
+        const masterBPS = masterBPMRef.value / 60; // beats per second
+        const padBeatDuration = 60 / padBPMs[index]; // one beat in the pad's native time
+        
+        // Get current position in the master audio
+        const playerAudio = engine.main.audio;
+        if (playerAudio && playerAudio.currentTime > 0 && !isNaN(playerAudio.duration)) {
+            const masterBeatPhase = (playerAudio.currentTime * masterBPS) % 1; // 0-1 phase within current beat
+            // Start the pad at the same phase position within its beat cycle
+            startOffset = masterBeatPhase * padBeatDuration;
+        }
     }
     source.playbackRate.value = rate;
     
     source.connect(gainNode);
     gainNode.connect(masterGain);
-    source.start(0);
+    source.start(0, startOffset);
+    console.log(`[Sampler] Pad ${index} playing! Rate: ${rate.toFixed(3)}, Offset: ${startOffset.toFixed(3)}s`);
     
     activeVoices[index] = { source, gain: gainNode };
     updatePadVisuals(index);
@@ -180,6 +224,7 @@ function renderPad(index: number, existing?: HTMLElement): HTMLElement {
         recBtn.addEventListener('mousedown', (e) => { e.stopPropagation(); startRecording(index); });
         recBtn.addEventListener('mouseup', (e) => { e.stopPropagation(); stopRecording(index); });
         recBtn.addEventListener('mouseleave', (e) => { e.stopPropagation(); stopRecording(index); });
+        recBtn.addEventListener('click', (e) => { e.stopPropagation(); }); // Prevent file dialog from opening
 
         pad.addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); pad.classList.add('drag-over'); });
         pad.addEventListener('dragleave', (e) => { e.preventDefault(); e.stopPropagation(); pad.classList.remove('drag-over'); });

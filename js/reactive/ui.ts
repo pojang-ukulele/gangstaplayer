@@ -97,7 +97,7 @@ export class VirtualScroller<T> {
 
         // Remove items no longer visible
         for (const [idx, el] of this.visibleItems) {
-            if (idx < startIdx || idx > endIdx) {
+            if (idx < startIdx || idx > endIdx || idx >= this.items.length) {
                 el.remove();
                 this.visibleItems.delete(idx);
             } else if (force) {

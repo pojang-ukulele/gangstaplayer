@@ -2,6 +2,8 @@
 import { VISUALIZER_BARS } from './constants';
 import { analyser, masterGain, audioCtx, resumeAudioContext, createAudioBuffer } from './audio';
 import { decoderPool } from './decoder-pool';
+import { logger } from './logger';
+import { state } from './state';
 
 const dataArray = new Uint8Array(analyser.frequencyBinCount);
 const visualizerBars: HTMLElement[] = [];
@@ -87,7 +89,10 @@ function masterLoop(): void {
     const HIGH_THRESHOLD = 100;
     const AVG_THRESHOLD = 2;
 
-    if (totalAvg > AVG_THRESHOLD) {
+    // Force EQ-reactive mode when crossfade is blending (both channels are always producing audio)
+    const isAudioActive = totalAvg > AVG_THRESHOLD || state.isCrossfadeInProgress;
+
+    if (isAudioActive) {
         // Only update visualizer bars every frame
         const step = Math.floor(dataArray.length / 16);
         for (let i = 0; i < 16; i++) {
@@ -131,15 +136,25 @@ function masterLoop(): void {
 
 
 export function playStartupSound(): void {
-    console.log("[Visuals] Triggering startup sound...");
+    logger.info("[Visuals] Triggering startup sound...");
+    
     resumeAudioContext().then(() => {
-        fetch('assets/gun-load.wav')
-            .then(response => response.arrayBuffer())
-            .then(async arrayBuffer => {
-                const decodeResult = await decoderPool.decode(arrayBuffer);
-                return createAudioBuffer(decodeResult);
+        const soundPath = 'assets/gun-load.wav';
+        logger.info(`[Visuals] Fetching startup sound from: ${soundPath}`);
+        
+        // Use standard fetch + decodeAudioData for highest reliability on startup
+        fetch(soundPath)
+            .then(response => {
+                if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+                return response.arrayBuffer();
+            })
+            .then(arrayBuffer => {
+                logger.debug("[Visuals] Startup sound binary loaded, decoding...");
+                // Note: We use the context's native decoder here to avoid any worker-pool race conditions on boot
+                return audioCtx.decodeAudioData(arrayBuffer);
             })
             .then(audioBuffer => {
+                logger.info("[Visuals] Startup sound decoded, initiating playback.");
                 const source = audioCtx.createBufferSource();
                 const gain = audioCtx.createGain();
                 source.buffer = audioBuffer;
@@ -147,7 +162,18 @@ export function playStartupSound(): void {
                 source.connect(gain);
                 gain.connect(masterGain);
                 source.start(0);
+                logger.info("[Visuals] Startup sound playback started.");
             })
-            .catch(e => console.error("[Visuals] Startup Sound Error:", e));
-    });
+            .catch((e: any) => {
+                logger.error(`[Visuals] Startup Sound Error: ${e.message || String(e)}`);
+                // Fallback for extreme cases: try playing via native Audio element (bypasses Web Audio chain)
+                try {
+                    const audio = new Audio(soundPath);
+                    audio.volume = 0.6;
+                    audio.play().catch((pErr: any) => logger.error(`[Visuals] Native Audio Fallback failed: ${pErr.message || String(pErr)}`));
+                } catch (fallbackErr: any) {
+                    logger.error(`[Visuals] All startup sound attempts failed: ${fallbackErr.message || String(fallbackErr)}`);
+                }
+            });
+    }).catch(e => logger.error(`[Visuals] Audio Context Resume failed: ${e.message}`));
 }

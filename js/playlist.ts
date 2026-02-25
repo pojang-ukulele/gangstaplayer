@@ -1,6 +1,5 @@
 import { DRAG_THRESHOLD_PX } from './constants';
-import { audioCtx, createAudioBuffer } from './audio';
-import { decoderPool } from './decoder-pool';
+import { audioCtx } from './audio';
 import { detectBPMWorker } from './worker-client';
 import { state, Track } from './state';
 import { VirtualScroller } from './reactive/ui';
@@ -23,7 +22,7 @@ let contextMenu: HTMLElement | null = null;
 let loadTrackFn: ((index: number) => Promise<void>) | null = null;
 let playTrackFn: (() => void) | null = null;
 let vScroller: VirtualScroller<Track> | null = null;
-const ITEM_HEIGHT = 40; // Pixels
+const ITEM_HEIGHT = 26; // Pixels — compact single-line row
 
 export function initPlaylist(deps: PlaylistDeps): void {
     loadTrackFn = deps.loadTrack;
@@ -109,11 +108,18 @@ async function analyzeTrackInBackground(track: Track): Promise<void> {
         }
 
 
-        const arrayBuffer = rawData.buffer.slice(rawData.byteOffset, rawData.byteOffset + rawData.byteLength);
+        // Robust buffer alignment (IPC returns varying types)
+        let arrayBuffer: ArrayBuffer;
+        if (rawData instanceof ArrayBuffer) {
+            arrayBuffer = rawData.slice(0);
+        } else if (rawData.buffer instanceof ArrayBuffer) {
+            arrayBuffer = rawData.buffer.slice(rawData.byteOffset, rawData.byteOffset + rawData.byteLength);
+        } else {
+            arrayBuffer = Uint8Array.from(rawData).buffer;
+        }
         
-        // Background decoding like a pro
-        const decodeResult = await decoderPool.decode(arrayBuffer);
-        const audioBuffer = createAudioBuffer(decodeResult);
+        // Use native decoder (decoder pool workers are unreliable)
+        const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
 
         const bpm = await detectBPMWorker(audioBuffer);
         
@@ -133,7 +139,7 @@ async function analyzeTrackInBackground(track: Track): Promise<void> {
 
         state.update({ playlist: [...state.playlist] });
     } catch (e) {
-        console.error(`[Playlist] Failed to analyze ${track.name}`, e);
+        console.warn(`[Playlist] BPM analysis skipped for ${track.name}`);
         track.bpm = 0; 
         state.update({ playlist: [...state.playlist] });
     }
@@ -184,9 +190,9 @@ export function addTracksToPlaylist(files: File[]): void {
 function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HTMLElement {
     const li = (existing || document.createElement('li')) as HTMLElement;
     
-    let bpmSuffix = " [...]";
+    let bpmSuffix = " [...]";  // Still analyzing
     if (track.bpm !== null && track.bpm !== undefined) {
-        bpmSuffix = track.bpm > 0 ? ` [${track.bpm} BPM]` : " [BPM: --]";
+        bpmSuffix = track.bpm > 0 ? ` [${track.bpm}bpm]` : "";  // Detected or silent fail
     }
     
     let blendSuffix = "";
@@ -207,6 +213,7 @@ function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HT
         li.addEventListener('click', (e) => {
             e.stopPropagation();
             const idx = parseInt(li.dataset.index || "0");
+            console.log(`[Playlist] Item Clicked: ${idx}`);
             
             const currentSelected = [...state.selectedIndices];
             if (e.ctrlKey || e.metaKey) {
@@ -233,10 +240,12 @@ function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HT
         li.addEventListener('dblclick', (e) => {
             e.stopPropagation();
             const idx = parseInt(li.dataset.index || "0");
+            console.log(`[Playlist] Item Dbl-Clicked: ${idx}`);
             if (loadTrackFn) {
                 loadTrackFn(idx).then(() => {
+                    console.log(`[Playlist] Track ${idx} loaded, triggering play...`);
                     if (playTrackFn) playTrackFn();
-                });
+                }).catch(err => console.error(`[Playlist] Load failed for ${idx}:`, err));
             }
         });
 
@@ -261,13 +270,20 @@ function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HT
                 menu.classList.remove('hidden');
                 menu.style.display = 'block';
                 menu.style.zIndex = '9999';
-                let x = e.pageX;
-                let y = e.pageY;
-                if (x + 180 > window.innerWidth) x = window.innerWidth - 180;
-                if (y + 150 > window.innerHeight) y = window.innerHeight - 150;
+                
+                // Use clientX/Y which are more reliable for fixed/absolute overlays in scrollable views
+                let x = e.clientX;
+                let y = e.clientY;
+                
+                // Keep menu within viewport
+                const menuWidth = 180;
+                const menuHeight = 150;
+                if (x + menuWidth > window.innerWidth) x = window.innerWidth - menuWidth;
+                if (y + menuHeight > window.innerHeight) y = window.innerHeight - menuHeight;
+                
                 menu.style.left = x + 'px';
                 menu.style.top = y + 'px';
-                menu.dataset.removeIndex = idx.toString(); 
+                menu.dataset.ctxIndex = idx.toString(); 
             }
         });
     }
@@ -456,12 +472,15 @@ export function setupPlaylistHandlers(): void {
 
     if (ctxPlay) ctxPlay.addEventListener('click', () => {
          if (contextMenu) {
-             const idxStr = contextMenu.dataset.removeIndex;
+             const idxStr = contextMenu.dataset.ctxIndex;
              if (idxStr) {
                  const idx = parseInt(idxStr);
                  if (!isNaN(idx)) {
-                     if (loadTrackFn) loadTrackFn(idx);
-                     if (playTrackFn) setTimeout(() => playTrackFn!(), 100);
+                     if (loadTrackFn) {
+                         loadTrackFn(idx).then(() => {
+                             if (playTrackFn) playTrackFn();
+                         });
+                     }
                  }
              }
          }

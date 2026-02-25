@@ -436,6 +436,14 @@ h1 {
     border: none;
 }
 
+.pad:focus,
+.pad:active,
+.pad:focus-visible {
+    outline: none;
+    border: none;
+    box-shadow: none;
+}
+
 .pad.loaded:hover {
     background: linear-gradient(145deg, #ff9900, #e68a00);
     /* Lighter Orange */
@@ -801,6 +809,49 @@ input[type=range].progress-slider:hover::-webkit-slider-thumb {
     position: relative;
 }
 
+/* === SEARCH BAR === */
+.playlist-search-container {
+    display: flex;
+    align-items: center;
+    background: #0a0a0a;
+    border: 1px solid #333;
+    border-radius: 3px;
+    padding: 0 8px;
+    margin-bottom: 4px;
+    transition: border-color 0.2s;
+}
+
+.playlist-search-container:focus-within {
+    border-color: var(--neon-green);
+    box-shadow: 0 0 6px rgba(57, 255, 20, 0.15);
+}
+
+.playlist-search-container .search-icon {
+    flex-shrink: 0;
+    color: #555;
+    transition: color 0.2s;
+}
+
+.playlist-search-container:focus-within .search-icon {
+    color: var(--neon-green);
+}
+
+.playlist-search-input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: #aaa;
+    font-family: 'VT323', monospace;
+    font-size: 0.95rem;
+    padding: 5px 6px;
+    letter-spacing: 1px;
+}
+
+.playlist-search-input::placeholder {
+    color: #444;
+    letter-spacing: 2px;
+}
 .vs-overflow {
     pointer-events: none;
 }
@@ -810,11 +861,15 @@ input[type=range].progress-slider:hover::-webkit-slider-thumb {
 }
 
 .playlist li {
-    padding: 4px 10px;
+    padding: 3px 10px;
     border-bottom: 1px solid #222;
     cursor: pointer;
     color: #666;
     font-size: 1rem;
+    line-height: 1.2;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 .playlist li:hover {
@@ -905,7 +960,7 @@ input[type=range].progress-slider:hover::-webkit-slider-thumb {
 }
 
 /* Empty Pad Hover Tooltip */
-.pad:not(.loaded):hover::after {
+.pad:not(.loaded):not(.loading):hover::after {
     content: 'CLICK TO LOAD';
     position: absolute;
     top: 50%;
@@ -920,6 +975,35 @@ input[type=range].progress-slider:hover::-webkit-slider-thumb {
     line-height: 1.1;
     pointer-events: none;
     text-shadow: none;
+}
+
+/* Loading Pad State */
+.pad.loading {
+    pointer-events: none;
+    opacity: 0.7;
+}
+
+.pad.loading::after {
+    content: '';
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 20px;
+    height: 20px;
+    margin: -10px 0 0 -10px;
+    border: 3px solid rgba(57, 255, 20, 0.2);
+    border-top-color: var(--neon-green);
+    border-radius: 50%;
+    animation: padSpin 0.6s linear infinite;
+    pointer-events: none;
+}
+
+.pad.loading > span {
+    visibility: hidden;
+}
+
+@keyframes padSpin {
+    to { transform: rotate(360deg); }
 }
 
 /* Loaded Pad Hover Tooltip */

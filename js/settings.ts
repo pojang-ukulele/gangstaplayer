@@ -68,14 +68,21 @@ export function initSettings(deps: { setAutoMixEnabled: (enabled: boolean) => vo
     setupSettingsHandlers();
     loadSettings();
 
-    // Escape key closes topmost modal
+    // Escape key closes topmost modal or context menu
     document.addEventListener('keydown', (e) => {
         if (e.key !== 'Escape') return;
-        const modals = ['confirmModal', 'autoMixModal', 'helpModal', 'settingsModal'];
+        // Priority order: child modals first, then parent settings modal, then context menus
+        const modals = ['confirmModal', 'autoMixModal', 'helpModal', 'settingsModal', 'padContextMenu', 'contextMenu'];
         for (const id of modals) {
-            const modal = document.getElementById(id);
-            if (modal && modal.style.display === 'block') {
-                modal.style.display = 'none';
+            const el = document.getElementById(id);
+            if (!el) continue;
+            const isVisible = el.style.display === 'block' || 
+                              el.style.display === 'flex' ||
+                              (el.style.display !== 'none' && getComputedStyle(el).display !== 'none');
+            if (isVisible) {
+                el.style.display = 'none';
+                e.preventDefault();
+                e.stopPropagation();
                 break;
             }
         }

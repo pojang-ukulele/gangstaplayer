@@ -1,17 +1,15 @@
 // === PLAYER MODULE ===
 import { BPM_DETECTION_THRESHOLD, BPM_MIN_STEP_SECONDS } from './constants';
-import { audioCtx, resumeAudioContext, masterGain, createAudioBuffer } from './audio';
+import { audioCtx, resumeAudioContext, masterGain } from './audio';
 import { settings } from './settings';
 import { state, Track, PlaybackMode, LoopMode } from './state';
 import { detectBPMWorker } from './worker-client';
-import { decoderPool } from './decoder-pool';
 import { toast } from './toast';
 import { engine } from './audio-engine';
 import { logger } from './logger';
 import { WaveformRenderer } from './waveform-engine';
 
 interface PlayerDeps {
-    playlist: Track[];
     renderPlaylist: () => void;
     setBlendingIndex?: (index: number) => void;
 }
@@ -42,8 +40,19 @@ async function getSafeUrl(filePath: string, isMain: boolean): Promise<string> {
             logger.warn(`[SafeURL] File unreadable: ${filePath}`);
             return filePath;
         }
-        // IPC Buffer Alignment Fix
-        const arrayBuffer = rawData.buffer.slice(rawData.byteOffset, rawData.byteOffset + rawData.byteLength);
+        
+        // IPC Buffer Alignment Fix - Robust implementation
+        let arrayBuffer: ArrayBuffer;
+        if (rawData instanceof ArrayBuffer) {
+            arrayBuffer = rawData.slice(0);
+        } else if (rawData.buffer instanceof ArrayBuffer) {
+            // It's a typed array or Buffer
+            arrayBuffer = rawData.buffer.slice(rawData.byteOffset, rawData.byteOffset + rawData.byteLength);
+        } else {
+            // Fallback for objects that might look like buffers but aren't
+            arrayBuffer = Uint8Array.from(rawData).buffer;
+        }
+
         const blob = new Blob([arrayBuffer], { type: 'audio/mpeg' });
         const url = URL.createObjectURL(blob);
         
@@ -57,7 +66,7 @@ async function getSafeUrl(filePath: string, isMain: boolean): Promise<string> {
         return url;
     } catch (e) {
         logger.error("[SafeURL] Failed to create blob", e);
-        return filePath; // Fallback
+        return filePath; 
     }
 }
 
@@ -76,7 +85,6 @@ let masterVol: HTMLInputElement | null = null;
 let volKnob: HTMLElement | null = null;
 let waveformRenderer: WaveformRenderer | null = null;
 
-let playlistRef: Track[] | null = null;
 let renderPlaylistFn: (() => void) | null = null;
 let setBlendingIndexFn: ((index: number) => void) | null = null;
 
@@ -112,7 +120,6 @@ export function setLoopMode(mode: LoopMode): void {
 export function getLoopMode(): LoopMode { return state.loopMode; }
 
 export function initPlayer(deps: PlayerDeps): void {
-    playlistRef = deps.playlist;
     renderPlaylistFn = deps.renderPlaylist;
     if (deps.setBlendingIndex) setBlendingIndexFn = deps.setBlendingIndex;
     
@@ -136,7 +143,6 @@ export function initPlayer(deps: PlayerDeps): void {
     state.subscribe('isAutoMixEnabled', (enabled) => {
         if (autoMixBtn) {
             autoMixBtn.classList.toggle('active', enabled);
-            autoMixBtn.innerText = enabled ? 'AUTOMIX ON' : 'AUTOMIX OFF';
         }
     });
 
@@ -176,8 +182,9 @@ export function getTempoSlider(): HTMLInputElement | null { return tempoSlider; 
 export function getPlayerAudio(): HTMLAudioElement { return engine.main.audio; }
 
 export async function loadTrack(index: number): Promise<void> {
-    if (!playlistRef || index < 0 || index >= playlistRef.length) return;
-    const track = playlistRef[index];
+    const playlist = state.playlist;
+    if (!playlist.length || index < 0 || index >= playlist.length) return;
+    const track = playlist[index];
     state.update({ currentTrackIndex: index });
     if (renderPlaylistFn) renderPlaylistFn();
     
@@ -187,22 +194,30 @@ export async function loadTrack(index: number): Promise<void> {
     engine.main.load(safeUrl);
     engine.main.audio.playbackRate = tempoSlider ? parseFloat(tempoSlider.value) : 1;
     
-    const hasBpm = track.bpm !== null && track.bpm !== undefined;
+    const hasBpm = track.bpm !== null && track.bpm !== undefined && track.bpm > 0;
     state.update({ masterBPM: hasBpm ? (track.bpm as number) : 0 });
 
     if (trackTitle) {
-        trackTitle.innerText = `${track.name} [${hasBpm ? track.bpm + ' BPM' : 'ANALYZING...'}]`;
+        trackTitle.innerText = hasBpm ? `${track.name} [${track.bpm}bpm]` : track.name;
     }
 
     // Single-pass high-performance decoding
     (async () => {
         try {
             const rawData = await (window as any).fileSystem.readFile(track.path);
-            const arrayBuffer = (rawData.buffer || rawData).slice(0);
             
-            // Use background worker pool for zero-stutter decoding
-            const decodeResult = await decoderPool.decode(arrayBuffer);
-            const audioBuffer = createAudioBuffer(decodeResult);
+            // Robust buffer alignment
+            let arrayBuffer: ArrayBuffer;
+            if (rawData instanceof ArrayBuffer) {
+                arrayBuffer = rawData.slice(0);
+            } else if (rawData.buffer instanceof ArrayBuffer) {
+                arrayBuffer = rawData.buffer.slice(rawData.byteOffset, rawData.byteOffset + rawData.byteLength);
+            } else {
+                arrayBuffer = Uint8Array.from(rawData).buffer;
+            }
+            
+            // Use native decoder (reliable)
+            const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
             
             // 1. Update Waveform
             if (waveformRenderer) waveformRenderer.setWaveform(audioBuffer.getChannelData(0));
@@ -217,33 +232,40 @@ export async function loadTrack(index: number): Promise<void> {
 
             // 3. Final display update
             if (trackTitle && state.currentTrackIndex === index) {
-                const bpmTxt = state.masterBPM > 0 ? `[${state.masterBPM} BPM]` : "[BPM: --]";
-                trackTitle.innerText = `${track.name} ${bpmTxt}`;
+                const bpmTxt = state.masterBPM > 0 ? ` [${state.masterBPM}bpm]` : "";
+                trackTitle.innerText = `${track.name}${bpmTxt}`;
             }
         } catch (e) {
-            logger.error("[Player] Load/Analysis pipeline failed", e);
-            if (!hasBpm && trackTitle) trackTitle.innerText = `${track.name} [BPM Error]`;
+            logger.warn("[Player] Load/Analysis pipeline issue", e);
+            // Don't show error to user — just show the track name
+            if (trackTitle && state.currentTrackIndex === index) {
+                trackTitle.innerText = track.name;
+            }
         }
     })();
 }
 
 function updateControlsLock(locked: boolean): void {
-    const lockable = [progressBar, playPauseBtn];
+    const nextBtn = document.getElementById('nextBtn');
+    const prevBtn = document.getElementById('prevBtn');
+    const lockable = [progressBar, playPauseBtn, stopBtn, nextBtn, prevBtn];
     lockable.forEach(el => {
         if (el) {
             (el as any).disabled = locked;
             el.style.opacity = locked ? '0.5' : '1';
             el.style.cursor = locked ? 'not-allowed' : 'pointer';
+            el.style.pointerEvents = locked ? 'none' : 'auto';
         }
     });
 }
 
 export async function startCrossfade(targetIndex: number | null = null, customDuration: number | null = null): Promise<void> {
-    if (state.isCrossfadeInProgress || !playlistRef?.length) return;
+    const playlist = state.playlist;
+    if (state.isCrossfadeInProgress || !playlist.length) return;
     
     resumeAudioContext();
-    const nextIdx = targetIndex !== null ? targetIndex : ((state.currentTrackIndex + 1) % playlistRef.length);
-    if (playlistRef[nextIdx].path === engine.main.audio.src && !targetIndex) return; 
+    const nextIdx = targetIndex !== null ? targetIndex : ((state.currentTrackIndex + 1) % playlist.length);
+    if (playlist[nextIdx].path === engine.main.audio.src && !targetIndex) return; 
 
     state.update({ isCrossfadeInProgress: true });
     updateControlsLock(true);
@@ -252,7 +274,7 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
     if (autoMixBtn) autoMixBtn.classList.add('blending');
 
     engine.crossfade.reset();
-    const safeUrl = await getSafeUrl(playlistRef[nextIdx].path, false);
+    const safeUrl = await getSafeUrl(playlist[nextIdx].path, false);
     engine.crossfade.load(safeUrl);
     
     engine.crossfade.lowEQ.gain.value = settings.autoMix.eqCrossfade ? -24 : 0;
@@ -336,18 +358,18 @@ function finishCrossfade(nextIndex: number): void {
     if (setBlendingIndexFn) setBlendingIndexFn(-1);
     if (autoMixBtn) autoMixBtn.classList.remove('blending');
     
-    setupPlayerHandlers();
+    // setupPlayerHandlers(); // DELETED: Redundant and causes listener leaks
     
     if (renderPlaylistFn) renderPlaylistFn();
-    if (trackTitle && playlistRef) {
-         const t = playlistRef[nextIndex];
+    if (trackTitle && state.playlist.length > nextIndex) {
+         const t = state.playlist[nextIndex];
          const txt = (t.bpm && t.bpm > 0) ? `[${t.bpm} BPM]` : "[BPM: --]";
          trackTitle.innerText = `${t.name} ${txt}`;
     }
 }
 
 export function playTrack(): void {
-    if (state.isCrossfadeInProgress || !playlistRef?.length || !engine.main.audio) return;
+    if (state.isCrossfadeInProgress || !state.playlist.length || !engine.main.audio) return;
     resumeAudioContext();
     engine.main.audio.play().then(() => {
         state.update({ isPlaying: true });
@@ -404,7 +426,7 @@ export function setupPlayerHandlers(): void {
             if (state.playbackMode === 'single') stopPlayback();
             else {
                 let nextIndex = state.currentTrackIndex + 1;
-                if (nextIndex >= (playlistRef?.length || 0)) {
+                if (nextIndex >= state.playlist.length) {
                     if (state.loopMode === 'all') nextIndex = 0;
                     else { stopPlayback(); return; }
                 }
@@ -439,21 +461,27 @@ export function setupPlayerHandlers(): void {
     }
 
     const nextBtn = document.getElementById('nextBtn');
-    if (nextBtn && playlistRef) {
-        nextBtn.addEventListener('click', () => {
-            if (state.isCrossfadeInProgress) return;
+    if (nextBtn) {
+        nextBtn.onclick = () => {
+            if (state.isCrossfadeInProgress || !state.playlist.length) return;
             if (state.isAutoMixEnabled) startCrossfade(null, settings.autoMix.btnDuration);
-            else loadTrack((state.currentTrackIndex + 1) % playlistRef!.length).then(playTrack);
-        });
+            else {
+                const nextIdx = (state.currentTrackIndex + 1) % state.playlist.length;
+                loadTrack(nextIdx).then(playTrack);
+            }
+        };
     }
 
     const prevBtn = document.getElementById('prevBtn');
-    if (prevBtn && playlistRef) {
-        prevBtn.addEventListener('click', () => {
-            if (state.isCrossfadeInProgress) return;
-            if (state.isAutoMixEnabled) startCrossfade((state.currentTrackIndex - 1 + playlistRef!.length) % playlistRef!.length, settings.autoMix.btnDuration);
-            else loadTrack((state.currentTrackIndex - 1 + playlistRef!.length) % playlistRef!.length).then(playTrack);
-        });
+    if (prevBtn) {
+        prevBtn.onclick = () => {
+            if (state.isCrossfadeInProgress || !state.playlist.length) return;
+            if (state.isAutoMixEnabled) startCrossfade((state.currentTrackIndex - 1 + state.playlist.length) % state.playlist.length, settings.autoMix.btnDuration);
+            else {
+                const prevIdx = (state.currentTrackIndex - 1 + state.playlist.length) % state.playlist.length;
+                loadTrack(prevIdx).then(playTrack);
+            }
+        };
     }
     
     if (tempoSlider) {

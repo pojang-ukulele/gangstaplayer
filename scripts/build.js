@@ -122,7 +122,8 @@ async function build() {
         'index.html',
         'styles.css',
         'icon.png',
-        'package.json'
+        'package.json',
+        'README.md'
     ];
 
     if (!fs.existsSync(path.join(BUILD_DIR, 'assets'))) {

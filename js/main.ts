@@ -51,7 +51,7 @@ async function initApp() {
         tempoSlider: getTempoSlider() as HTMLInputElement
     });
 
-    initPlayer({ playlist: state.playlist, renderPlaylist, setBlendingIndex });
+    initPlayer({ renderPlaylist, setBlendingIndex });
 
     initPlaylist({
         loadTrack, playTrack
@@ -62,7 +62,7 @@ async function initApp() {
     initSettings({ setAutoMixEnabled });
 
     // Initialize UI components
-    createPadGrid();
+    // NOTE: createPadGrid() is already called inside initSampler() — do NOT call it again here
     initVisuals();
     
     // Setup handlers
@@ -108,17 +108,23 @@ async function initApp() {
 
                     padContextMenu.classList.remove('hidden');
                     padContextMenu.setAttribute('aria-hidden', 'false');
-                    padContextMenu.style.left = e.pageX + 'px';
-                    padContextMenu.style.top = e.pageY + 'px';
+                    padContextMenu.style.left = e.clientX + 'px';
+                    padContextMenu.style.top = e.clientY + 'px';
                     padContextMenu.dataset.padIndex = i.toString();
                 });
-                pad.addEventListener('mousedown', (e) => { if (e.button === 0 && padBuffers[i]) startPad(i); });
+                pad.addEventListener('mousedown', (e) => {
+                    console.log(`[Main] Pad ${i} mousedown. button=${e.button}, bufferExists=${!!padBuffers[i]}`);
+                    if (e.button === 0 && padBuffers[i]) startPad(i);
+                });
                 pad.addEventListener('mouseup', () => stopPad(i));
                 pad.addEventListener('mouseleave', () => stopPad(i));
                 pad.addEventListener('click', async () => {
+                    console.log(`[Main] Pad ${i} click. bufferExists=${!!padBuffers[i]}`);
                     if (!padBuffers[i]) {
                         const filePath = await bridge.openSampleDialog();
+                        console.log(`[Main] Pad ${i} dialog result: ${filePath}`);
                         if (filePath) await loadSampleFromPath(filePath, i);
+                        console.log(`[Main] Pad ${i} after load. bufferExists=${!!padBuffers[i]}`);
                     }
                 });
             }
@@ -176,8 +182,8 @@ async function initApp() {
                 if (ctxControlMidiLearn) ctxControlMidiLearn.classList.toggle('hidden', !state.isMidiActive);
 
                 controlContextMenu.classList.remove('hidden');
-                controlContextMenu.style.left = e.pageX + 'px';
-                controlContextMenu.style.top = e.pageY + 'px';
+                controlContextMenu.style.left = e.clientX + 'px';
+                controlContextMenu.style.top = e.clientY + 'px';
                 controlContextMenu.dataset.controlId = id;
             });
         }
@@ -197,15 +203,17 @@ async function initApp() {
         const target = e.target as HTMLElement;
         if (target.tagName === 'INPUT' && (target as HTMLInputElement).type === 'text') return;
 
-        // Transport
+        // Transport — blocked during AutoMix blending
         if (e.code === 'Space') {
-            e.preventDefault(); 
+            e.preventDefault();
+            if (state.isCrossfadeInProgress) return;
             const playerAudio = getPlayerAudio();
             if (playerAudio) {
                 if (!playerAudio.paused) pauseTrack(); else playTrack();
             }
         } else if (e.code === 'Enter') {
             e.preventDefault();
+            if (state.isCrossfadeInProgress) return;
             stopPlayback();
         } 
         
@@ -274,7 +282,7 @@ async function initApp() {
     const btnOpenManual = document.getElementById('btnOpenManual');
     if (btnOpenManual) {
         btnOpenManual.addEventListener('click', () => {
-             bridge.openExternal('README.txt');
+             bridge.openExternal('README.md');
         });
     }
 
@@ -300,8 +308,8 @@ async function initApp() {
 
             playContextMenu.classList.remove('hidden');
             playContextMenu.setAttribute('aria-hidden', 'false');
-            playContextMenu.style.left = e.pageX + 'px';
-            playContextMenu.style.top = e.pageY + 'px';
+            playContextMenu.style.left = e.clientX + 'px';
+            playContextMenu.style.top = e.clientY + 'px';
         });
     }
 
@@ -342,8 +350,8 @@ async function initApp() {
 
             loopContextMenu.classList.remove('hidden');
             loopContextMenu.setAttribute('aria-hidden', 'false');
-            loopContextMenu.style.left = e.pageX + 'px';
-            loopContextMenu.style.top = e.pageY + 'px';
+            loopContextMenu.style.left = e.clientX + 'px';
+            loopContextMenu.style.top = e.clientY + 'px';
         });
 
         loopBtn.addEventListener('click', () => {

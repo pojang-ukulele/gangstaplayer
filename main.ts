@@ -80,7 +80,15 @@ function createWindow() {
     } else {
         fullPath = path.join(app.getAppPath(), relativePath);
     }
-    await shell.openPath(fullPath);
+    // Try notepad first (Windows), fall back to system default
+    try {
+        const { execFile } = require('child_process');
+        execFile('notepad.exe', [fullPath], (err: any) => {
+            if (err) shell.openPath(fullPath);
+        });
+    } catch {
+        await shell.openPath(fullPath);
+    }
   });
 
   ipcMain.handle('dialog:save-kit', async () => {

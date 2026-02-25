@@ -1,5 +1,37 @@
 # CHANGELOG
 
+## [v4.19.0] - 2026-02-25 - "Pad & AutoMix Polish"
+
+### 🐛 Bugfixes
+
+- **Pad Playback Fix**: Replaced broken decoder worker pool with native `audioCtx.decodeAudioData` for pad loading (`sampler.ts`), playlist analysis (`playlist.ts`), and player pipeline (`player.ts`). This was the root cause of silent pad failures.
+- **Rec Button File Dialog**: Recording on a pad via the rec button no longer opens the file browser on mouse release — added `click` stopPropagation on `.rec-btn`.
+- **README Not Found**: Added `README.md` to the build copy list in `scripts/build.js` so "Open Full Manual" works.
+- **BPM Detection Doubled**: Fixed BPM detector halving (threshold > 170) and expanded valid range to 40–200. Display format changed to compact `[90bpm]`.
+- **BPM Error in Player Display**: Removed "BPM Error" / "ANALYZING..." text from the upper info screen — now shows just the track name until BPM is ready, then appends `[Xbpm]`.
+- **White Focus Border on Pads**: Added `.pad:focus, .pad:active, .pad:focus-visible { outline: none }` to remove browser default focus ring.
+
+### ✨ Enhancements
+
+- **Search Bar Restyled**: Replaced emoji 🔍 with SVG icon that glows neon-green on focus. Removed "(INSTANT)" from placeholder. Added matching CSS with VT323 font.
+- **AutoMix Transport Lock**: All transport controls (play, pause, stop, next, prev, progress bar) and keyboard shortcuts (Space, Enter) are now fully locked during crossfade blending.
+- **AutoMix Button Stability**: AUTOMIX toggle no longer changes button text — just toggles the `.active` CSS class to avoid layout breaking.
+- **LED EQ During Crossfade**: Visualizer LEDs stay in EQ-reactive mode during AutoMix blending instead of falling to idle scanner pattern.
+- **Pad BPM Sync**: Beat-quantized start offset added — synced pads snap to the master audio's beat phase for tight sync.
+- **ESC Closes All Modals**: Improved ESC handler with computed style checks, covers all modals and context menus in priority order.
+
+## [v4.18.0] - 2026-02-25 - "Installer Refactor"
+
+### 🐛 Critical Bugfix
+
+- **Playlist Playback Broken (Stale Reference)**: `playlistRef` in `player.ts` was set once at init to the empty `state.playlist` array. When tracks were later added, the state created a new array, but `playlistRef` still pointed to `[]`. Every `loadTrack`, `playTrack`, `startCrossfade`, Next/Prev call silently returned because `playlistRef.length === 0`. Replaced all 12 occurrences with live `state.playlist` reads.
+- **Context Menu Mispositioned**: All context menus used `pageX/Y` which includes scroll offset; switched to `clientX/Y` for correct cursor-relative placement.
+
+### 📦 Distribution & Build
+
+- **Installer Automation**: Configured `electron-builder` to target the `app-build` directory for clean, production-ready installers.
+- **Version Bump**: Incremented to `v4.18.0` for new release.
+
 ## [v4.17.0] - 2026-02-24 - "Optimization Pass"
 
 ### 🛡️ Code Quality & Refactoring
