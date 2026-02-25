@@ -10,6 +10,7 @@
 - **BPM Detection Doubled**: Fixed BPM detector halving (threshold > 170) and expanded valid range to 40–200. Display format changed to compact `[90bpm]`.
 - **BPM Error in Player Display**: Removed "BPM Error" / "ANALYZING..." text from the upper info screen — now shows just the track name until BPM is ready, then appends `[Xbpm]`.
 - **White Focus Border on Pads**: Added `.pad:focus, .pad:active, .pad:focus-visible { outline: none }` to remove browser default focus ring.
+- **Volume Knob UI Overlay**: Fixed volume knob overlaying the right border at 100% by adding container margins and adjusting the position calculation.
 
 ### ✨ Enhancements
 

@@ -511,7 +511,7 @@ export function setupPlayerHandlers(): void {
             masterGain.gain.value = val;
             if (volKnob) {
                 volKnob.innerText = Math.round(val * 100) + '%';
-                volKnob.style.left = `calc(22.5px + (100% - 45px) * ${val})`;
+                volKnob.style.left = `calc(22.5px + (100% - 47px) * ${val})`;
             }
         };
     }
