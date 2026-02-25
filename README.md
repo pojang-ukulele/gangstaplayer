@@ -16,11 +16,17 @@ This is the ultimate **ghetto-tech sampler and tape deck** for the streets. **Ga
 ### 🎹 16-PAD SAMPLER
 
 - **Drag & Drop:** Drop any audio file onto a pad to load it.
-- **Right-Click Menu:** Right-click any pad to load samples or enable sync.
+- **Click to Load:** Click an empty pad to open a file browser.
+- **Hold to Play:** Hold the mouse button (or keyboard key) on a loaded pad to play it — release to stop.
 - **Keyboard Mapped:** Play pads with your keyboard (1-4, Q-R, A-F, Z-V).
 - **MIDI Support:** Plug in your MIDI controller and start finger drumming instantly.
 - **Pad Recording:** Hold `CTRL + Pad Key` or click the small [REC] button to record directly from your mic.
-- **Sync Mode:** Right-click a loaded pad and select SYNC to match its tempo to the master track.
+- **BPM Detection:** Each loaded pad auto-detects its BPM for sync.
+- **Right-Click Menu:**
+  - **LOAD SAMPLE** — Browse and load an audio file.
+  - **SYNC** — Match the pad's tempo to the master track (beat-quantized start). Click again to deactivate. Shows ✓ when active.
+  - **MIDI LEARN** — Assign a MIDI note to trigger this pad (visible when MIDI is active).
+  - **KEY BIND** — Reassign which keyboard key triggers this pad.
 
 ### 📼 TAPE DECK PLAYER
 
@@ -110,10 +116,12 @@ This is the ultimate **ghetto-tech sampler and tape deck** for the streets. **Ga
 
 ### Using the Sampler Pads
 
-1. **Load a Sample:** Right-click any pad and select "LOAD SAMPLE", or drag & drop an audio file onto it.
-2. **Play:** Press the corresponding key (`1-4`, `Q-R`, `A-F`, `Z-V`) or click/hold the pad.
+1. **Load a Sample:** Right-click any pad → "LOAD SAMPLE", drag & drop an audio file, or click an empty pad.
+2. **Play:** Hold the corresponding key (`1-4`, `Q-R`, `A-F`, `Z-V`) or hold the mouse on the pad. Release to stop.
 3. **Record:** Hold `CTRL` + pad key or click the [REC] button on a pad to record from your mic.
-4. **Sync:** Right-click a loaded pad and select "SYNC" to match its tempo to the master track. A checkmark (✓) indicates SYNC is active.
+4. **Sync:** Right-click a loaded pad → "SYNC" to match its tempo to the master track. The pad's BPM is auto-detected, and playback starts beat-aligned with the playlist. A checkmark (✓) indicates SYNC is active; click SYNC again to deactivate.
+5. **MIDI Learn:** Right-click a pad → "MIDI LEARN" (when MIDI is active), then press a note on your controller to bind it.
+6. **Key Bind:** Right-click a pad → "KEY BIND", then press any key to reassign the trigger key.
 
 ### Auto-Mix Mode
 
