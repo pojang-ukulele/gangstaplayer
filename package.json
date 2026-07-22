@@ -70,7 +70,7 @@
       "shortcutName": "Gangsta Player Pro 3"
     },
 "files": [
-    "app-build/**/*"
+    "**/*"
   ],
   "extraResources": [
     {
