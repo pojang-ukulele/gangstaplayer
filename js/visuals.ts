@@ -183,4 +183,3 @@ export function playStartupSound(): void {
     }).catch(e => logger.error(`[Visuals] Audio Context Resume failed: ${e.message}`));
 }
 
-(End of file - total 184 lines)

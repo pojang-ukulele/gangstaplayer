@@ -80,6 +80,11 @@
     {
       "from": "sonetra-requirements.txt",
       "to": "sonetra-requirements.txt"
+    },
+    {
+      "from": "python-embed",
+      "to": "python-embed",
+      "filter": ["**/*"]
     }
   ]
 }

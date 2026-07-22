@@ -156,6 +156,19 @@ async function build() {
         }
     }
 
+    // 8. Bundle portable Python + AI deps if present (Sonetra)
+    const embedDir = 'python-embed';
+    const embedDest = path.join(BUILD_DIR, embedDir);
+    if (fs.existsSync(embedDir) && !fs.existsSync(embedDest)) {
+        console.log('Copying portable Python environment...');
+        fs.cpSync(embedDir, embedDest, { recursive: true });
+        console.log('Portable Python bundled.');
+    } else if (fs.existsSync(embedDest)) {
+        console.log('Portable Python already present in build.');
+    } else {
+        console.log('Portable Python not found — Sonetra AI will auto-setup on first use.');
+    }
+
     console.log('--- BUILD COMPLETE ---');
     console.log(`Ready to package in: ${BUILD_DIR}`);
 }
