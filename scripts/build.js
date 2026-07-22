@@ -4,6 +4,11 @@ const path = require('path');
 
 const BUILD_DIR = 'app-build';
 
+// Conditional minification: `node scripts/build.js` = dev, `node scripts/build.js --prod` = production
+const IS_PROD = process.argv.includes('--prod');
+const MINIFY = IS_PROD;
+const SOURCEMAP = !IS_PROD ? 'inline' : false;
+
 const resolveEntry = (filePath) => {
     const tsPath = filePath.replace(/\.js$/, '.ts');
     if (fs.existsSync(tsPath)) return tsPath;
@@ -11,7 +16,8 @@ const resolveEntry = (filePath) => {
 };
 
 async function build() {
-    console.log('--- STARTING OBFUSCATED BUILD ---');
+    const mode = IS_PROD ? 'PRODUCTION (minified)' : 'DEVELOPMENT (with sourcemaps)';
+    console.log(`--- STARTING ${mode} BUILD ---`);
 
     // 1. Clean / Create Build Dir
     if (fs.existsSync(BUILD_DIR)) {
@@ -28,7 +34,8 @@ async function build() {
         platform: 'node',
         target: 'node20',
         outfile: path.join(BUILD_DIR, 'main.js'),
-        minify: true,
+        minify: MINIFY,
+        sourcemap: SOURCEMAP,
         external: ['electron', 'fsevents', 'better-sqlite3']
     });
 
@@ -39,7 +46,8 @@ async function build() {
         bundle: true,
         platform: 'node',
         outfile: path.join(BUILD_DIR, 'preload.js'),
-        minify: true,
+        minify: MINIFY,
+        sourcemap: SOURCEMAP,
         external: ['electron']
     });
 
@@ -52,9 +60,9 @@ async function build() {
             bundle: true,
             platform: 'node',
             outfile: path.join(BUILD_DIR, 'sonetra-bridge.js'),
-            minify: true,
-            external: ['electron', 'form-data'] // form-data is a dependency we might want to keep external or bundle? 
-            // Better bundle it since it's a small utility and makes the build more portable.
+            minify: MINIFY,
+            sourcemap: SOURCEMAP,
+            external: ['electron']
         });
     }
 
@@ -66,7 +74,8 @@ async function build() {
         platform: 'browser',
         format: 'esm',
         outfile: path.join(BUILD_DIR, 'js', 'main.js'),
-        minify: true,
+        minify: MINIFY,
+        sourcemap: SOURCEMAP,
         keepNames: true,
     });
 
@@ -79,7 +88,8 @@ async function build() {
             bundle: true,
             platform: 'browser',
             outfile: path.join(BUILD_DIR, 'js', 'workers', 'audio-worker.js'),
-            minify: true,
+            minify: MINIFY,
+            sourcemap: SOURCEMAP,
         });
     }
 
@@ -90,7 +100,8 @@ async function build() {
             bundle: true,
             platform: 'browser',
             outfile: path.join(BUILD_DIR, 'js', 'workers', 'gangsta-processor.js'),
-            minify: true,
+            minify: MINIFY,
+            sourcemap: SOURCEMAP,
         });
     }
 
@@ -101,7 +112,8 @@ async function build() {
             bundle: true,
             platform: 'browser',
             outfile: path.join(BUILD_DIR, 'js', 'workers', 'recorder-processor.js'),
-            minify: true,
+            minify: MINIFY,
+            sourcemap: SOURCEMAP,
         });
     }
 

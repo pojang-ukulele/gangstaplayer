@@ -248,8 +248,16 @@ class SonetraBridge {
         const pythonCmd = this._resolvePythonCmd();
 
         // Ensure Python dependencies are installed before spawning
-        const depsOk = await this._ensureDependencies(pythonCmd);
+        let depsOk = { ok: false, error: 'Unknown error during dependency check' };
+        try {
+            depsOk = await this._ensureDependencies(pythonCmd);
+        } catch (e: any) {
+            console.warn('[Sonetra] Dependency check failed:', e.message);
+            depsOk.error = `Dependency check failed: ${e.message}`;
+        }
+        
         if (!depsOk.ok) {
+            this._fireStatus('failed', { message: depsOk.error });
             return { success: false, error: depsOk.error };
         }
 

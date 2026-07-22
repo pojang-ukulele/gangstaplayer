@@ -7,6 +7,7 @@ import { toast } from './toast';
 import { engine } from './audio-engine';
 import { logger } from './logger';
 import { normalizeToArrayBuffer } from './utils';
+import { showConfirm } from './modals';
 import './types';
 
 interface PlayerDeps {
@@ -80,28 +81,6 @@ let setBlendingIndexFn: ((index: number) => void) | null = null;
 // Cancellation token for loadTrack race condition
 let _loadTrackId = 0;
 
-// UI Helper for Confirmation
-export function showConfirm(title: string, message: string, onYes: () => void): void {
-    const modal = document.getElementById('confirmModal');
-    if (!modal) return;
-    const titleEl = document.getElementById('confirmTitle');
-    const msgEl = document.getElementById('confirmMessage');
-    const yesBtn = document.getElementById('confirmYes');
-    const noBtn = document.getElementById('confirmNo');
-
-    if (titleEl) titleEl.innerText = title;
-    if (msgEl) msgEl.innerText = message;
-    
-    const close = () => { modal.style.display = 'none'; };
-    
-    if (yesBtn) {
-        yesBtn.onclick = () => { onYes(); close(); };
-    }
-    if (noBtn) {
-        noBtn.onclick = close;
-    }
-    modal.style.display = 'block';
-}
 
 export function setPlaybackMode(mode: PlaybackMode): void { state.update({ playbackMode: mode }); }
 export function getPlaybackMode(): PlaybackMode { return state.playbackMode; }
@@ -299,7 +278,7 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
     try {
         await engine.crossfade.audio.play();
     } catch (e) {
-        console.error("AutoMix Playback Failed", e);
+        logger.error("AutoMix Playback Failed", e);
         state.update({ isCrossfadeInProgress: false });
         updateControlsLock(false);
         if (setBlendingIndexFn) setBlendingIndexFn(-1);
@@ -378,7 +357,7 @@ function finishCrossfade(nextIndex: number): void {
          const t = state.playlist[nextIndex];
          const txt = (t.bpm && t.bpm > 0) ? `[${t.bpm} BPM]` : "[BPM: --]";
          trackTitle.innerText = `${t.name} ${txt}`;
-    }
+     }
 }
 
 export function playTrack(): void {
@@ -391,7 +370,7 @@ export function playTrack(): void {
     engine.main.audio.play().then(() => {
         state.update({ isPlaying: true });
         updateControlsLock(false);
-    }).catch(console.error);
+    }).catch((e) => logger.error(e));
 }
 
 export function pauseTrack(): void {
@@ -449,7 +428,7 @@ export function setupPlayerHandlers(): void {
             }
         }
     };
-    
+
     engine.main.audio.onloadedmetadata = () => {
         if (totalTimeDisplay && engine.main.audio.duration) {
             totalTimeDisplay.innerText = formatTime(engine.main.audio.duration);
@@ -498,16 +477,16 @@ export function setupPlayerHandlers(): void {
             }
         };
     }
-    
+
     if (tempoSlider) {
         tempoSlider.oninput = (e: Event) => {
             const target = e.target as HTMLInputElement;
             let val = parseFloat(target.value);
-            if (Math.abs(val - 1.0) < 0.05) { val = 1.0; tempoSlider!.value = "1.0"; }
+            if (Math.abs(val - 1.0) < 0.05) { val = 1.0; tempoSlider.value = "1.0"; }
             engine.main.audio.playbackRate = val;
             if (tempoVal) {
-                const displayBPM = state.masterBPM > 0 ? Math.round(state.masterBPM * val) : "---";
-                tempoVal.innerText = `SPEED: ${Math.round(val * 100)}% (BPM: ${displayBPM})`;
+                const displayBpm = state.masterBPM > 0 ? Math.round(state.masterBPM * val) : "---";
+                tempoVal.innerText = `SPEED: ${Math.round(val * 100)}% (BPM: ${displayBpm})`;
             }
         };
     }

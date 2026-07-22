@@ -4,7 +4,7 @@
 
 Electron-based desktop ghetto-tech sampler, tape deck, and DJ mixing application. Turns the PC into a beat-making, chopper-screwing powerhouse with 16-pad sampler, playlist player, AI auto-mix, and studio recording.
 
-- **Version:** 4.18.0
+- **Version:** 4.20.0
 - **License:** MIT
 - **Main repo:** https://github.com/coreyshearwater/ug-gangsta-player-pro-3
 
@@ -15,7 +15,7 @@ Electron-based desktop ghetto-tech sampler, tape deck, and DJ mixing application
 | Runtime | Electron v30 |
 | Language | TypeScript (strict mode, ESNext modules) |
 | Bundler | esbuild (via `scripts/build.js`) |
-| Testing | Jest (77+ tests), Playwright (smoke) |
+| Testing | Jest (77 tests), Playwright (smoke) |
 | Audio | Web Audio API, WebMIDI |
 | Storage | better-sqlite3 (track metadata) |
 | AI Mixer | Python FastAPI (Sonetra bridge) |
@@ -27,25 +27,26 @@ Electron-based desktop ghetto-tech sampler, tape deck, and DJ mixing application
 ├── main.ts                     # Electron main process (322 lines)
 ├── preload.ts                  # Context bridge (52 lines)
 ├── sonetra-requirements.txt    # Python deps for Sonetra AI (10 lines)
-├── js/main.ts                  # Renderer entry, UI init, event wiring (505 lines)
+├── js/main.ts                  # Renderer entry, UI init, event wiring (589 lines)
 ├── js/audio.ts                 # Web Audio context, master gain, analyser, worklets (96 lines)
+├── js/modals.ts                # Unified modal open/close with focus mgmt (80 lines)
 ├── js/audio-engine.ts          # AudioChannel class, engine singleton, crossfade channels (124 lines)
-├── js/player.ts                # Player controls, crossfade logic, track loading (506 lines)
+├── js/player.ts                # Player controls, crossfade logic, track loading (533 lines)
 ├── js/playlist.ts              # Playlist UI, drag-drop, multi-select, virtual scroller (555 lines)
-├── js/sampler.ts               # 16-pad sampler, recording, kit persistence (671 lines)
+├── js/sampler.ts               # 16-pad sampler, recording, kit persistence (720 lines)
 ├── js/session.ts               # Full session save/load: kit, playlist, settings, UI state (364 lines)
 ├── js/crash-recovery.ts        # Auto-save snapshots, restore prompt, data loss prevention (308 lines)
-├── js/visuals.ts               # 16-band frequency analyzer, LED rack, screws (170 lines)
+├── js/visuals.ts               # 16-band frequency analyzer, LED rack, screws (186 lines)
 ├── js/midi.ts                  # WebMIDI input handling, MIDI learn (219 lines)
-├── js/state.ts                 # Central reactive state manager (125 lines)
-├── js/settings.ts              # Settings persistence, AutoMix config, modals (328 lines)
+├── js/state.ts                 # Central reactive state manager (167 lines)
+├── js/settings.ts              # Settings persistence, AutoMix config, modals (355 lines)
 ├── js/recorder-client.ts       # High-fidelity master recording via AudioWorklet (70 lines)
 ├── js/worker-client.ts         # Web Worker client for BPM detection + WAV conversion (119 lines)
-├── js/constants.ts             # App constants, utility helpers (9 lines)
-├── js/utils.ts                 # normalizeToArrayBuffer, validateAudioSignature, Disposable class (164 lines)
+├── js/constants.ts             # App constants, utility helpers (68 lines)
+├── js/utils.ts                 # normalizeToArrayBuffer, validateAudioSignature, Disposable class, debounce, throttle (250 lines)
 ├── js/toast.ts                 # Toast notification system (46 lines)
 ├── js/logger.ts                # Client-side logging with disk persistence (186 lines)
-├── js/types.ts                 # TypeScript type definitions & window augmentations (49 lines)
+├── js/types.ts                 # TypeScript type definitions & window augmentations (96 lines)
 ├── js/reactive/ui.ts           # VirtualScroller + reactive element helpers (110 lines)
 ├── js/workers/audio-worker.ts  # Web Worker: BPM detection + WAV encoding (116 lines)
 ├── js/workers/gangsta-processor.ts # AudioWorkletProcessor: gangsta effects (108 lines)
@@ -55,7 +56,7 @@ Electron-based desktop ghetto-tech sampler, tape deck, and DJ mixing application
 ├── log-manager.ts              # Logging system with ring buffer + crash reports (93 lines)
 ├── scripts/build.js            # esbuild bundler script (137 lines)
 ├── index.html                  # Renderer HTML entry point (299 lines)
-├── styles.css                  # Dark theme, custom scrollbar, animations (1840 lines)
+├── styles.css                  # Dark theme, custom scrollbar, animations (2122 lines)
 ├── tests/                      # Jest + Playwright test suite (6 files)
 │   ├── audio-engine.test.ts    # AudioChannel/AudioEngine tests (13 tests)
 │   ├── player.test.ts          # Player logic tests
@@ -439,7 +440,7 @@ database     →  track metadata CRUD
 | Command | Description |
 |---------|-------------|
 | `npm start` | Build dev + launch Electron |
-| `npm test` | Run Jest test suite (77+ tests) |
+| `npm test` | Run Jest test suite (77 tests) |
 | `npm run build:prod` | Minified obfuscated production build |
 | `npm run dist` | Package into installer (electron-builder) |
 | `npm run setup:sonetra` | Install Python deps for Sonetra AI (macOS/Linux) |

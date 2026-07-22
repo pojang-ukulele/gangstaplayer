@@ -3,6 +3,8 @@ import { VISUALIZER_BARS } from './constants';
 import { analyser, masterGain, audioCtx, resumeAudioContext } from './audio';
 import { logger } from './logger';
 import { state } from './state';
+import { throttle } from './utils';
+import { BASS_THRESHOLD, MID_THRESHOLD, HIGH_THRESHOLD, AVG_THRESHOLD, SCANNER_INTERVAL_MS, LED_FRAME_SKIP } from './constants';
 
 let dataArray: Uint8Array | null = null;
 if (analyser) {
@@ -28,14 +30,14 @@ export function initVisuals(): void {
             visualizerBars.push(bar);
         }
     }
-
+    
     leds = ([
         document.getElementById('l1'), document.getElementById('l2'), document.getElementById('l3'),
         document.getElementById('r1'), document.getElementById('r2'), document.getElementById('r3')
     ].filter(l => l !== null)) as HTMLElement[];
     
     setupScrews();
-
+    
     masterLoop();
 }
 
@@ -45,38 +47,54 @@ function setupScrews(): void {
         let clicks = 0;
         screw.addEventListener('click', () => {
              clicks++;
-             // Lefty-loosey attempts
-             let rotationDir = 1;
-             
-             // Debugging class detection
-             console.log("Clicked screw classes:", screw.className);
-             
-             if (screw.matches('.br') || screw.classList.contains('br')) {
-                 console.log("Matches BR! Reversing direction.");
-                 rotationDir = -1;
-             }
+              // Lefty-loosey attempts
+              let rotationDir = 1;
+              
+              // Debugging class detection
+              logger.debug("Clicked screw classes:", screw.className);
+              
+              if (screw.matches('.br') || screw.classList.contains('br')) {
+                  logger.debug("Matches BR! Reversing direction.");
+                  rotationDir = -1;
+              }
 
-             const rotation = clicks * 60 * rotationDir; 
-             const lift = 1 + (clicks * 0.05); // Subtle rise
-             
-             screw.style.transform = `rotate(${rotation}deg) scale(${lift})`;
-             
-             // Visual feedback: shadow gets deeper as it comes out?
-             screw.style.boxShadow = `${clicks}px ${clicks}px ${clicks+2}px rgba(0,0,0,0.5)`;
+              const rotation = clicks * 60 * rotationDir; 
+              const lift = 1 + (clicks * 0.05); // Subtle rise
+              
+              screw.style.transform = `rotate(${rotation}deg) scale(${lift})`;
+              
+              // Visual feedback: shadow gets deeper as it comes out?
+              screw.style.boxShadow = `${clicks}px ${clicks}px ${clicks+2}px rgba(0,0,0,0.5)`;
 
-             if (clicks >= 7) {
-                 if (!screw.classList.contains('dropped')) {
-                     screw.classList.add('dropped');
-                     // Create hole
-                     const hole = document.createElement('div');
-                     const posClass = Array.from(screw.classList).find(c => ['tl','tr','bl','br'].includes(c));
-                     hole.className = 'screw-hole ' + (posClass || '');
-                     if (screw.parentElement) screw.parentElement.insertBefore(hole, screw);
-                 }
-             }
-        });
-    });
+              if (clicks >= 7) {
+                  if (!screw.classList.contains('dropped')) {
+                      screw.classList.add('dropped');
+                      // Create hole
+                      const hole = document.createElement('div');
+                      const posClass = Array.from(screw.classList).find(c => ['tl','tr','bl','br'].includes(c));
+                      hole.className = 'screw-hole ' + (posClass || '');
+                      if (screw.parentElement) screw.parentElement.insertBefore(hole, screw);
+                  }
+              }
+          });
+      });
 }
+
+const updateLEDs = throttle((dataArray: Uint8Array, leds: HTMLElement[]) => {
+    let bassSum = 0, midSum = 0, highSum = 0;
+    for (let i = 0; i < 5; i++) bassSum += dataArray[i];
+    for (let i = 10; i < 30; i++) midSum += dataArray[i];
+    for (let i = 80; i < 120; i++) highSum += dataArray[i];
+
+    if (leds.length >= 6) {
+        leds[0].classList.toggle('lit', (bassSum / 5) > BASS_THRESHOLD);
+        leds[5].classList.toggle('lit', (bassSum / 5) > BASS_THRESHOLD);
+        leds[1].classList.toggle('lit', (midSum / 20) > MID_THRESHOLD);
+        leds[4].classList.toggle('lit', (midSum / 20) > MID_THRESHOLD);
+        leds[2].classList.toggle('lit', (highSum / 40) > HIGH_THRESHOLD);
+        leds[3].classList.toggle('lit', (highSum / 40) > HIGH_THRESHOLD);
+    }
+}, 100);
 
 function masterLoop(): void {
     requestAnimationFrame(masterLoop);
@@ -90,15 +108,10 @@ function masterLoop(): void {
         for (let i = 0; i < dataArray.length; i++) totalVol += dataArray[i];
         totalAvg = totalVol / dataArray.length;
     }
-
-    const BASS_THRESHOLD = 200;
-    const MID_THRESHOLD = 160;
-    const HIGH_THRESHOLD = 100;
-    const AVG_THRESHOLD = 2;
-
+    
     // Force EQ-reactive mode when crossfade is blending (both channels are always producing audio)
     const isAudioActive = totalAvg > AVG_THRESHOLD || state.isCrossfadeInProgress;
-
+    
     if (isAudioActive && dataArray && visualizerBars.length > 0) {
         // Only update visualizer bars every frame
         const step = Math.floor(dataArray.length / 16);
@@ -109,26 +122,12 @@ function masterLoop(): void {
             }
         }
         
-        // Only run heavy LED logic every 2nd frame or so (optimization)
-        if (scannerIndex % 2 === 0) {
-            let bassSum = 0, midSum = 0, highSum = 0;
-            for (let i = 0; i < 5; i++) bassSum += dataArray[i];
-            for (let i = 10; i < 30; i++) midSum += dataArray[i];
-            for (let i = 80; i < 120; i++) highSum += dataArray[i];
-
-            if (leds.length >= 6) {
-                leds[0].classList.toggle('lit', (bassSum / 5) > BASS_THRESHOLD);
-                leds[5].classList.toggle('lit', (bassSum / 5) > BASS_THRESHOLD);
-                leds[1].classList.toggle('lit', (midSum / 20) > MID_THRESHOLD);
-                leds[4].classList.toggle('lit', (midSum / 20) > MID_THRESHOLD);
-                leds[2].classList.toggle('lit', (highSum / 40) > HIGH_THRESHOLD);
-                leds[3].classList.toggle('lit', (highSum / 40) > HIGH_THRESHOLD);
-            }
-        }
+        // Update LEDs using throttled function
+        updateLEDs(dataArray as Uint8Array, leds);
     } else {
         visualizerBars.forEach(bar => bar.style.height = '5%');
         const now = performance.now();
-        if (now - lastScannerUpdate > 300) {
+        if (now - lastScannerUpdate > SCANNER_INTERVAL_MS) {
             leds.forEach(l => l.classList.remove('lit'));
             if (scannerIndex === 0) { if(leds[0]) leds[0].classList.add('lit'); if(leds[5]) leds[5].classList.add('lit'); }
             if (scannerIndex === 1) { if(leds[1]) leds[1].classList.add('lit'); if(leds[4]) leds[4].classList.add('lit'); }
@@ -139,7 +138,6 @@ function masterLoop(): void {
         }
     }
 }
-
 
 
 export function playStartupSound(): void {
@@ -184,3 +182,5 @@ export function playStartupSound(): void {
             });
     }).catch(e => logger.error(`[Visuals] Audio Context Resume failed: ${e.message}`));
 }
+
+(End of file - total 184 lines)

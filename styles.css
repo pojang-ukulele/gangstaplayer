@@ -1298,6 +1298,13 @@ input[type=range].progress-slider:hover::-webkit-slider-thumb {
     backdrop-filter: blur(5px);
 }
 
+/* Show modal when active class is set (used by modals.ts) */
+.modal.active {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
 .modal-content {
     background-color: #111;
     margin: 10% auto;

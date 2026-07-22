@@ -1,5 +1,50 @@
 # Changelog
 
+## [v4.20.0] — 2026-07-22 — "Structural Overhaul & Performance"
+
+### 🧩 Architecture
+
+- **`js/modals.ts` created**: Unified modal module extracted from `player.ts` — `openModal()`, `closeModal()`, `showConfirm()`, `showModalById()`, `closeModalById()` with focus management. Uses CSS `.active` class instead of inline `style.display`.
+- **`js/main.ts` decomposed**: Extracted `setupContextMenus()`, `setupGlobalKeyboardShortcuts()`, `setupMasterRecording()` from monolithic `initApp()`.
+- **`js/types.ts` consolidated**: Added `IpcChannels` union type (30 channels). Added missing bridge methods (`loadKit`, `getPathForFile`, `restartServer`, `onRestartStatus`, `saveKit`, `loadKit`).
+- **`js/state.ts` array-aware**: Added `shallowEqual()` for content-based array comparison in `ReactiveStore.update()` — prevents unnecessary re-renders when array contents haven't changed.
+
+### ⚡ Performance
+
+- **Voice pool in `js/sampler.ts`**: GainNode objects are now pooled and reused via `acquireGain()`/`releaseGain()` (pool capped at 32). Reduces GC pressure during rapid pad triggers.
+- **LED throttling in `js/visuals.ts`**: LED calculations extracted into `updateLEDs()` throttled at 100ms via new `throttle()` utility.
+- **`debounce`/`throttle` in `js/utils.ts`**: Added full `debounce()` and `throttle()` with `.cancel()` support.
+
+### 🧹 Code Quality
+
+- All `console.log/error` replaced with `logger.debug/error` across `player.ts`, `sampler.ts`, `visuals.ts`, `settings.ts`.
+- `settings.ts` — removed duplicate `openModal`/`closeModal` (moved to `modals.ts`).
+- `player.ts` — fixed `tempoSlider!.value` reference (was `slider!`).
+- Variable naming consistency: `displayBPM` → `displayBpm`.
+
+### 🎛️ Settings
+
+- Added `enableAI: boolean` flag to `AutoMixSettings` with `isAiEnabled()` export.
+- Wired `mixOptEnableAI` checkbox in `applySettingsToUI()` and `saveSettings()`.
+
+### 🎨 UI/UX
+
+- Global `Escape` handler: closes active modal first, falls back to hiding context menus.
+- `.modal.active` CSS rule added to `styles.css` (uses `display: flex` + centering).
+- ARIA attributes added to context menus in `main.ts`.
+
+### 🏗️ Build
+
+- `--prod` flag in `scripts/build.js`: dev builds include inline sourcemaps, only production builds minify.
+- `sonetra-bridge.ts`: dependency check wrapped in try-catch with graceful failure.
+- `sonetra-requirements.txt`: all `>=` ranges pinned to exact versions.
+- `package.json`: version 4.18.0 → 4.20.0, `files` scoped to `app-build/**/*`, `extraResources` restructured.
+
+### 🧪 Testing
+
+- Updated `tests/state.test.ts` to match new `shallowEqual` behavior (empty array ref change no longer triggers subscriber).
+- All 77 tests pass.
+
 ## [2026-07-22] — Audit Fixes (10 items)
 - **Security: Path validation hardened**: `fs:read-file` now validates absolute paths, blocks directory traversal, checks file existence. `fs:save-file` restricted to dialog-returned paths or `userData` directory. Added `dialogReturnedPaths` tracking set in `main.ts`.
 - **Security: `app:open-external` platform check**: Now only spawns `notepad.exe` on `win32` — no more silent failed process spawn on macOS/Linux.

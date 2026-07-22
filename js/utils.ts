@@ -162,3 +162,89 @@ export class Disposable {
         this._cleanups = [];
     }
 }
+
+// ==================== TIMING UTILITIES ====================
+
+/**
+ * Creates a debounced function that delays invoking the provided function
+ * until after wait milliseconds have elapsed since the last time it was invoked.
+ * 
+ * @param func - The function to debounce
+ * @param wait - The number of milliseconds to delay
+ * @returns A new debounced function
+ */
+export function debounce<T extends (...args: any[]) => any>(func: T, wait: number): (...args: Parameters<T>) => ReturnType<T> {
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    
+    function debounced(...args: Parameters<T>): ReturnType<T> {
+        if (timeout) clearTimeout(timeout);
+        timeout = setTimeout(() => {
+            timeout = null;
+            func(...args);
+        }, wait);
+        // Return undefined for void functions, or the result if applicable
+        return undefined as ReturnType<T>;
+    }
+    
+    debounced.cancel = () => {
+        if (timeout) {
+            clearTimeout(timeout);
+            timeout = null;
+        }
+    };
+    
+    return debounced as (...args: Parameters<T>) => ReturnType<T>;
+}
+
+/**
+ * Creates a throttled function that only invokes the provided function at most once per
+ * every wait milliseconds.
+ * 
+ * @param func - The function to throttle
+ * @param wait - The number of milliseconds to throttle invocations to
+ * @returns A new throttled function
+ */
+export function throttle<T extends (...args: any[]) => any>(func: T, wait: number): (...args: Parameters<T>) => ReturnType<T> {
+    let lastExecuted = 0;
+    let timeout: ReturnType<typeof setTimeout> | null = null;
+    let lastArgs: Parameters<T> | null = null;
+    let lastThis: any = null;
+    let result: ReturnType<T>;
+    
+    function invoke(): void {
+        lastExecuted = Date.now();
+        result = func.apply(lastThis, lastArgs as any);
+    }
+    
+    function throttled(this: any, ...args: Parameters<T>): ReturnType<T> {
+        const now = Date.now();
+        const remaining = wait - (now - lastExecuted);
+        
+        lastThis = this;
+        lastArgs = args;
+        
+        if (remaining <= 0 || remaining > wait) {
+            if (timeout) {
+                clearTimeout(timeout);
+                timeout = null;
+            }
+            invoke();
+        } else if (!timeout) {
+            timeout = setTimeout(invoke, remaining);
+        }
+        
+        return result;
+    }
+    
+    throttled.cancel = () => {
+        if (timeout) {
+            clearTimeout(timeout);
+            timeout = null;
+        }
+        lastExecuted = 0;
+        lastArgs = null;
+        lastThis = null;
+    };
+    
+    return throttled as (...args: Parameters<T>) => ReturnType<T>;
+}

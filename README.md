@@ -201,7 +201,7 @@ npm run dist
 npm test
 ```
 
-Runs the Jest test suite (77+ tests across 6 test files).
+Runs the Jest test suite (77 tests across 6 test files).
 
 ---
 

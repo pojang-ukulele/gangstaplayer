@@ -2,6 +2,32 @@
  * Centralized Reactive State Manager for Gangsta Player Pro 3
  */
 
+/**
+ * Shallow equality check for arrays and objects.
+ * Returns true if both values have the same contents by === comparison.
+ */
+export function shallowEqual(a: any, b: any): boolean {
+    if (a === b) return true;
+    if (!a || !b) return false;
+    const isArrayA = Array.isArray(a);
+    const isArrayB = Array.isArray(b);
+    if (isArrayA !== isArrayB) return false;
+    if (isArrayA && isArrayB) {
+        if (a.length !== b.length) return false;
+        for (let i = 0; i < a.length; i++) {
+            if (a[i] !== b[i]) return false;
+        }
+        return true;
+    }
+    const keysA = Object.keys(a);
+    const keysB = Object.keys(b);
+    if (keysA.length !== keysB.length) return false;
+    for (const key of keysA) {
+        if (a[key] !== b[key]) return false;
+    }
+    return true;
+}
+
 export interface Track {
     id: string;
     name: string;
@@ -112,8 +138,10 @@ class ReactiveStore implements AppStateData {
         for (const [key, value] of Object.entries(patch)) {
             const k = key as keyof AppStateData;
             
-            // Reference equality check (arrays should be new refs when changed)
-            const isDifferent = (this._data as any)[k] !== value;
+            // Reference equality check with shallow comparison for arrays
+            const isDifferent = Array.isArray(value)
+                ? !shallowEqual((this._data as any)[k], value)
+                : (this._data as any)[k] !== value;
 
             if (isDifferent) {
                 (this._data as any)[k] = value;

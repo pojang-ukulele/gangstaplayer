@@ -1,6 +1,6 @@
 // === SETTINGS MODULE ===
 import { toast } from './toast';
-import { showConfirm } from './player';
+import { showConfirm, openModal, closeModal } from './modals';
 import { logger } from './logger';
 
 interface AutoMixSettings {
@@ -10,6 +10,7 @@ interface AutoMixSettings {
     bpmSync: boolean;
     trackDuration: number;
     btnDuration: number;
+    enableAI: boolean;
 }
 
 interface Settings {
@@ -35,7 +36,8 @@ const _settings: Settings = {
         hpfSweep: true,
         bpmSync: false,
         trackDuration: 10.0,
-        btnDuration: 4.0
+        btnDuration: 4.0,
+        enableAI: false
     }
 };
 
@@ -53,34 +55,7 @@ export function updateSettings(patch: Partial<Settings>): void {
 
 let setAutoMixEnabledFn: ((enabled: boolean) => void) | null = null;
 
-/** Track the last focused element before a modal opened, for focus restoration */
-let _lastFocused: HTMLElement | null = null;
-
-/**
- * Opens a modal with focus management.
- * Saves the currently focused element and moves focus into the modal.
- */
-function openModal(modal: HTMLElement): void {
-    _lastFocused = document.activeElement as HTMLElement;
-    modal.style.display = 'block';
-    // Focus the first focusable element inside the modal
-    const firstFocusable = modal.querySelector<HTMLElement>('button, input, select, textarea, [tabindex]:not([tabindex="-1"])');
-    if (firstFocusable) {
-        setTimeout(() => firstFocusable.focus(), 50);
-    }
-}
-
-/**
- * Closes a modal with focus restoration.
- */
-function closeModal(modal: HTMLElement): void {
-    modal.style.display = 'none';
-    // Restore focus to the element that was focused before the modal opened
-    if (_lastFocused) {
-        _lastFocused.focus();
-        _lastFocused = null;
-    }
-}
+// openModal/closeModal imported from modals.ts
 
 export function initSettings(deps: { setAutoMixEnabled: (enabled: boolean) => void }): void {
     setAutoMixEnabledFn = deps.setAutoMixEnabled;
@@ -143,7 +118,9 @@ export function loadSettings(): void {
             // Apply Full Screen on load
             if (bridge && bridge.setFullScreen) bridge.setFullScreen(settings.fullScreen);
         }
-    } catch(e) { console.error("Load Settings Error", e); }
+    } catch(e) { 
+        logger.error("Load Settings Error", e); 
+    }
 }
 
 function applySettingsToUI(): void {
@@ -154,11 +131,13 @@ function applySettingsToUI(): void {
     const mixOptFilterSweep = document.getElementById('mixOptFilterSweep') as HTMLInputElement;
     const mixOptHPFSweep = document.getElementById('mixOptHPFSweep') as HTMLInputElement;
     const mixOptBPMSync = document.getElementById('mixOptBPMSync') as HTMLInputElement;
+    const mixOptEnableAI = document.getElementById('mixOptEnableAI') as HTMLInputElement;
 
     if (mixOptEQCrossfade) mixOptEQCrossfade.checked = !!settings.autoMix.eqCrossfade;
     if (mixOptFilterSweep) mixOptFilterSweep.checked = !!settings.autoMix.filterSweep;
     if (mixOptHPFSweep) mixOptHPFSweep.checked = !!settings.autoMix.hpfSweep;
     if (mixOptBPMSync) mixOptBPMSync.checked = !!settings.autoMix.bpmSync;
+    if (mixOptEnableAI) mixOptEnableAI.checked = !!settings.autoMix.enableAI;
 
     updateSliderUI('sliderTrackFade', 'valTrackFade', settings.autoMix.trackDuration);
     updateSliderUI('sliderBtnFade', 'valBtnFade', settings.autoMix.btnDuration);
@@ -170,17 +149,23 @@ export function saveSettings(): void {
     const mixOptFilterSweep = document.getElementById('mixOptFilterSweep') as HTMLInputElement;
     const mixOptHPFSweep = document.getElementById('mixOptHPFSweep') as HTMLInputElement;
     const mixOptBPMSync = document.getElementById('mixOptBPMSync') as HTMLInputElement;
+    const mixOptEnableAI = document.getElementById('mixOptEnableAI') as HTMLInputElement;
 
     _settings.fullScreen = fullScreenToggle ? fullScreenToggle.checked : _settings.fullScreen;
     if (mixOptEQCrossfade) _settings.autoMix.eqCrossfade = mixOptEQCrossfade.checked;
     if (mixOptFilterSweep) _settings.autoMix.filterSweep = mixOptFilterSweep.checked;
     if (mixOptHPFSweep) _settings.autoMix.hpfSweep = mixOptHPFSweep.checked;
     if (mixOptBPMSync) _settings.autoMix.bpmSync = mixOptBPMSync.checked;
+    if (mixOptEnableAI) _settings.autoMix.enableAI = mixOptEnableAI.checked;
 
     localStorage.setItem('ug_settings', JSON.stringify(_settings));
     
     // Actuate Full Screen
     if (bridge && bridge.setFullScreen) bridge.setFullScreen(_settings.fullScreen);
+}
+
+export function isAiEnabled(): boolean {
+    return _settings.autoMix.enableAI;
 }
 
 function updateSliderUI(sliderId: string, labelId: string, val: number): void {
@@ -203,7 +188,7 @@ export function setupSettingsHandlers(): void {
     if (closeAutoMixBtn && autoMixModal) closeAutoMixBtn.addEventListener('click', () => { closeModal(autoMixModal); });
 
     // Auto-save on any change
-    const inputs = ['fullScreenToggle', 'mixOptEQCrossfade', 'mixOptFilterSweep', 'mixOptHPFSweep', 'mixOptBPMSync'];
+    const inputs = ['fullScreenToggle', 'mixOptEQCrossfade', 'mixOptFilterSweep', 'mixOptHPFSweep', 'mixOptBPMSync', 'mixOptEnableAI'];
     inputs.forEach(id => {
         const el = document.getElementById(id);
         if (el) el.addEventListener('change', saveSettings);
@@ -227,7 +212,8 @@ export function setupSettingsHandlers(): void {
                     hpfSweep: true,
                     bpmSync: false,
                     trackDuration: 10.0,
-                    btnDuration: 4.0
+                    btnDuration: 4.0,
+                    enableAI: false
                 };
                 saveSettings();
                 applySettingsToUI();
@@ -345,7 +331,7 @@ async function refreshAudioDevices(): Promise<void> {
             const permStatus = await navigator.permissions.query({ name: 'microphone' as PermissionName });
             hasPermission = permStatus.state === 'granted';
             if (permStatus.state === 'denied') {
-                console.warn("Microphone permission denied — audio device list may be incomplete");
+                logger.warn("Microphone permission denied — audio device list may be incomplete");
                 // Fall through — enumerateDevices() still returns limited info without permission
             }
         }
@@ -363,5 +349,7 @@ async function refreshAudioDevices(): Promise<void> {
             if (device.kind === 'audioinput') inputSelect.appendChild(option);
             else if (device.kind === 'audiooutput') outputSelect.appendChild(option);
         });
-    } catch (e) { console.warn("Device refresh failed", e); }
+    } catch (e) { 
+        logger.warn("Device refresh failed", e); 
+    }
 }

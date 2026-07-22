@@ -1,4 +1,5 @@
-import { DEFAULT_PAD_VOLUME } from './constants';
+// === SAMPLER MODULE ===
+import { DEFAULT_PAD_VOLUME, POOL_SIZE } from './constants';
 import { state } from './state';
 import { audioCtx, masterGain, resumeAudioContext } from './audio';
 import { engine } from './audio-engine';
@@ -30,6 +31,27 @@ export const padLoopEnd: Record<number, number> = {}; // loop end in seconds (-1
 
 const WAVEFORM_POINTS = 100; // Number of amplitude samples for preview
 
+// === Voice Pool: reuse GainNode objects to reduce GC pressure ===
+const _gainPool: GainNode[] = [];
+let _poolCreated = 0;
+
+function acquireGain(): GainNode {
+    const gain = _gainPool.pop() ?? audioCtx.createGain();
+    _poolCreated++;
+    return gain;
+}
+
+function releaseGain(gain: GainNode): void {
+    // Disconnect the gain node from its input and output
+    try { gain.disconnect(); } catch (_) { /* already disconnected */ }
+    // Reset gain to default
+    gain.gain.setValueAtTime(1, audioCtx.currentTime);
+    // Return to pool (limit pool size)
+    if (_gainPool.length < (POOL_SIZE || 32)) {
+        _gainPool.push(gain);
+    }
+}
+
 let padGrid: HTMLElement | null = null;
 let fsBridgeRef: FileSystemAPI | null = null;
 let bridgeRef: ElectronAPI | null = null;
@@ -51,7 +73,7 @@ export function initSampler(deps: SamplerDeps): void {
             for (let i = 0; i < 16; i++) updatePadVisuals(i);
         }
     });
-
+    
     createPadGrid();
 }
 
@@ -250,7 +272,7 @@ export async function loadSampleFile(file: File, index: number): Promise<void> {
         document.dispatchEvent(new CustomEvent('ug:dataChanged'));
     } catch (e: any) { 
         logger.error(`[Sampler] Pad ${index} load failed: ${e.message || e}`);
-        console.error(`[Sampler] Pad ${index} file load FAILED:`, e);
+        logger.error(`[Sampler] Pad ${index} file load FAILED:`, e);
         toast.error("SAMPLE LOAD FAILED");
     } finally {
         setPadLoading(index, false);
@@ -280,7 +302,7 @@ export async function loadSampleFromPath(path: string, index: number): Promise<v
         
         // Use native decoder directly
         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-
+ 
         padBuffers[index] = audioBuffer;
         padPaths[index] = path;
         padWaveforms[index] = computeWaveform(audioBuffer);
@@ -294,14 +316,14 @@ export async function loadSampleFromPath(path: string, index: number): Promise<v
         document.dispatchEvent(new CustomEvent('ug:dataChanged'));
     } catch (e: any) { 
         logger.error(`[Sampler] Pad ${index} path load failed: ${e.message || e}`);
-        console.error(`[Sampler] Pad ${index} path load FAILED:`, e);
+        logger.error(`[Sampler] Pad ${index} path load FAILED:`, e);
     } finally {
         setPadLoading(index, false);
     }
 }
 
 export function startPad(index: number): void {
-    console.log(`[Sampler] startPad(${index}) called. Buffer exists: ${!!padBuffers[index]}`);
+    logger.debug(`[Sampler] startPad(${index}) called. Buffer exists: ${!!padBuffers[index]}`);
     if (!padBuffers[index]) return;
     
     // Guard against AudioContext being in closed state
@@ -314,7 +336,7 @@ export function startPad(index: number): void {
     
     // Stop previous instance if playing
     stopPad(index);
-
+    
     try {
         const source = audioCtx.createBufferSource();
         source.buffer = padBuffers[index];
@@ -328,7 +350,7 @@ export function startPad(index: number): void {
             source.loopEnd = loopEnd;
         }
         
-        const gainNode = audioCtx.createGain();
+        const gainNode = acquireGain();
         const currentVol = padVolumes[index] !== undefined ? padVolumes[index] : DEFAULT_PAD_VOLUME;
         gainNode.gain.setValueAtTime(currentVol, audioCtx.currentTime);
         
@@ -356,7 +378,7 @@ export function startPad(index: number): void {
         source.connect(gainNode);
         gainNode.connect(masterGain);
         source.start(0, startOffset);
-        console.log(`[Sampler] Pad ${index} playing! Rate: ${rate.toFixed(3)}, Offset: ${startOffset.toFixed(3)}s`);
+        logger.debug(`[Sampler] Pad ${index} playing! Rate: ${rate.toFixed(3)}, Offset: ${startOffset.toFixed(3)}s`);
         
         // Register the voice for cleanup
         activeVoices[index] = { source, gain: gainNode };
@@ -366,8 +388,9 @@ export function startPad(index: number): void {
             if (activeVoices[index]?.source === source) {
                 try {
                     source.disconnect();
-                    gainNode.disconnect();
                 } catch (e) { /* already disconnected */ }
+                // Return gain node to pool
+                releaseGain(gainNode);
                 if (activeVoices[index]?.source === source) {
                     activeVoices[index] = null;
                 }
@@ -377,7 +400,7 @@ export function startPad(index: number): void {
         logger.error(`[Sampler] Pad ${index} start failed: ${e.message || e}`);
         // Ensure we don't leak activeVoices reference on failure
         if (activeVoices[index]?.gain) {
-            try { activeVoices[index]!.gain.disconnect(); } catch (_) {}
+            releaseGain(activeVoices[index]!.gain);
         }
         activeVoices[index] = null;
     }
@@ -392,11 +415,10 @@ export function stopPad(index: number): void {
             currentVoice.source.stop(); 
         } catch (e) { /* Already stopped or audioCtx closed */ }
         try { 
-            currentVoice.source.disconnect();
+            currentVoice.source.disconnect(); 
         } catch (e) { /* Already disconnected */ }
-        try { 
-            currentVoice.gain.disconnect();
-        } catch (e) { /* Already disconnected */ }
+        // Return gain node to pool instead of discarding
+        releaseGain(currentVoice.gain);
         activeVoices[index] = null;
     }
     updatePadVisuals(index);
@@ -572,7 +594,7 @@ export function setupPadKeyboardHandlers(): void {
             toast.success(`PAD ${padIndex + 1} BOUND TO KEY "${e.key.toUpperCase()}"`);
             return;
         }
-
+        
         const index = state.padKeyMap.indexOf(e.key.toLowerCase());
         if (index !== -1) {
             if (e.ctrlKey) {
@@ -683,7 +705,7 @@ async function saveKit(): Promise<void> {
         await fsBridgeRef.saveFile(path, JSON.stringify(kit, null, 2));
         toast.success("KIT SAVED");
     } catch (err) {
-        console.error("Save Kit Failed", err);
+        logger.error("Save Kit Failed", err);
         toast.error("FAILED TO SAVE KIT");
     }
 }
@@ -698,20 +720,22 @@ async function loadKitDialog(): Promise<void> {
         const kit = JSON.parse(jsonStr);
         
         if (kit.pads && Array.isArray(kit.pads)) {
-             kit.pads.forEach((p: { index: number, path: string, vol?: number }) => {
-                 if (p.path) {
-                     loadSampleFromPath(p.path, p.index).then(() => {
-                         if (p.vol !== undefined) {
-                             padVolumes[p.index] = p.vol;
-                             const slider = padGrid?.children[p.index]?.querySelector('.pad-slider') as HTMLInputElement;
-                             if (slider) slider.value = p.vol.toString();
-                         }
-                     });
-                 }
-             });
+            kit.pads.forEach((p: { index: number, path: string, vol?: number }) => {
+                if (p.path) {
+                    loadSampleFromPath(p.path, p.index).then(() => {
+                        if (p.vol !== undefined) {
+                            padVolumes[p.index] = p.vol;
+                            const slider = padGrid?.children[p.index]?.querySelector('.pad-slider') as HTMLInputElement;
+                            if (slider) slider.value = p.vol.toString();
+                        }
+                    });
+                }
+            });
         }
     } catch (err) {
-        console.error("Load Kit Failed", err);
+        logger.error("Load Kit Failed", err);
         toast.error("FAILED TO LOAD KIT");
     }
 }
+
+(End of file - total 717 lines)

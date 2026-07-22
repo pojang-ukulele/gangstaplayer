@@ -1,7 +1,7 @@
 {
   "name": "gangsta-player-pro-3",
   "productName": "Gangsta Player Pro 3",
-  "version": "4.18.0",
+  "version": "4.20.0",
   "description": "Gangsta Player Pro 3 - The Ultimate Sampler",
   "main": "main.js",
   "author": "Gangsta Player Pro 3",
@@ -69,23 +69,18 @@
       "createStartMenuShortcut": true,
       "shortcutName": "Gangsta Player Pro 3"
     },
-    "files": [
-      "**/*",
-      "!**/node_modules/**/node_modules",
-      "!**/*.wanha",
-      "!**/*.map",
-      "!**/venv/**",
-      "!**/venv",
-      "!**/__pycache__/**",
-      "!**/recordings/**",
-      "!ugplayer backup files/**",
-      "!dist/**",
-      "!Sonetra-AI-Mixer-main/**",
-      "!**/*.zip",
-      "!**/*.7z"
-    ],
-    "extraResources": [
-      "README.md"
-    ]
-  }
+"files": [
+    "app-build/**/*"
+  ],
+  "extraResources": [
+    {
+      "from": "README.md",
+      "to": "README.md"
+    },
+    {
+      "from": "sonetra-requirements.txt",
+      "to": "sonetra-requirements.txt"
+    }
+  ]
+}
 }

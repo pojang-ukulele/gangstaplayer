@@ -90,11 +90,14 @@ describe('ReactiveStore (state singleton)', () => {
         unsub();
     });
 
-    test('update() DOES trigger on array reference change even if content is same', () => {
+    test('update() does NOT trigger when array content is unchanged (shallowEqual)', () => {
         const spy = jest.fn();
         const unsub = state.subscribe('playlist', spy);
 
-        state.update({ playlist: [] }); // empty === default, but new ref
+        state.update({ playlist: [] }); // empty === default, same content
+        expect(spy).toHaveBeenCalledTimes(0);
+
+        state.update({ playlist: [{ id: '1', name: 'A', path: '/a', duration: 10, bpm: 120 }] });
         expect(spy).toHaveBeenCalledTimes(1);
 
         unsub();

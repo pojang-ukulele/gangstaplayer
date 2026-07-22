@@ -28,53 +28,15 @@ import { initCrashRecovery, checkAndRestore } from './crash-recovery';
 
 import './types';
 
+// State for master recording (moved to module scope for setupMasterRecording closure)
+let hiFiRecorder: HighFidelityRecorder | null = null;
+let isRecording = false;
+
 const bridge = window.electronAPI;
 const fsBridge = window.fileSystem;
 
-async function initApp() {
-    logger.info('[MAIN] Initializing Gangsta Player Pro 3 Core...');
-    applyPlatformStyles();
-    
-    // Initialize Worklets first
-    await initWorklets();
-    engine.initWorklets();
-    
-    // Window Controls
-    const minBtn = document.getElementById('minBtn');
-    const maxBtn = document.getElementById('maxBtn');
-    const closeBtn = document.getElementById('closeBtn');
-    if (minBtn) minBtn.addEventListener('click', () => bridge.minimize());
-    if (maxBtn) maxBtn.addEventListener('click', () => bridge.maximize());
-    if (closeBtn) closeBtn.addEventListener('click', () => bridge.close());
-
-    initSampler({
-        fsBridge, bridge, 
-        detectBPM: detectBPMWorker,
-        masterBPMRef: getMasterBPMRef(),
-        tempoSliderRef: getTempoSlider() as HTMLInputElement
-    });
-
-    initPlayer({ renderPlaylist, setBlendingIndex });
-
-    initPlaylist({
-        loadTrack, playTrack
-    });
-
-    initMIDI({ startPad, stopPad, activeVoices, padVolumes });
-
-    initSettings({ setAutoMixEnabled });
-
-    // Initialize UI components
-    // NOTE: createPadGrid() is already called inside initSampler() — do NOT call it again here
-    initVisuals();
-    
-    // Setup handlers
-    setupPadKeyboardHandlers();
-    setupPlayerHandlers();
-    setupPlaylistHandlers();
-    setupSettingsHandlers();
-    loadSettings();
-
+// Context menu setup functions (extracted from initApp)
+function setupContextMenus() {
     // Context Menu for Pads
     const padGrid = getPadGrid();
     const padContextMenu = document.getElementById('padContextMenu');
@@ -109,35 +71,41 @@ async function initApp() {
                     
                     // Show loop items when sample is loaded
                     const hasBpm = hasBuffer && !!padBPMs[i];
-                    const padCtxLoopDivider = document.getElementById('padCtxLoopDivider');
+                    const padCtxLoopDivider = document.getElementById('ctxLoopDivider');
                     if (padCtxLoopDivider) padCtxLoopDivider.classList.toggle('hidden', !hasBuffer);
-                    if (ctxSetLoop1Bar) ctxSetLoop1Bar.classList.toggle('hidden', !hasBpm);
-                    if (ctxSetLoopStart) ctxSetLoopStart.classList.toggle('hidden', !hasBuffer);
-                    if (ctxSetLoopEnd) ctxSetLoopEnd.classList.toggle('hidden', !hasBuffer);
-                    if (ctxClearLoop) ctxClearLoop.classList.toggle('hidden', !hasBuffer);
+                    if (document.getElementById('ctxSetLoop1Bar')) document.getElementById('ctxSetLoop1Bar')!.classList.toggle('hidden', !hasBpm);
+                    if (document.getElementById('ctxSetLoopStart')) document.getElementById('ctxSetLoopStart')!.classList.toggle('hidden', !hasBuffer);
+                    if (document.getElementById('ctxSetLoopEnd')) document.getElementById('ctxSetLoopEnd')!.classList.toggle('hidden', !hasBuffer);
+                    if (document.getElementById('ctxClearLoop')) document.getElementById('ctxClearLoop')!.classList.toggle('hidden', !hasBuffer);
 
                     const ctxPadMidiLearn = document.getElementById('ctxPadMidiLearn');
                     if (ctxPadMidiLearn) ctxPadMidiLearn.classList.toggle('hidden', !state.isMidiActive);
 
+                    // Position context menu with viewport boundary check
                     padContextMenu.classList.remove('hidden');
                     padContextMenu.setAttribute('aria-hidden', 'false');
-                    padContextMenu.style.left = e.clientX + 'px';
-                    padContextMenu.style.top = e.clientY + 'px';
+                    let left = e.clientX;
+                    let top = e.clientY;
+                    const rect = padContextMenu.getBoundingClientRect();
+                    if (left + rect.width > window.innerWidth) left = window.innerWidth - rect.width;
+                    if (top + rect.height > window.innerHeight) top = window.innerHeight - rect.height;
+                    padContextMenu.style.left = `${left}px`;
+                    padContextMenu.style.top = `${top}px`;
                     padContextMenu.dataset.padIndex = i.toString();
                 });
                 pad.addEventListener('mousedown', (e) => {
-                    console.log(`[Main] Pad ${i} mousedown. button=${e.button}, bufferExists=${!!padBuffers[i]}`);
+                    logger.info(`[Main] Pad ${i} mousedown. button=${e.button}, bufferExists=${!!padBuffers[i]}`);
                     if (e.button === 0 && padBuffers[i]) startPad(i);
                 });
                 pad.addEventListener('mouseup', () => stopPad(i));
                 pad.addEventListener('mouseleave', () => stopPad(i));
                 pad.addEventListener('click', async () => {
-                    console.log(`[Main] Pad ${i} click. bufferExists=${!!padBuffers[i]}`);
+                    logger.info(`[Main] Pad ${i} click. bufferExists=${!!padBuffers[i]}`);
                     if (!padBuffers[i]) {
                         const filePath = await bridge.openSampleDialog();
-                        console.log(`[Main] Pad ${i} dialog result: ${filePath}`);
+                        logger.info(`[Main] Pad ${i} dialog result: ${filePath}`);
                         if (filePath) await loadSampleFromPath(filePath, i);
-                        console.log(`[Main] Pad ${i} after load. bufferExists=${!!padBuffers[i]}`);
+                        logger.info(`[Main] Pad ${i} after load. bufferExists=${!!padBuffers[i]}`);
                     }
                 });
             }
@@ -266,8 +234,13 @@ async function initApp() {
                 if (ctxControlMidiLearn) ctxControlMidiLearn.classList.toggle('hidden', !state.isMidiActive);
 
                 controlContextMenu.classList.remove('hidden');
-                controlContextMenu.style.left = e.clientX + 'px';
-                controlContextMenu.style.top = e.clientY + 'px';
+                let left = e.clientX;
+                let top = e.clientY;
+                const rect = controlContextMenu.getBoundingClientRect();
+                if (left + rect.width > window.innerWidth) left = window.innerWidth - rect.width;
+                if (top + rect.height > window.innerHeight) top = window.innerHeight - rect.height;
+                controlContextMenu.style.left = `${left}px`;
+                controlContextMenu.style.top = `${top}px`;
                 controlContextMenu.dataset.controlId = id;
             });
         }
@@ -280,12 +253,33 @@ async function initApp() {
              toast.info(`MOVE MIDI KNOB FOR ${id.toUpperCase()}...`);
         });
     }
+}
 
-    // === GLOBAL KEYBOARD SHORTCUTS ===
+function setupGlobalKeyboardShortcuts() {
     document.addEventListener('keydown', (e) => {
         // Ignore if user is typing in an input
         const target = e.target as HTMLElement;
         if (target.tagName === 'INPUT' && (target as HTMLInputElement).type === 'text') return;
+
+        // ESC: Close topmost modal or context menu
+        if (e.key === 'Escape') {
+            e.preventDefault();
+            // Try modals first
+            const activeModal = document.querySelector('.modal.active');
+            if (activeModal) {
+                import('./modals').then(({ closeModal }) => closeModal(activeModal as HTMLElement));
+                return;
+            }
+            // Fallback: hide any visible context menus
+            const visibleMenus = document.querySelectorAll('.context-menu:not(.hidden)');
+            if (visibleMenus.length > 0) {
+                visibleMenus.forEach(menu => {
+                    (menu as HTMLElement).classList.add('hidden');
+                    menu.setAttribute('aria-hidden', 'true');
+                });
+            }
+            return;
+        }
 
         // Transport — blocked during AutoMix blending
         if (e.code === 'Space') {
@@ -306,35 +300,24 @@ async function initApp() {
             handlePlaylistNavigation(e);
         }
     });
+}
 
-    // Startup sequence completion
-    playStartupSound();
-    if (bridge?.appReadyToShow) bridge.appReadyToShow();
-
-    // Initialize crash recovery (auto-save)
-    initCrashRecovery();
-    // Check for previous crash and prompt restore (non-blocking)
-    checkAndRestore();
-
-    // === HIGH-FIDELITY MASTER RECORDING LOGIC ===
+function setupMasterRecording() {
     const recBtn = document.getElementById('masterRecBtn');
-    let hiFiRecorder: HighFidelityRecorder | null = null;
-    let isRecording = false;
-
     if (recBtn) {
         recBtn.addEventListener('click', async () => {
             if (!isRecording) {
                 // START RECORDING
                 try {
-                     if (!hiFiRecorder) {
-                         if (!masterGain) {
-                             logger.error("AudioContext unavailable. Cannot start recorder.");
-                             return;
-                         }
-                         hiFiRecorder = new HighFidelityRecorder(masterGain);
-                         await hiFiRecorder.init();
-                     }
-                    
+                    if (!hiFiRecorder) {
+                        if (!masterGain) {
+                            logger.error("AudioContext unavailable. Cannot start recorder.");
+                            return;
+                        }
+                        hiFiRecorder = new HighFidelityRecorder(masterGain);
+                        await hiFiRecorder.init();
+                    }
+                   
                     hiFiRecorder.start();
                     isRecording = true;
                     recBtn.classList.add('recording');
@@ -372,6 +355,56 @@ async function initApp() {
             }
         });
     }
+}
+
+async function initApp() {
+    logger.info('[MAIN] Initializing Gangsta Player Pro 3 Core...');
+    applyPlatformStyles();
+    
+    // Initialize Worklets first
+    await initWorklets();
+    engine.initWorklets();
+    
+    // Window Controls
+    const minBtn = document.getElementById('minBtn');
+    const maxBtn = document.getElementById('maxBtn');
+    const closeBtn = document.getElementById('closeBtn');
+    if (minBtn) minBtn.addEventListener('click', () => bridge.minimize());
+    if (maxBtn) maxBtn.addEventListener('click', () => bridge.maximize());
+    if (closeBtn) closeBtn.addEventListener('click', () => bridge.close());
+
+    initSampler({
+        fsBridge, bridge, 
+        detectBPM: detectBPMWorker,
+        masterBPMRef: getMasterBPMRef(),
+        tempoSliderRef: getTempoSlider() as HTMLInputElement
+    });
+
+    initPlayer({ renderPlaylist, setBlendingIndex });
+
+    initPlaylist({
+        loadTrack, playTrack
+    });
+
+    initMIDI({ startPad, stopPad, activeVoices, padVolumes });
+
+    initSettings({ setAutoMixEnabled });
+
+    // Initialize UI components
+    // NOTE: createPadGrid() is already called inside initSampler() — do NOT call it again here
+    initVisuals();
+    
+    // Setup handlers
+    setupPadKeyboardHandlers();
+    setupPlayerHandlers();
+    setupPlaylistHandlers();
+    setupSettingsHandlers();
+    loadSettings();
+
+    // Context menus, keyboard shortcuts, and master recording
+    setupContextMenus();
+    setupGlobalKeyboardShortcuts();
+    setupMasterRecording();
 
     // Manual Button
     const btnOpenManual = document.getElementById('btnOpenManual');
@@ -413,8 +446,13 @@ async function initApp() {
 
             playContextMenu.classList.remove('hidden');
             playContextMenu.setAttribute('aria-hidden', 'false');
-            playContextMenu.style.left = e.clientX + 'px';
-            playContextMenu.style.top = e.clientY + 'px';
+            let left = e.clientX;
+            let top = e.clientY;
+            const rect = playContextMenu.getBoundingClientRect();
+            if (left + rect.width > window.innerWidth) left = window.innerWidth - rect.width;
+            if (top + rect.height > window.innerHeight) top = window.innerHeight - rect.height;
+            playContextMenu.style.left = `${left}px`;
+            playContextMenu.style.top = `${top}px`;
         });
     }
 
@@ -455,8 +493,13 @@ async function initApp() {
 
             loopContextMenu.classList.remove('hidden');
             loopContextMenu.setAttribute('aria-hidden', 'false');
-            loopContextMenu.style.left = e.clientX + 'px';
-            loopContextMenu.style.top = e.clientY + 'px';
+            let left = e.clientX;
+            let top = e.clientY;
+            const rect = loopContextMenu.getBoundingClientRect();
+            if (left + rect.width > window.innerWidth) left = window.innerWidth - rect.width;
+            if (top + rect.height > window.innerHeight) top = window.innerHeight - rect.height;
+            loopContextMenu.style.left = `${left}px`;
+            loopContextMenu.style.top = `${top}px`;
         });
 
         loopBtn.addEventListener('click', () => {
@@ -513,6 +556,15 @@ async function initApp() {
         }
     });
     
+    // Startup sequence completion
+    playStartupSound();
+    if (bridge?.appReadyToShow) bridge.appReadyToShow();
+
+    // Initialize crash recovery (auto-save)
+    initCrashRecovery();
+    // Check for previous crash and prompt restore (non-blocking)
+    checkAndRestore();
+
     // === GURU CRASH PROTECTION (RENDERER) ===
     window.onerror = (message, source, lineno, colno, error) => {
         logger.error(`[Renderer Crash] ${message} at ${source}:${lineno}:${colno}`);
