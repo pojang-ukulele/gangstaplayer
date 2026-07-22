@@ -245,7 +245,27 @@ class SonetraBridge {
             };
         }
 
-        const pythonCmd = this._resolvePythonCmd();
+        let pythonCmd = this._resolvePythonCmd();
+
+        // Auto-setup: if Python doesn't exist or isn't usable, run the setup script
+        const pythonOk = await this._checkPythonAvailable(pythonCmd);
+        if (!pythonOk) {
+            console.log('[Sonetra] Python not found — running auto-setup...');
+            const setupScript = path.join(__dirname, '..', 'scripts', 'setup-sonetra.js');
+            if (fs.existsSync(setupScript)) {
+                try {
+                    execSync(`node "${setupScript}"`, {
+                        cwd: path.join(__dirname, '..'),
+                        stdio: 'inherit',
+                        timeout: 120000
+                    });
+                    console.log('[Sonetra] Auto-setup succeeded — re-resolving Python');
+                    pythonCmd = this._resolvePythonCmd();
+                } catch (e: any) {
+                    console.warn('[Sonetra] Auto-setup failed — will try system Python:', e.message);
+                }
+            }
+        }
 
         // Ensure Python dependencies are installed before spawning
         let depsOk = { ok: false, error: 'Unknown error during dependency check' };
@@ -468,8 +488,9 @@ class SonetraBridge {
         }
 
         const portablePythonPaths = [
-            path.join(__dirname, 'python-embed', 'python.exe'),
-            path.join(this._getResourcesPath(), 'python-embed', 'python.exe'),
+            path.join(__dirname, '..', 'python-embed', 'python.exe'),   // Project root (dev mode)
+            path.join(__dirname, 'python-embed', 'python.exe'),         // Build dir (packaged)
+            path.join(this._getResourcesPath(), 'python-embed', 'python.exe'), // Resources (packaged)
             path.join(__dirname, 'python', 'python.exe'),
         ];
 
@@ -484,6 +505,26 @@ class SonetraBridge {
         pythonCmd = process.platform === 'win32' ? 'py' : 'python3';
         console.log(`[Sonetra] Using system Python: ${pythonCmd}`);
         return pythonCmd;
+    }
+
+    /**
+     * Check if the resolved Python command is actually usable.
+     * For file paths (portable/venv), checks file existence.
+     * For system commands ('py', 'python3'), tries to run --version.
+     */
+    private async _checkPythonAvailable(cmd: string): Promise<boolean> {
+        if (!cmd) return false;
+        // If it's a file path, check the file exists
+        if (cmd.includes(path.sep) || cmd.includes('/')) {
+            return fs.existsSync(cmd);
+        }
+        // It's a system command (e.g. 'py', 'python3') — try to run it
+        try {
+            execSync(`"${cmd}" --version`, { stdio: 'ignore', timeout: 5000 });
+            return true;
+        } catch {
+            return false;
+        }
     }
 
     /**
