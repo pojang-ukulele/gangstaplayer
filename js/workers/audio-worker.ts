@@ -14,6 +14,8 @@ interface WorkerMessage {
     payload: {
         data?: Float32Array;
         sampleRate?: number;
+        threshold?: number;
+        minStepSeconds?: number;
         buffer?: AudioBufferTransfer;
         len?: number;
     };
@@ -26,7 +28,7 @@ self.onmessage = function(e: MessageEvent<WorkerMessage>) {
     switch (type) {
         case 'DETECT_BPM':
             if (payload.data && payload.sampleRate) {
-                const bpm = detectBPM(payload.data, payload.sampleRate);
+                const bpm = detectBPM(payload.data, payload.sampleRate, payload.threshold, payload.minStepSeconds);
                 self.postMessage({ type: 'BPM_RESULT', bpm, id });
             }
             break;
@@ -39,9 +41,11 @@ self.onmessage = function(e: MessageEvent<WorkerMessage>) {
     }
 };
 
-function detectBPM(data: Float32Array, sampleRate: number): number {
-    const BPM_DETECTION_THRESHOLD = 0.1;
-    const BPM_MIN_STEP_SECONDS = 0.3;
+// Defaults match js/constants.ts — values are always passed from the main thread
+// but kept here as fallback for standalone worker execution.
+function detectBPM(data: Float32Array, sampleRate: number, threshold = 0.1, minStepSeconds = 0.3): number {
+    const BPM_DETECTION_THRESHOLD = threshold;
+    const BPM_MIN_STEP_SECONDS = minStepSeconds;
     
     const peaks: number[] = [];
     const minStep = Math.floor(BPM_MIN_STEP_SECONDS * sampleRate);

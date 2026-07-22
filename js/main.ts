@@ -5,7 +5,7 @@ import { enableMIDI, initMIDI } from './midi';
 import { 
     initSampler, createPadGrid, setupPadKeyboardHandlers, getPadGrid,
     startPad, stopPad, loadSampleFromPath, toggleSync,
-    padBuffers, activeVoices, padVolumes, padSyncState
+    padBuffers, activeVoices, padVolumes, padSyncState, padBPMs
 } from './sampler';
 import { 
     initPlayer, setupPlayerHandlers, loadTrack, playTrack, pauseTrack, 
@@ -22,6 +22,9 @@ import { state } from './state';
 import { toast } from './toast';
 import { logger } from './logger';
 import { HighFidelityRecorder } from './recorder-client';
+
+import { saveSession, loadSession } from './session';
+import { initCrashRecovery, checkAndRestore } from './crash-recovery';
 
 import './types';
 
@@ -48,7 +51,7 @@ async function initApp() {
         fsBridge, bridge, 
         detectBPM: detectBPMWorker,
         masterBPMRef: getMasterBPMRef(),
-        tempoSlider: getTempoSlider() as HTMLInputElement
+        tempoSliderRef: getTempoSlider() as HTMLInputElement
     });
 
     initPlayer({ renderPlaylist, setBlendingIndex });
@@ -87,7 +90,8 @@ async function initApp() {
                 pad.addEventListener('contextmenu', (e) => {
                     e.preventDefault();
                     e.stopPropagation();
-                    if (padBuffers[i]) {
+                    const hasBuffer = !!padBuffers[i];
+                    if (hasBuffer) {
                         if (ctxSync) {
                             ctxSync.classList.remove('hidden');
                             if (padSyncState[i]) {
@@ -101,8 +105,17 @@ async function initApp() {
                     } else {
                         if (ctxSync) ctxSync.classList.add('hidden');
                     }
-                    if (padCtxDivider) padCtxDivider.classList.toggle('hidden', !padBuffers[i]);
+                    if (padCtxDivider) padCtxDivider.classList.toggle('hidden', !hasBuffer);
                     
+                    // Show loop items when sample is loaded
+                    const hasBpm = hasBuffer && !!padBPMs[i];
+                    const padCtxLoopDivider = document.getElementById('padCtxLoopDivider');
+                    if (padCtxLoopDivider) padCtxLoopDivider.classList.toggle('hidden', !hasBuffer);
+                    if (ctxSetLoop1Bar) ctxSetLoop1Bar.classList.toggle('hidden', !hasBpm);
+                    if (ctxSetLoopStart) ctxSetLoopStart.classList.toggle('hidden', !hasBuffer);
+                    if (ctxSetLoopEnd) ctxSetLoopEnd.classList.toggle('hidden', !hasBuffer);
+                    if (ctxClearLoop) ctxClearLoop.classList.toggle('hidden', !hasBuffer);
+
                     const ctxPadMidiLearn = document.getElementById('ctxPadMidiLearn');
                     if (ctxPadMidiLearn) ctxPadMidiLearn.classList.toggle('hidden', !state.isMidiActive);
 
@@ -142,6 +155,77 @@ async function initApp() {
         ctxSync.addEventListener('click', () => {
             const index = parseInt(padContextMenu.dataset.padIndex || "0");
             toggleSync(index);
+        });
+    }
+
+    // === LOOP CONTEXT MENU ITEMS ===
+    const ctxSetLoop1Bar = document.getElementById('ctxSetLoop1Bar');
+    const ctxSetLoopStart = document.getElementById('ctxSetLoopStart');
+    const ctxSetLoopEnd = document.getElementById('ctxSetLoopEnd');
+    const ctxClearLoop = document.getElementById('ctxClearLoop');
+
+    if (ctxSetLoop1Bar && padContextMenu) {
+        ctxSetLoop1Bar.addEventListener('click', () => {
+            const index = parseInt(padContextMenu.dataset.padIndex || "0");
+            import('./sampler').then(({ padBuffers, padBPMs, padLoopStart, padLoopEnd, padBeatPositions }) => {
+                const buf = padBuffers[index];
+                const bpm = padBPMs[index];
+                if (!buf || !bpm) return;
+                const beatSec = 60 / bpm;
+                const barSec = beatSec * 4;
+                const currentPos = (buf.duration / 4); // roughly 1/4 into sample
+                const startBeat = Math.floor(currentPos / barSec) * barSec;
+                padLoopStart[index] = startBeat;
+                padLoopEnd[index] = Math.min(startBeat + barSec, buf.duration);
+                toast.success(`1-BAR LOOP SET`);
+                const { renderWaveform } = require('./sampler');
+                if (renderWaveform) renderWaveform(index);
+            });
+        });
+    }
+    if (ctxSetLoopStart && padContextMenu) {
+        ctxSetLoopStart.addEventListener('click', () => {
+            const index = parseInt(padContextMenu.dataset.padIndex || "0");
+            import('./sampler').then(({ padBuffers, padLoopStart, padLoopEnd, padBeatPositions, renderWaveform }) => {
+                const buf = padBuffers[index];
+                if (!buf) return;
+                // Use 25% of duration as the default loop start position
+                const pos = buf.duration * 0.25;
+                padLoopStart[index] = pos;
+                if (padLoopEnd[index] < 0 || padLoopEnd[index] <= pos) {
+                    padLoopEnd[index] = buf.duration;
+                }
+                toast.success(`LOOP START AT ${pos.toFixed(2)}s`);
+                if (renderWaveform) renderWaveform(index);
+            });
+        });
+    }
+    if (ctxSetLoopEnd && padContextMenu) {
+        ctxSetLoopEnd.addEventListener('click', () => {
+            const index = parseInt(padContextMenu.dataset.padIndex || "0");
+            import('./sampler').then(({ padBuffers, padLoopStart, padLoopEnd, padBeatPositions, renderWaveform }) => {
+                const buf = padBuffers[index];
+                if (!buf) return;
+                // Use 75% of duration as the default loop end position
+                const pos = buf.duration * 0.75;
+                padLoopEnd[index] = pos;
+                if (padLoopStart[index] < 0 || padLoopStart[index] >= pos) {
+                    padLoopStart[index] = 0;
+                }
+                toast.success(`LOOP END AT ${pos.toFixed(2)}s`);
+                if (renderWaveform) renderWaveform(index);
+            });
+        });
+    }
+    if (ctxClearLoop && padContextMenu) {
+        ctxClearLoop.addEventListener('click', () => {
+            const index = parseInt(padContextMenu.dataset.padIndex || "0");
+            import('./sampler').then(({ padLoopStart, padLoopEnd, renderWaveform }) => {
+                padLoopStart[index] = -1;
+                padLoopEnd[index] = -1;
+                toast.info("LOOP CLEARED");
+                if (renderWaveform) renderWaveform(index);
+            });
         });
     }
 
@@ -227,6 +311,11 @@ async function initApp() {
     playStartupSound();
     if (bridge?.appReadyToShow) bridge.appReadyToShow();
 
+    // Initialize crash recovery (auto-save)
+    initCrashRecovery();
+    // Check for previous crash and prompt restore (non-blocking)
+    checkAndRestore();
+
     // === HIGH-FIDELITY MASTER RECORDING LOGIC ===
     const recBtn = document.getElementById('masterRecBtn');
     let hiFiRecorder: HighFidelityRecorder | null = null;
@@ -237,15 +326,20 @@ async function initApp() {
             if (!isRecording) {
                 // START RECORDING
                 try {
-                    if (!hiFiRecorder) {
-                        hiFiRecorder = new HighFidelityRecorder(masterGain);
-                        await hiFiRecorder.init();
-                    }
+                     if (!hiFiRecorder) {
+                         if (!masterGain) {
+                             logger.error("AudioContext unavailable. Cannot start recorder.");
+                             return;
+                         }
+                         hiFiRecorder = new HighFidelityRecorder(masterGain);
+                         await hiFiRecorder.init();
+                     }
                     
                     hiFiRecorder.start();
                     isRecording = true;
                     recBtn.classList.add('recording');
                     recBtn.innerText = "STOP";
+                    recBtn.setAttribute('aria-pressed', 'true');
                 } catch (e) {
                     logger.error("[MasterRec] Start failed", e);
                     toast.error("COULD NOT START HI-FI RECORDER");
@@ -271,6 +365,7 @@ async function initApp() {
                     } finally {
                         recBtn.classList.remove('recording');
                         recBtn.innerText = "REC";
+                        recBtn.setAttribute('aria-pressed', 'false');
                         isRecording = false;
                     }
                 }
@@ -284,6 +379,16 @@ async function initApp() {
         btnOpenManual.addEventListener('click', () => {
              bridge.openExternal('README.md');
         });
+    }
+
+    // Session Save/Load
+    const btnSaveSession = document.getElementById('btnSaveSession');
+    const btnLoadSession = document.getElementById('btnLoadSession');
+    if (btnSaveSession) {
+        btnSaveSession.addEventListener('click', saveSession);
+    }
+    if (btnLoadSession) {
+        btnLoadSession.addEventListener('click', loadSession);
     }
 
     // === PLAY BUTTON CONTEXT MENU ===

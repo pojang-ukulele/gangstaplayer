@@ -3,26 +3,162 @@
  */
 
 /**
- * Standard debounce utility
+ * Normalize IPC buffer data to a clean ArrayBuffer.
+ * IPC can return ArrayBuffer, typed arrays (Uint8Array), or Node.js Buffer.
+ * This robustly converts any variant to a standalone ArrayBuffer.
+ *
+ * Uses toString() cross-realm check instead of instanceof to avoid
+ * failures when ts-jest/bundler creates isolated realm references.
  */
-export function debounce<T extends (...args: any[]) => any>(fn: T, wait: number): (...args: Parameters<T>) => void {
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    return function(this: any, ...args: Parameters<T>) {
-        if (timeout) clearTimeout(timeout);
-        timeout = setTimeout(() => fn.apply(this, args), wait);
-    };
+function isArrayBuffer(value: any): boolean {
+    return Object.prototype.toString.call(value) === '[object ArrayBuffer]';
+}
+
+export function normalizeToArrayBuffer(data: any): ArrayBuffer {
+    // Fast path: already an ArrayBuffer
+    if (isArrayBuffer(data)) {
+        return data.slice(0);
+    }
+    // Fast path: TypedArray (Uint8Array, Buffer, etc.) or has .buffer (e.g. DataView)
+    if (data && typeof data === 'object') {
+        // Node.js Buffer extends Uint8Array — check its buffer property
+        if (data.buffer && isArrayBuffer(data.buffer)) {
+            return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+        }
+        // If it's array-like but not a TypedArray, try to convert efficiently
+        if (typeof data.length === 'number' && data.length > 0) {
+            const bytes = new Uint8Array(data.length);
+            for (let i = 0; i < data.length; i++) {
+                bytes[i] = data[i];
+            }
+            return bytes.buffer;
+        }
+    }
+    // Unrecognized format — throw instead of silently producing garbage
+    throw new Error(
+        `normalizeToArrayBuffer: Unsupported data type (${typeof data}, ` +
+        `${data?.constructor?.name ?? 'unknown'}). Expected ArrayBuffer or TypedArray.`
+    );
+}
+
+// ==================== AUDIO FILE VALIDATION ====================
+// Magic number signatures for common audio formats
+
+const AUDIO_SIGNATURES: Record<string, { offset: number; bytes: number[] }> = {
+    // WAV: "RIFF" at offset 0 + "WAVE" at offset 8
+    'wav':  { offset: 0, bytes: [0x52, 0x49, 0x46, 0x46] }, // "RIFF"
+    // MP3: 0xFF 0xFB / 0xFF 0xF3 / 0xFF 0xF2 / ID3 "ID3" tag at offset 0
+    'mp3':  { offset: 0, bytes: [0xFF, 0xFB] },
+    'mp3v2': { offset: 0, bytes: [0x49, 0x44, 0x33] }, // "ID3" (tagged)
+    // OGG: "OggS" at offset 0
+    'ogg':  { offset: 0, bytes: [0x4F, 0x67, 0x67, 0x53] }, // "OggS"
+    // FLAC: "fLaC" at offset 0
+    'flac': { offset: 0, bytes: [0x66, 0x4C, 0x61, 0x43] }, // "fLaC"
+    // WAV (secondary): verify "WAVE" at offset 8 for RIFF files
+    'wave': { offset: 8, bytes: [0x57, 0x41, 0x56, 0x45] }, // "WAVE"
+};
+
+/**
+ * Validates that a file buffer contains an actual audio file by checking
+ * magic number signatures. Prevents loading of non-audio files as audio.
+ *
+ * Returns null on success (valid audio), or an error message string on failure.
+ */
+export function validateAudioSignature(
+    buffer: ArrayBuffer, 
+    fileName?: string
+): string | null {
+    if (!buffer || buffer.byteLength < 4) {
+        return 'File is too small to be a valid audio file';
+    }
+
+    const view = new DataView(buffer);
+    const matches: string[] = [];
+
+    // Check each known audio signature
+    for (const [sigName, { offset, bytes }] of Object.entries(AUDIO_SIGNATURES)) {
+        if (buffer.byteLength < offset + bytes.length) continue;
+
+        let matchesSig = true;
+        for (let i = 0; i < bytes.length; i++) {
+            if (view.getUint8(offset + i) !== bytes[i]) {
+                matchesSig = false;
+                break;
+            }
+        }
+        if (matchesSig) matches.push(sigName);
+    }
+
+    // RIFF/WAV requires both "RIFF" AND "WAVE" signatures
+    const hasRiff = matches.includes('wav');
+    const hasWave = matches.includes('wave');
+    const isRealWav = hasRiff && hasWave;
+    const hasAudioSignature = isRealWav ||
+        matches.includes('mp3') ||
+        matches.includes('mp3v2') || // ID3 tag - could be any audio
+        matches.includes('ogg') ||
+        matches.includes('flac');
+
+    if (!hasAudioSignature) {
+        const nameHint = fileName ? ` (file: ${fileName})` : '';
+        return `File does not contain recognized audio data${nameHint}`;
+    }
+
+    return null; // null = valid audio
 }
 
 /**
- * Standard throttle utility
+ * Convenience function: validates an audio file and returns an error message,
+ * or null if the file is valid audio.
  */
-export function throttle<T extends (...args: any[]) => any>(fn: T, wait: number): (...args: Parameters<T>) => void {
-    let lastTime = 0;
-    return function(this: any, ...args: Parameters<T>) {
-        const now = Date.now();
-        if (now - lastTime >= wait) {
-            lastTime = now;
-            fn.apply(this, args);
+export function isValidAudio(arrayBuffer: ArrayBuffer): boolean {
+    return validateAudioSignature(arrayBuffer) === null;
+}
+
+// ==================== EVENT LISTENER DISCIPLINE ====================
+
+/**
+ * Disposable manages a collection of cleanup callbacks (event listeners,
+ * timers, subscriptions) that can be torn down in one shot.
+ *
+ * Use this instead of raw addEventListener in dynamic components to
+ * prevent listener leaks when the DOM subtree is not wholesale-replaced.
+ *
+ * @example
+ * const disp = new Disposable();
+ * disp.add(() => { window.removeEventListener('resize', onResize); });
+ * // or use the on() helper:
+ * disp.on(btn, 'click', handleClick);
+ * // later:
+ * disp.dispose();
+ */
+export class Disposable {
+    private _cleanups: Array<() => void> = [];
+
+    /** Register a cleanup callback. Returns the same callback for convenience. */
+    add(fn: () => void): () => void {
+        this._cleanups.push(fn);
+        return fn;
+    }
+
+    /** Register an event listener that auto-removes on dispose. */
+    on<K extends keyof HTMLElementEventMap>(
+        el: HTMLElement | EventTarget,
+        event: K,
+        handler: (ev: HTMLElementEventMap[K]) => void,
+        options?: AddEventListenerOptions
+    ): void {
+        el.addEventListener(event, handler as EventListener, options);
+        this._cleanups.push(() => {
+            el.removeEventListener(event, handler as EventListener, options);
+        });
+    }
+
+    /** Dispose all registered cleanups. Further adds are no-ops. */
+    dispose(): void {
+        for (const cleanup of this._cleanups) {
+            try { cleanup(); } catch { /* ignore disposal errors */ }
         }
-    };
+        this._cleanups = [];
+    }
 }

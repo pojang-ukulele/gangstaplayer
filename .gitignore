@@ -12,6 +12,23 @@ release/
 app-build/
 dist_source/
 
+# === Android Port (Expo / React Native) ===
+android-port/node_modules/
+android-port/.expo/
+android-port/*.log
+android-port/build_log*.txt
+android-port/bundle_test.js
+android-port/reposition-emulator.ps1
+android-port/start-app.bat
+android-port/start-emulator.bat
+# Android build outputs are handled by android-port/android/.gitignore
+# but we also cover them at root level for safety:
+android-port/android/build/
+android-port/android/app/build/
+android-port/android/.gradle/
+android-port/android/app/debug.keystore
+android-port/android/react-settings-plugin/bin/
+
 # === Python / Sonetra ===
 __pycache__/
 *.py[cod]
@@ -49,8 +66,13 @@ samples/
 # === Editor / IDE ===
 .vscode/
 .idea/
-.sublime-
+*.sublime-workspace
+*.sublime-project
+*.sublime-*
 
 # === Tests / coverage ===
 coverage/
 .nyc_output/
+
+# === Local scripts (not for sharing) ===
+run-app.bat

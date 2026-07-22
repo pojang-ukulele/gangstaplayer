@@ -105,17 +105,6 @@ async function build() {
         });
     }
 
-    const decoderEntry = resolveEntry('js/workers/decoder-worker.js');
-    if (fs.existsSync(decoderEntry)) {
-        await esbuild.build({
-            entryPoints: [decoderEntry],
-            bundle: true,
-            platform: 'browser',
-            outfile: path.join(BUILD_DIR, 'js', 'workers', 'decoder-worker.js'),
-            minify: true,
-        });
-    }
-
     console.log('Copying Assets...');
     // 7. Copy Assets
     const filesToCopy = [
@@ -123,7 +112,8 @@ async function build() {
         'styles.css',
         'icon.png',
         'package.json',
-        'README.md'
+        'README.md',
+        'sonetra-requirements.txt'
     ];
 
     if (!fs.existsSync(path.join(BUILD_DIR, 'assets'))) {

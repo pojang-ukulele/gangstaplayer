@@ -4,13 +4,15 @@ import { audioCtx, masterGain, resumeAudioContext } from './audio';
 import { engine } from './audio-engine';
 import { toast } from './toast';
 import { logger } from './logger';
+import { normalizeToArrayBuffer, validateAudioSignature } from './utils';
+import type { FileSystemAPI, ElectronAPI } from './types';
 
 interface SamplerDeps {
-    fsBridge: any;
-    bridge: any;
+    fsBridge: FileSystemAPI;
+    bridge: ElectronAPI;
     detectBPM: (buffer: AudioBuffer) => Promise<number>;
     masterBPMRef: { value: number };
-    tempoSlider: HTMLInputElement;
+    tempoSliderRef: HTMLInputElement;
 }
 
 export const padBuffers: Record<number, AudioBuffer> = {};
@@ -20,9 +22,17 @@ export const padVolumes: number[] = new Array(16).fill(DEFAULT_PAD_VOLUME);
 export const padBPMs: Record<number, number> = {};
 export const padSyncState: Record<number, boolean> = {};
 
+// Waveform preview data: downsampled amplitude envelopes per pad (0-255 for canvas)
+export const padWaveforms: Record<number, Uint8Array> = {};
+export const padBeatPositions: Record<number, number[]> = {}; // beat positions in seconds
+export const padLoopStart: Record<number, number> = {}; // loop start in seconds (-1 = not set)
+export const padLoopEnd: Record<number, number> = {}; // loop end in seconds (-1 = not set)
+
+const WAVEFORM_POINTS = 100; // Number of amplitude samples for preview
+
 let padGrid: HTMLElement | null = null;
-let fsBridgeRef: any = null;
-let bridgeRef: any = null;
+let fsBridgeRef: FileSystemAPI | null = null;
+let bridgeRef: ElectronAPI | null = null;
 let detectBPMFn: ((buffer: AudioBuffer) => Promise<number>) | null = null;
 let masterBPMRef = { value: 0 };
 let tempoSliderRef: HTMLInputElement | null = null;
@@ -32,7 +42,7 @@ export function initSampler(deps: SamplerDeps): void {
     bridgeRef = deps.bridge;
     detectBPMFn = deps.detectBPM;
     masterBPMRef = deps.masterBPMRef;
-    tempoSliderRef = deps.tempoSlider;
+    tempoSliderRef = deps.tempoSliderRef;
     padGrid = document.getElementById('padGrid');
     
     // Subscribe to mapping changes
@@ -47,10 +57,157 @@ export function initSampler(deps: SamplerDeps): void {
 
 export function getPadGrid(): HTMLElement | null { return padGrid; }
 
+/**
+ * Compute evenly-spaced beat positions from BPM and duration.
+ * Returns positions in seconds.
+ */
+function computeBeatPositions(bpm: number, duration: number): number[] {
+    if (bpm <= 0 || duration <= 0) return []; // Skip, no beat data available
+    const beatInterval = 60 / bpm; // seconds per beat
+    const count = Math.floor(duration / beatInterval);
+    const positions: number[] = new Array(count);
+    for (let i = 0; i < count; i++) {
+        positions[i] = i * beatInterval;
+    }
+    return positions;
+}
+
+/**
+ * Compute a downsampled waveform preview from an AudioBuffer.
+ * Returns a Uint8Array of WAVEFORM_POINTS length (0-255 amplitude).
+ */
+function computeWaveform(buffer: AudioBuffer): Uint8Array {
+    const channel = buffer.getChannelData(0);
+    const len = channel.length;
+    const points = new Uint8Array(WAVEFORM_POINTS);
+    const samplesPerPoint = Math.max(1, Math.floor(len / WAVEFORM_POINTS));
+    
+    // Find peak amplitude for normalization
+    let peak = 0;
+    for (let i = 0; i < len; i++) {
+        const abs = Math.abs(channel[i]);
+        if (abs > peak) peak = abs;
+    }
+    if (peak < 0.01) peak = 1; // Avoid division by zero on silent samples
+    
+    for (let i = 0; i < WAVEFORM_POINTS; i++) {
+        let maxVal = 0;
+        const start = i * samplesPerPoint;
+        const end = Math.min(start + samplesPerPoint, len);
+        for (let j = start; j < end; j++) {
+            const abs = Math.abs(channel[j]);
+            if (abs > maxVal) maxVal = abs;
+        }
+        points[i] = Math.min(255, Math.round((maxVal / peak) * 255));
+    }
+    return points;
+}
+
+/** Draw the waveform + beat markers + loop region onto the pad's canvas */
+export function renderWaveform(index: number): void {
+    if (!padGrid) return;
+    const wrapper = padGrid.children[index] as HTMLElement;
+    if (!wrapper) return;
+    const canvas = wrapper.querySelector('.pad-canvas') as HTMLCanvasElement;
+    if (!canvas) return;
+    
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    
+    // Match canvas size to pad dimensions
+    const pad = wrapper.querySelector('.pad') as HTMLElement;
+    if (!pad) return;
+    const dpr = window.devicePixelRatio || 1;
+    const w = pad.clientWidth;
+    const h = pad.clientHeight;
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+    ctx.scale(dpr, dpr);
+    
+    ctx.clearRect(0, 0, w, h);
+    
+    const data = padWaveforms[index];
+    if (!data || data.length < 2) return;
+    
+    const buffer = padBuffers[index];
+    const duration = buffer ? buffer.duration : 1;
+    const midY = h / 2;
+    const stepX = w / WAVEFORM_POINTS;
+    
+    // === 1. Draw loop region highlight (if loop points are set) ===
+    const loopStart = padLoopStart[index];
+    const loopEnd = padLoopEnd[index];
+    if (loopStart >= 0 && loopEnd > loopStart && duration > 0) {
+        const lsX = (loopStart / duration) * w;
+        const leX = (loopEnd / duration) * w;
+        ctx.fillStyle = 'rgba(188, 19, 254, 0.2)'; // purple tint for loop region
+        ctx.fillRect(lsX, 0, leX - lsX, h);
+        // Loop boundary lines
+        ctx.strokeStyle = 'rgba(188, 19, 254, 0.7)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(lsX, 0); ctx.lineTo(lsX, h);
+        ctx.moveTo(leX, 0); ctx.lineTo(leX, h);
+        ctx.stroke();
+    }
+    
+    // === 2. Draw beat markers (vertical ticks) ===
+    const beats = padBeatPositions[index];
+    if (beats && beats.length > 1 && duration > 0) {
+        ctx.strokeStyle = 'rgba(255, 204, 0, 0.25)'; // gold tick marks
+        ctx.lineWidth = 1;
+        for (let i = 0; i < beats.length; i++) {
+            const x = (beats[i] / duration) * w;
+            ctx.beginPath();
+            ctx.moveTo(x, midY - 6);
+            ctx.lineTo(x, midY + 6);
+            ctx.stroke();
+        }
+    }
+    
+    // === 3. Draw amplitude envelope (mirrored) ===
+    ctx.strokeStyle = 'rgba(57, 255, 20, 0.35)';
+    ctx.lineWidth = 1.5;
+    
+    // Top half
+    ctx.beginPath();
+    for (let i = 0; i < WAVEFORM_POINTS; i++) {
+        const amp = (data[i] / 255) * (midY - 4);
+        const x = i * stepX + stepX / 2;
+        if (i === 0) ctx.moveTo(x, midY - amp);
+        else ctx.lineTo(x, midY - amp);
+    }
+    ctx.stroke();
+    
+    // Bottom half (mirror)
+    ctx.beginPath();
+    for (let i = 0; i < WAVEFORM_POINTS; i++) {
+        const amp = (data[i] / 255) * (midY - 4);
+        const x = i * stepX + stepX / 2;
+        if (i === 0) ctx.moveTo(x, midY + amp);
+        else ctx.lineTo(x, midY + amp);
+    }
+    ctx.stroke();
+    
+    // === 4. BPM text overlay (top-left corner) ===
+    if (padBPMs[index] > 0) {
+        ctx.fillStyle = 'rgba(57, 255, 20, 0.5)';
+        ctx.font = `${Math.max(8, Math.min(12, Math.round(w * 0.07)))}px VT323, monospace`;
+        ctx.textBaseline = 'top';
+        ctx.fillText(`${padBPMs[index]}bpm`, 3, 3);
+    }
+}
+
 function updatePadVisuals(index: number): void {
     if (!padGrid) return;
     const wrapper = padGrid.children[index] as HTMLElement;
-    if (wrapper) renderPad(index, wrapper);
+    if (wrapper) {
+        renderPad(index, wrapper);
+        // Defer waveform render to next frame so canvas has correct layout dimensions
+        requestAnimationFrame(() => renderWaveform(index));
+    }
 }
 
 function setPadLoading(index: number, loading: boolean): void {
@@ -67,19 +224,30 @@ export async function loadSampleFile(file: File, index: number): Promise<void> {
         logger.info(`[Sampler] Loading file to pad ${index}: ${file.name}`);
         const arrayBuffer = await file.arrayBuffer();
         
+        // Validate audio file signature
+        const validationError = validateAudioSignature(arrayBuffer, file.name);
+        if (validationError) {
+            logger.error(`[Sampler] Pad ${index} validation failed: ${validationError}`);
+            toast.error("INVALID AUDIO FILE");
+            return;
+        }
+        
         // Use native decoder directly (no worker pool — most reliable for one-shot samples)
         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
         
         padBuffers[index] = audioBuffer;
         padPaths[index] = file.name;
+        padWaveforms[index] = computeWaveform(audioBuffer);
         logger.info(`[Sampler] Pad ${index}: Buffer set from file (${audioBuffer.duration.toFixed(2)}s)`);
         updatePadVisuals(index);
         
         if (detectBPMFn) {
             const bpm = await detectBPMFn(audioBuffer);
             padBPMs[index] = bpm;
-            logger.info(`[Sampler] Pad ${index} BPM: ${bpm}`);
+            padBeatPositions[index] = computeBeatPositions(bpm, audioBuffer.duration);
+            logger.info(`[Sampler] Pad ${index} BPM: ${bpm}, beats: ${padBeatPositions[index].length}`);
         }
+        document.dispatchEvent(new CustomEvent('ug:dataChanged'));
     } catch (e: any) { 
         logger.error(`[Sampler] Pad ${index} load failed: ${e.message || e}`);
         console.error(`[Sampler] Pad ${index} file load FAILED:`, e);
@@ -99,14 +267,13 @@ export async function loadSampleFromPath(path: string, index: number): Promise<v
             return;
         }
         
-        // Robust buffer alignment
-        let arrayBuffer: ArrayBuffer;
-        if (rawData instanceof ArrayBuffer) {
-            arrayBuffer = rawData.slice(0);
-        } else if (rawData.buffer instanceof ArrayBuffer) {
-            arrayBuffer = rawData.buffer.slice(rawData.byteOffset, rawData.byteOffset + rawData.byteLength);
-        } else {
-            arrayBuffer = Uint8Array.from(rawData).buffer;
+        const arrayBuffer = normalizeToArrayBuffer(rawData);
+        
+        // Validate audio file signature
+        const validationError = validateAudioSignature(arrayBuffer, path.split(/[\\/]/).pop());
+        if (validationError) {
+            logger.error(`[Sampler] Pad ${index} path validation failed: ${validationError}`);
+            return;
         }
         
         logger.info(`[Sampler] Pad ${index}: Got ${arrayBuffer.byteLength} bytes, decoding...`);
@@ -116,12 +283,15 @@ export async function loadSampleFromPath(path: string, index: number): Promise<v
 
         padBuffers[index] = audioBuffer;
         padPaths[index] = path;
+        padWaveforms[index] = computeWaveform(audioBuffer);
         logger.info(`[Sampler] Pad ${index}: Buffer set (${audioBuffer.duration.toFixed(2)}s, ${audioBuffer.sampleRate}Hz)`);
         updatePadVisuals(index);
         if (detectBPMFn) {
             const bpm = await detectBPMFn(audioBuffer);
             padBPMs[index] = bpm;
+            padBeatPositions[index] = computeBeatPositions(bpm, audioBuffer.duration);
         }
+        document.dispatchEvent(new CustomEvent('ug:dataChanged'));
     } catch (e: any) { 
         logger.error(`[Sampler] Pad ${index} path load failed: ${e.message || e}`);
         console.error(`[Sampler] Pad ${index} path load FAILED:`, e);
@@ -133,46 +303,85 @@ export async function loadSampleFromPath(path: string, index: number): Promise<v
 export function startPad(index: number): void {
     console.log(`[Sampler] startPad(${index}) called. Buffer exists: ${!!padBuffers[index]}`);
     if (!padBuffers[index]) return;
+    
+    // Guard against AudioContext being in closed state
+    if (audioCtx.state === 'closed') {
+        logger.warn(`[Sampler] AudioContext is closed, cannot start pad ${index}`);
+        return;
+    }
+    
     resumeAudioContext();
     
     // Stop previous instance if playing
     stopPad(index);
 
-    const source = audioCtx.createBufferSource();
-    source.buffer = padBuffers[index];
-    source.loop = true;
-    
-    const gainNode = audioCtx.createGain();
-    const currentVol = padVolumes[index] !== undefined ? padVolumes[index] : DEFAULT_PAD_VOLUME;
-    gainNode.gain.setValueAtTime(currentVol, audioCtx.currentTime);
-    
-    let rate = tempoSliderRef ? parseFloat(tempoSliderRef.value) : 1;
-    let startOffset = 0;
-    
-    if (padSyncState[index] && masterBPMRef.value > 0 && padBPMs[index] > 0) {
-        // Adjust playback rate to match master BPM
-        rate = (masterBPMRef.value / padBPMs[index]) * rate;
+    try {
+        const source = audioCtx.createBufferSource();
+        source.buffer = padBuffers[index];
+        source.loop = true;
         
-        // Beat-quantized start: snap to nearest beat in the master timeline
-        const masterBPS = masterBPMRef.value / 60; // beats per second
-        const padBeatDuration = 60 / padBPMs[index]; // one beat in the pad's native time
-        
-        // Get current position in the master audio
-        const playerAudio = engine.main.audio;
-        if (playerAudio && playerAudio.currentTime > 0 && !isNaN(playerAudio.duration)) {
-            const masterBeatPhase = (playerAudio.currentTime * masterBPS) % 1; // 0-1 phase within current beat
-            // Start the pad at the same phase position within its beat cycle
-            startOffset = masterBeatPhase * padBeatDuration;
+        // Apply loop points if set
+        const loopStart = padLoopStart[index];
+        const loopEnd = padLoopEnd[index];
+        if (loopStart >= 0 && loopEnd > loopStart) {
+            source.loopStart = loopStart;
+            source.loopEnd = loopEnd;
         }
+        
+        const gainNode = audioCtx.createGain();
+        const currentVol = padVolumes[index] !== undefined ? padVolumes[index] : DEFAULT_PAD_VOLUME;
+        gainNode.gain.setValueAtTime(currentVol, audioCtx.currentTime);
+        
+        let rate = tempoSliderRef ? parseFloat(tempoSliderRef.value) : 1;
+        let startOffset = 0;
+        
+        if (padSyncState[index] && masterBPMRef.value > 0 && padBPMs[index] > 0) {
+            // Adjust playback rate to match master BPM
+            rate = (masterBPMRef.value / padBPMs[index]) * rate;
+            
+            // Beat-quantized start: snap to nearest beat in the master timeline
+            const masterBPS = masterBPMRef.value / 60; // beats per second
+            const padBeatDuration = 60 / padBPMs[index]; // one beat in the pad's native time
+            
+            // Get current position in the master audio
+            const playerAudio = engine.main.audio;
+            if (playerAudio && playerAudio.currentTime > 0 && !isNaN(playerAudio.duration)) {
+                const masterBeatPhase = (playerAudio.currentTime * masterBPS) % 1; // 0-1 phase within current beat
+                // Start the pad at the same phase position within its beat cycle
+                startOffset = masterBeatPhase * padBeatDuration;
+            }
+        }
+        source.playbackRate.value = rate;
+        
+        source.connect(gainNode);
+        gainNode.connect(masterGain);
+        source.start(0, startOffset);
+        console.log(`[Sampler] Pad ${index} playing! Rate: ${rate.toFixed(3)}, Offset: ${startOffset.toFixed(3)}s`);
+        
+        // Register the voice for cleanup
+        activeVoices[index] = { source, gain: gainNode };
+        
+        // Cleanup after source finishes playing naturally
+        source.onended = () => {
+            if (activeVoices[index]?.source === source) {
+                try {
+                    source.disconnect();
+                    gainNode.disconnect();
+                } catch (e) { /* already disconnected */ }
+                if (activeVoices[index]?.source === source) {
+                    activeVoices[index] = null;
+                }
+            }
+        };
+    } catch (e: any) {
+        logger.error(`[Sampler] Pad ${index} start failed: ${e.message || e}`);
+        // Ensure we don't leak activeVoices reference on failure
+        if (activeVoices[index]?.gain) {
+            try { activeVoices[index]!.gain.disconnect(); } catch (_) {}
+        }
+        activeVoices[index] = null;
     }
-    source.playbackRate.value = rate;
     
-    source.connect(gainNode);
-    gainNode.connect(masterGain);
-    source.start(0, startOffset);
-    console.log(`[Sampler] Pad ${index} playing! Rate: ${rate.toFixed(3)}, Offset: ${startOffset.toFixed(3)}s`);
-    
-    activeVoices[index] = { source, gain: gainNode };
     updatePadVisuals(index);
 }
 
@@ -181,9 +390,13 @@ export function stopPad(index: number): void {
     if (currentVoice) {
         try { 
             currentVoice.source.stop(); 
+        } catch (e) { /* Already stopped or audioCtx closed */ }
+        try { 
             currentVoice.source.disconnect();
+        } catch (e) { /* Already disconnected */ }
+        try { 
             currentVoice.gain.disconnect();
-        } catch (e) {}
+        } catch (e) { /* Already disconnected */ }
         activeVoices[index] = null;
     }
     updatePadVisuals(index);
@@ -192,10 +405,12 @@ export function stopPad(index: number): void {
 export function toggleSync(index: number): void { 
     padSyncState[index] = !padSyncState[index]; 
     updatePadVisuals(index);
+    document.dispatchEvent(new CustomEvent('ug:dataChanged'));
 }
 
 export function createPadGrid(): void {
     if (!padGrid) return;
+    if (padGrid.children.length > 0) return; // Guard: prevent duplicate grid on hot reload
     padGrid.innerHTML = '';
     for (let i = 0; i < 16; i++) {
         const wrapper = renderPad(i);
@@ -211,6 +426,7 @@ function renderPad(index: number, existing?: HTMLElement): HTMLElement {
         const currentKey = state.padKeyMap[index] || "?";
         wrapper.innerHTML = `
             <div class="pad" data-key="${currentKey}" role="button" aria-pressed="false" tabindex="0">
+                <canvas class="pad-canvas"></canvas>
                 <span>${currentKey.toUpperCase()}</span>
                 <div class="rec-btn" title="Hold to Record"></div>
             </div>
@@ -240,6 +456,80 @@ function renderPad(index: number, existing?: HTMLElement): HTMLElement {
             const currentVoice = activeVoices[index];
             if (currentVoice) currentVoice.gain.gain.setValueAtTime(padVolumes[index], audioCtx.currentTime);
         });
+
+        // === WAVEFORM LOOP POINT EDITING ===
+        const canvas = wrapper.querySelector('.pad-canvas') as HTMLCanvasElement;
+        if (canvas) {
+            // Shift+click toggles loop start at nearest beat
+            // Ctrl+click toggles loop end at nearest beat
+            canvas.addEventListener('click', (e) => {
+                try {
+                    const buf = padBuffers[index];
+                    if (!buf) return;
+                    const duration = buf.duration;
+                    if (!duration) return;
+                    
+                    const rect = canvas.getBoundingClientRect();
+                    if (rect.width <= 0) return; // Guard against zero-width canvas
+                    const frac = (e.clientX - rect.left) / rect.width;
+                    const clickTime = frac * duration;
+                    
+                    // Snap to nearest beat if available
+                    const beats = padBeatPositions[index];
+                    let snappedTime = clickTime;
+                    if (beats && beats.length > 0) {
+                        let nearest = beats[0];
+                        let minDist = Math.abs(clickTime - nearest);
+                        for (let i = 1; i < beats.length; i++) {
+                            const dist = Math.abs(clickTime - beats[i]);
+                            if (dist < minDist) { minDist = dist; nearest = beats[i]; }
+                        }
+                        snappedTime = nearest;
+                    }
+                    
+                    if (e.shiftKey) {
+                        // Set loop start, snap to nearest beat
+                        padLoopStart[index] = snappedTime;
+                        // If loop end isn't set, default to end of sample
+                        if (padLoopEnd[index] < 0 || padLoopEnd[index] <= snappedTime) {
+                            padLoopEnd[index] = duration;
+                        }
+                        toast.success(`LOOP START: ${snappedTime.toFixed(2)}s`);
+                    } else if (e.ctrlKey || e.metaKey) {
+                        // Set loop end, snap to nearest beat
+                        padLoopEnd[index] = snappedTime;
+                        if (padLoopStart[index] < 0 || padLoopStart[index] >= snappedTime) {
+                            padLoopStart[index] = 0;
+                        }
+                        toast.success(`LOOP END: ${snappedTime.toFixed(2)}s`);
+                    } else if (e.altKey) {
+                        // Alt+click = clear loop points
+                        padLoopStart[index] = -1;
+                        padLoopEnd[index] = -1;
+                        toast.info("LOOP CLEARED");
+                    } else {
+                        // Regular click: set BOTH start and end around nearest beat to make a 1-bar loop
+                        if (padBPMs[index] > 0) {
+                            const beatSec = 60 / padBPMs[index];
+                            const barSec = beatSec * 4; // 4 beats = 1 bar
+                            // Snap start down to the bar boundary
+                            const startBeat = Math.floor(snappedTime / barSec) * barSec;
+                            padLoopStart[index] = startBeat;
+                            padLoopEnd[index] = startBeat + barSec;
+                            toast.success(`1-BAR LOOP: ${startBeat.toFixed(2)}s - ${(startBeat + barSec).toFixed(2)}s`);
+                        } else {
+                            // No BPM: set region from 0 to clickTime
+                            padLoopStart[index] = 0;
+                            padLoopEnd[index] = snappedTime;
+                            toast.success(`LOOP: 0s - ${snappedTime.toFixed(2)}s`);
+                        }
+                    }
+                    renderWaveform(index);
+                } catch (err) {
+                    logger.error(`[Sampler] Canvas click handler error for pad ${index}:`, err);
+                }
+            });
+        }
     }
 
     const pad = wrapper.querySelector('.pad') as HTMLElement;

@@ -28,6 +28,7 @@ contextBridge.exposeInMainWorld('fileSystem', {
 contextBridge.exposeInMainWorld('sonetra', {
   startServer: () => ipcRenderer.invoke('sonetra:start-server'),
   stopServer: () => ipcRenderer.invoke('sonetra:stop-server'),
+  restartServer: () => ipcRenderer.invoke('sonetra:restart-server'),
   getStatus: () => ipcRenderer.invoke('sonetra:get-status'),
   createTransition: (track1Path: string, track2Path: string, style: string) => 
     ipcRenderer.invoke('sonetra:create-transition', track1Path, track2Path, style),
@@ -36,7 +37,11 @@ contextBridge.exposeInMainWorld('sonetra', {
   getCachedTransition: (track1Path: string, track2Path: string) => 
     ipcRenderer.invoke('sonetra:get-cached-transition', track1Path, track2Path),
   precomputeTransition: (track1Path: string, track2Path: string) =>
-    ipcRenderer.invoke('sonetra:precompute-transition', track1Path, track2Path)
+    ipcRenderer.invoke('sonetra:precompute-transition', track1Path, track2Path),
+  // Listen for restart/status events from main process
+  onRestartStatus: (callback: (status: any) => void) => {
+    ipcRenderer.on('sonetra:restart-status', (_event, status) => callback(status));
+  }
 });
 // Database Bridge
 contextBridge.exposeInMainWorld('database', {

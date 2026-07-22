@@ -1,5 +1,4 @@
 // === PLAYER MODULE ===
-import { BPM_DETECTION_THRESHOLD, BPM_MIN_STEP_SECONDS } from './constants';
 import { audioCtx, resumeAudioContext, masterGain } from './audio';
 import { settings } from './settings';
 import { state, Track, PlaybackMode, LoopMode } from './state';
@@ -7,7 +6,8 @@ import { detectBPMWorker } from './worker-client';
 import { toast } from './toast';
 import { engine } from './audio-engine';
 import { logger } from './logger';
-import { WaveformRenderer } from './waveform-engine';
+import { normalizeToArrayBuffer } from './utils';
+import './types';
 
 interface PlayerDeps {
     renderPlaylist: () => void;
@@ -35,24 +35,13 @@ function revokeLater(url: string, delay = 5000): void {
 
 async function getSafeUrl(filePath: string, isMain: boolean): Promise<string> {
     try {
-        const rawData = await (window as any).fileSystem.readFile(filePath);
+        const rawData = await window.fileSystem.readFile(filePath);
         if (!rawData) {
             logger.warn(`[SafeURL] File unreadable: ${filePath}`);
             return filePath;
         }
         
-        // IPC Buffer Alignment Fix - Robust implementation
-        let arrayBuffer: ArrayBuffer;
-        if (rawData instanceof ArrayBuffer) {
-            arrayBuffer = rawData.slice(0);
-        } else if (rawData.buffer instanceof ArrayBuffer) {
-            // It's a typed array or Buffer
-            arrayBuffer = rawData.buffer.slice(rawData.byteOffset, rawData.byteOffset + rawData.byteLength);
-        } else {
-            // Fallback for objects that might look like buffers but aren't
-            arrayBuffer = Uint8Array.from(rawData).buffer;
-        }
-
+        const arrayBuffer = normalizeToArrayBuffer(rawData);
         const blob = new Blob([arrayBuffer], { type: 'audio/mpeg' });
         const url = URL.createObjectURL(blob);
         
@@ -75,6 +64,7 @@ let isDraggingProgress = false;
 let playPauseBtn: HTMLElement | null = null;
 let stopBtn: HTMLElement | null = null;
 let trackTitle: HTMLElement | null = null;
+let trackSpinner: HTMLElement | null = null;
 let progressBar: HTMLInputElement | null = null;
 let timeDisplay: HTMLElement | null = null;
 let totalTimeDisplay: HTMLElement | null = null;
@@ -83,10 +73,12 @@ let tempoVal: HTMLElement | null = null;
 let autoMixBtn: HTMLElement | null = null;
 let masterVol: HTMLInputElement | null = null;
 let volKnob: HTMLElement | null = null;
-let waveformRenderer: WaveformRenderer | null = null;
 
 let renderPlaylistFn: (() => void) | null = null;
 let setBlendingIndexFn: ((index: number) => void) | null = null;
+
+// Cancellation token for loadTrack race condition
+let _loadTrackId = 0;
 
 // UI Helper for Confirmation
 export function showConfirm(title: string, message: string, onYes: () => void): void {
@@ -126,6 +118,7 @@ export function initPlayer(deps: PlayerDeps): void {
     playPauseBtn = document.getElementById('playPauseBtn');
     stopBtn = document.getElementById('stopBtn');
     trackTitle = document.getElementById('trackTitle');
+    trackSpinner = document.getElementById('trackSpinner');
     progressBar = document.getElementById('progressBar') as HTMLInputElement;
     timeDisplay = document.getElementById('currentTime');
     totalTimeDisplay = document.getElementById('totalTime');
@@ -137,12 +130,16 @@ export function initPlayer(deps: PlayerDeps): void {
     
     // === REACTIVE SUBSCRIPTIONS ===
     state.subscribe('isPlaying', (playing) => {
-        if (playPauseBtn) playPauseBtn.innerText = playing ? "PAUSE" : "PLAY";
+        if (playPauseBtn) {
+            playPauseBtn.innerText = playing ? "PAUSE" : "PLAY";
+            playPauseBtn.setAttribute('aria-pressed', String(playing));
+        }
     });
 
     state.subscribe('isAutoMixEnabled', (enabled) => {
         if (autoMixBtn) {
             autoMixBtn.classList.toggle('active', enabled);
+            autoMixBtn.setAttribute('aria-pressed', String(enabled));
         }
     });
 
@@ -150,16 +147,10 @@ export function initPlayer(deps: PlayerDeps): void {
         const loopBtn = document.getElementById('loopBtn');
         if (loopBtn) {
             loopBtn.classList.toggle('active-loop', mode !== 'off');
+            loopBtn.setAttribute('aria-pressed', String(mode !== 'off'));
         }
         engine.main.audio.loop = (mode === 'one');
     });
-
-    const wfCanvas = document.getElementById('waveformCanvas') as HTMLCanvasElement;
-    if (wfCanvas) {
-        waveformRenderer = new WaveformRenderer(wfCanvas);
-        waveformRenderer.resize();
-        window.addEventListener('resize', () => waveformRenderer?.resize());
-    }
 
     setupPlayerHandlers();
 }
@@ -201,42 +192,53 @@ export async function loadTrack(index: number): Promise<void> {
         trackTitle.innerText = hasBpm ? `${track.name} [${track.bpm}bpm]` : track.name;
     }
 
+    // Cancellation guard: if loadTrack is called again before this finishes, skip stale results
+    const loadId = ++_loadTrackId;
+
+    // Show spinner during async load (decoding + BPM analysis)
+    if (trackSpinner) trackSpinner.classList.add('active');
+
     // Single-pass high-performance decoding
     (async () => {
         try {
-            const rawData = await (window as any).fileSystem.readFile(track.path);
-            
-            // Robust buffer alignment
-            let arrayBuffer: ArrayBuffer;
-            if (rawData instanceof ArrayBuffer) {
-                arrayBuffer = rawData.slice(0);
-            } else if (rawData.buffer instanceof ArrayBuffer) {
-                arrayBuffer = rawData.buffer.slice(rawData.byteOffset, rawData.byteOffset + rawData.byteLength);
-            } else {
-                arrayBuffer = Uint8Array.from(rawData).buffer;
+            const rawData = await window.fileSystem.readFile(track.path);
+            if (_loadTrackId !== loadId) {
+                hideSpinnerIfCurrent(loadId, index);
+                return; // cancelled by newer loadTrack call
             }
+            
+            const arrayBuffer = normalizeToArrayBuffer(rawData);
             
             // Use native decoder (reliable)
             const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-            
-            // 1. Update Waveform
-            if (waveformRenderer) waveformRenderer.setWaveform(audioBuffer.getChannelData(0));
+            if (_loadTrackId !== loadId) {
+                hideSpinnerIfCurrent(loadId, index);
+                return; // cancelled
+            }
 
-            // 2. Detect BPM if missing
+            // 1. Detect BPM if missing
             if (!hasBpm) {
                 const detectedValue = await detectBPMWorker(audioBuffer);
+                if (_loadTrackId !== loadId) {
+                    hideSpinnerIfCurrent(loadId, index);
+                    return; // cancelled
+                }
                 track.bpm = detectedValue;
                 state.update({ masterBPM: detectedValue });
                 logger.info(`[Player] Async analysis complete: ${detectedValue} BPM`);
             }
 
-            // 3. Final display update
+            // Hide spinner now that analysis is done
+            hideSpinnerIfCurrent(loadId, index);
+
+            // 2. Final display update
             if (trackTitle && state.currentTrackIndex === index) {
                 const bpmTxt = state.masterBPM > 0 ? ` [${state.masterBPM}bpm]` : "";
                 trackTitle.innerText = `${track.name}${bpmTxt}`;
             }
         } catch (e) {
             logger.warn("[Player] Load/Analysis pipeline issue", e);
+            hideSpinnerIfCurrent(loadId, index);
             // Don't show error to user — just show the track name
             if (trackTitle && state.currentTrackIndex === index) {
                 trackTitle.innerText = track.name;
@@ -251,7 +253,7 @@ function updateControlsLock(locked: boolean): void {
     const lockable = [progressBar, playPauseBtn, stopBtn, nextBtn, prevBtn];
     lockable.forEach(el => {
         if (el) {
-            (el as any).disabled = locked;
+            (el as HTMLButtonElement | HTMLInputElement).disabled = locked;
             el.style.opacity = locked ? '0.5' : '1';
             el.style.cursor = locked ? 'not-allowed' : 'pointer';
             el.style.pointerEvents = locked ? 'none' : 'auto';
@@ -263,6 +265,18 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
     const playlist = state.playlist;
     if (state.isCrossfadeInProgress || !playlist.length) return;
     
+    if (!audioCtx) { // Check if audioCtx is available before resuming
+        toast.error("Audio not available for crossfade. Please refresh the page.");
+        return;
+    }
+    // Check that all audio chain nodes are available
+    const main = engine.main;
+    const cross = engine.crossfade;
+    if (!main.gain || !main.lowEQ || !main.midEQ || !main.highEQ || !main.lpFilter || !main.hpFilter ||
+        !cross.gain || !cross.lowEQ || !cross.midEQ || !cross.highEQ || !cross.lpFilter || !cross.hpFilter) {
+        toast.error("Audio chain not ready. Please restart the app.");
+        return;
+    }
     resumeAudioContext();
     const nextIdx = targetIndex !== null ? targetIndex : ((state.currentTrackIndex + 1) % playlist.length);
     if (playlist[nextIdx].path === engine.main.audio.src && !targetIndex) return; 
@@ -277,10 +291,10 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
     const safeUrl = await getSafeUrl(playlist[nextIdx].path, false);
     engine.crossfade.load(safeUrl);
     
-    engine.crossfade.lowEQ.gain.value = settings.autoMix.eqCrossfade ? -24 : 0;
-    engine.crossfade.midEQ.gain.value = settings.autoMix.eqCrossfade ? -6 : 0;
-    engine.crossfade.gain.gain.value = 0.001;
-    engine.crossfade.audio.playbackRate = engine.main.audio.playbackRate;
+    cross.lowEQ.gain.value = settings.autoMix.eqCrossfade ? -24 : 0;
+    cross.midEQ.gain.value = settings.autoMix.eqCrossfade ? -6 : 0;
+    cross.gain.gain.value = 0.001;
+    cross.audio.playbackRate = engine.main.audio.playbackRate;
 
     try {
         await engine.crossfade.audio.play();
@@ -298,35 +312,35 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
 
     // --- AUTOMATION: OUTGOING (Main) ---
     if (settings.autoMix.eqCrossfade) {
-        engine.main.lowEQ.gain.cancelScheduledValues(now);
-        engine.main.lowEQ.gain.setValueAtTime(0, now);
-        engine.main.lowEQ.gain.linearRampToValueAtTime(-24, now + duration * 0.8);
-        engine.main.midEQ.gain.linearRampToValueAtTime(-12, now + duration);
+        main.lowEQ.gain.cancelScheduledValues(now);
+        main.lowEQ.gain.setValueAtTime(0, now);
+        main.lowEQ.gain.linearRampToValueAtTime(-24, now + duration * 0.8);
+        main.midEQ.gain.linearRampToValueAtTime(-12, now + duration);
     }
     if (settings.autoMix.filterSweep) {
-        engine.main.lpFilter.frequency.cancelScheduledValues(now);
-        engine.main.lpFilter.frequency.setValueAtTime(20000, now);
-        engine.main.lpFilter.frequency.exponentialRampToValueAtTime(600, now + duration);
+        main.lpFilter.frequency.cancelScheduledValues(now);
+        main.lpFilter.frequency.setValueAtTime(20000, now);
+        main.lpFilter.frequency.exponentialRampToValueAtTime(600, now + duration);
     }
-    engine.main.gain.gain.cancelScheduledValues(now);
-    engine.main.gain.gain.setValueAtTime(engine.main.gain.gain.value, now);
-    engine.main.gain.gain.linearRampToValueAtTime(0.001, now + duration);
+    main.gain.gain.cancelScheduledValues(now);
+    main.gain.gain.setValueAtTime(main.gain.gain.value, now);
+    main.gain.gain.linearRampToValueAtTime(0.001, now + duration);
 
     // --- AUTOMATION: INCOMING (Crossfade) ---
     if (settings.autoMix.eqCrossfade) {
-        engine.crossfade.lowEQ.gain.cancelScheduledValues(now);
-        engine.crossfade.lowEQ.gain.setValueAtTime(-24, now);
-        engine.crossfade.lowEQ.gain.linearRampToValueAtTime(0, now + duration * 0.8); 
-        engine.crossfade.midEQ.gain.linearRampToValueAtTime(0, now + duration);
+        cross.lowEQ.gain.cancelScheduledValues(now);
+        cross.lowEQ.gain.setValueAtTime(-24, now);
+        cross.lowEQ.gain.linearRampToValueAtTime(0, now + duration * 0.8); 
+        cross.midEQ.gain.linearRampToValueAtTime(0, now + duration);
     }
     if (settings.autoMix.hpfSweep) {
-        engine.crossfade.hpFilter.frequency.cancelScheduledValues(now);
-        engine.crossfade.hpFilter.frequency.setValueAtTime(2000, now);
-        engine.crossfade.hpFilter.frequency.exponentialRampToValueAtTime(30, now + duration * 0.8);
+        cross.hpFilter.frequency.cancelScheduledValues(now);
+        cross.hpFilter.frequency.setValueAtTime(2000, now);
+        cross.hpFilter.frequency.exponentialRampToValueAtTime(30, now + duration * 0.8);
     }
-    engine.crossfade.gain.gain.cancelScheduledValues(now);
-    engine.crossfade.gain.gain.setValueAtTime(0.001, now);
-    engine.crossfade.gain.gain.linearRampToValueAtTime(1, now + duration);
+    cross.gain.gain.cancelScheduledValues(now);
+    cross.gain.gain.setValueAtTime(0.001, now);
+    cross.gain.gain.linearRampToValueAtTime(1, now + duration);
 
     setTimeout(() => { finishCrossfade(nextIdx); }, duration * 1000);
 }
@@ -358,7 +372,6 @@ function finishCrossfade(nextIndex: number): void {
     if (setBlendingIndexFn) setBlendingIndexFn(-1);
     if (autoMixBtn) autoMixBtn.classList.remove('blending');
     
-    // setupPlayerHandlers(); // DELETED: Redundant and causes listener leaks
     
     if (renderPlaylistFn) renderPlaylistFn();
     if (trackTitle && state.playlist.length > nextIndex) {
@@ -370,6 +383,10 @@ function finishCrossfade(nextIndex: number): void {
 
 export function playTrack(): void {
     if (state.isCrossfadeInProgress || !state.playlist.length || !engine.main.audio) return;
+    if (!audioCtx) { // Check if audioCtx is available
+        toast.error("Audio not available. Please refresh the page.");
+        return;
+    }
     resumeAudioContext();
     engine.main.audio.play().then(() => {
         state.update({ isPlaying: true });
@@ -405,8 +422,6 @@ export function setupPlayerHandlers(): void {
             const progress = (engine.main.audio.currentTime / engine.main.audio.duration) * 100;
             if (progressBar) progressBar.value = progress.toString();
             if (timeDisplay) timeDisplay.innerText = formatTime(engine.main.audio.currentTime);
-            if (waveformRenderer) waveformRenderer.render(engine.main.audio.currentTime / engine.main.audio.duration);
-
             if (state.isAutoMixEnabled && !state.isCrossfadeInProgress && engine.main.audio.duration > settings.autoMix.trackDuration * 2) {
                 if (engine.main.audio.currentTime >= engine.main.audio.duration - settings.autoMix.trackDuration) {
                     startCrossfade();
@@ -507,13 +522,27 @@ export function setupPlayerHandlers(): void {
     if (masterVol) {
         masterVol.oninput = () => {
             const val = parseFloat(masterVol!.value);
-            engine.main.gain.gain.value = 1.0; 
-            masterGain.gain.value = val;
+            if (engine.main.gain) {
+                engine.main.gain.gain.value = 1.0;
+            }
+            if (masterGain) {
+                masterGain.gain.value = val;
+            }
             if (volKnob) {
                 volKnob.innerText = Math.round(val * 100) + '%';
                 volKnob.style.left = `calc(22.5px + (100% - 47px) * ${val})`;
             }
         };
+    }
+}
+
+/**
+ * Hide the track spinner only if the given loadId is still the current one.
+ * Prevents stale async completions from hiding the spinner for a newer loadTrack call.
+ */
+function hideSpinnerIfCurrent(loadId: number, expectedIndex: number): void {
+    if (_loadTrackId === loadId && trackSpinner) {
+        trackSpinner.classList.remove('active');
     }
 }
 

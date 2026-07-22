@@ -1,16 +1,19 @@
 import { audioCtx } from './audio';
-import { state } from './state';
+import { state, AppStateData } from './state';
 import { toast } from './toast';
 import { logger } from './logger';
+
+const MIDI_MAPPINGS_STORAGE_KEY = 'ug_midi_mappings';
 
 interface MidiDeps {
     startPad: (pad: number) => void;
     stopPad: (pad: number) => void;
-    activeVoices: Record<number, any>;
+    activeVoices: Record<number, { source: AudioBufferSourceNode; gain: GainNode } | null>;
     padVolumes: number[];
 }
 
 let selectedMidiId = 'all';
+let selectedMidiName = '';
 let midiDeviceSelect: HTMLSelectElement | null = null;
 let midiStatusEl: HTMLElement | null = null;
 
@@ -18,6 +21,62 @@ let startPadFn: ((pad: number) => void) | null = null;
 let stopPadFn: ((pad: number) => void) | null = null;
 let activeVoicesRef: Record<number, any> | null = null;
 let padVolumesRef: number[] | null = null;
+
+// --- MIDI Mapping Persistence ---
+
+function saveMidiMappings(): void {
+    try {
+        const data = {
+            padMidiMap: state.padMidiMap,
+            padKeyMap: state.padKeyMap,
+            controlMidiMap: state.controlMidiMap,
+        };
+        localStorage.setItem(MIDI_MAPPINGS_STORAGE_KEY, JSON.stringify(data));
+    } catch (e) {
+        logger.warn('[MIDI] Failed to persist mappings', e);
+    }
+}
+
+function loadMidiMappings(): void {
+    try {
+        const saved = localStorage.getItem(MIDI_MAPPINGS_STORAGE_KEY);
+        if (!saved) return;
+        const data = JSON.parse(saved);
+        const patch: Partial<AppStateData> = {};
+        if (data.padMidiMap && typeof data.padMidiMap === 'object') {
+            patch.padMidiMap = data.padMidiMap;
+        }
+        if (Array.isArray(data.padKeyMap) && data.padKeyMap.length === 16) {
+            patch.padKeyMap = data.padKeyMap;
+        }
+        if (data.controlMidiMap && typeof data.controlMidiMap === 'object') {
+            patch.controlMidiMap = data.controlMidiMap;
+        }
+        if (Object.keys(patch).length > 0) {
+            state.update(patch);
+            logger.info('[MIDI] Restored saved mappings');
+        }
+    } catch (e) {
+        logger.warn('[MIDI] Failed to load saved mappings', e);
+    }
+}
+
+// Auto-save whenever any mapping changes
+let _mappingUnsubs: (() => void)[] | null = null;
+
+function subscribeMappingAutoSave(): void {
+    // Clean up previous subscriptions if any
+    if (_mappingUnsubs) {
+        _mappingUnsubs.forEach(fn => fn());
+    }
+    _mappingUnsubs = [
+        state.subscribe('padMidiMap', saveMidiMappings),
+        state.subscribe('padKeyMap', saveMidiMappings),
+        state.subscribe('controlMidiMap', saveMidiMappings),
+    ];
+}
+
+// ---
 
 export function initMIDI(deps: MidiDeps): void {
     startPadFn = deps.startPad;
@@ -32,8 +91,14 @@ export function initMIDI(deps: MidiDeps): void {
         midiDeviceSelect.addEventListener('change', (e) => {
             const target = e.target as HTMLSelectElement;
             selectedMidiId = target.value;
+            selectedMidiName = target.options[target.selectedIndex]?.text || '';
         });
     }
+
+    // Restore persisted mappings
+    loadMidiMappings();
+    // Auto-save on future changes
+    subscribeMappingAutoSave();
 }
 
 export function enableMIDI(): void {
@@ -62,13 +127,22 @@ function updateMidiStatus(midiAccess: WebMidi.MIDIAccess): void {
     if (!midiDeviceSelect || !midiStatusEl) return;
     midiDeviceSelect.innerHTML = '<option value="all">ALL INPUTS (Default)</option>';
     let deviceCount = 0;
+    let foundSelected = false;
     for (const input of midiAccess.inputs.values()) {
         const option = document.createElement('option');
         option.value = input.id;
         option.text = input.name || `MIDI Device ${input.id}`;
-        if (input.id === selectedMidiId) option.selected = true;
+        // Try matching by ID first, then by name (handles device re-pairing)
+        if (input.id === selectedMidiId || (selectedMidiName && input.name === selectedMidiName)) {
+            option.selected = true;
+            foundSelected = true;
+        }
         midiDeviceSelect.appendChild(option);
         deviceCount++;
+    }
+    if (foundSelected && selectedMidiId !== 'all') {
+        // Update the stored ID in case it changed but name matched
+        selectedMidiId = midiDeviceSelect.value;
     }
     if (deviceCount > 0) {
         midiStatusEl.innerText = `MIDI: ON (${deviceCount})`;

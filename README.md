@@ -1,13 +1,9 @@
-# GANGSTA PLAYER PRO
+# GANGSTA PLAYER PRO 3
 
-![Main Interface Placeholder](https://via.placeholder.com/800x450?text=Gangsta+Player+Pro+Main+UI)
+![Main Interface Placeholder](https://via.placeholder.com/800x450?text=Gangsta+Player+Pro+3+Main+UI)
 ![Sampler Pads View](https://via.placeholder.com/400x300?text=16-Pad+Sampler+View)
-![Settings Panel](https://via.placeholder.com/400x300?text=Settings+&+Customization)
-*The ultimate ghetto-tech sampler for the streets.*
-
-## 💀 ABOUT DA SOFTWARE
-
-This is the ultimate **ghetto-tech sampler and tape deck** for the streets. **Gangsta Player Pro 3** turns your PC into a beat-making, chopper-screwing powerhouse. Whether you're laying down tracks or just slowing down the classics, this tool has the grit you need. It also works flawlessly as a basic music audio player for your daily listening.
+![Settings Panel](https://via.placeholder.com/400x300?text=Settings+%26+Automation)
+*The ultimate ghetto-tech sampler, tape deck, and DJ mixing application.*
 
 ---
 
@@ -15,12 +11,12 @@ This is the ultimate **ghetto-tech sampler and tape deck** for the streets. **Ga
 
 ### 🎹 16-PAD SAMPLER
 
-- **Drag & Drop:** Drop any audio file onto a pad to load it.
+- **Drag & Drop:** Drop any audio file onto a pad to load it instantly.
 - **Click to Load:** Click an empty pad to open a file browser.
 - **Hold to Play:** Hold the mouse button (or keyboard key) on a loaded pad to play it — release to stop.
-- **Keyboard Mapped:** Play pads with your keyboard (1-4, Q-R, A-F, Z-V).
+- **Keyboard Mapped:** Play pads with your keyboard (`1-4`, `Q-R`, `A-F`, `Z-V`).
 - **MIDI Support:** Plug in your MIDI controller and start finger drumming instantly.
-- **Pad Recording:** Hold `CTRL + Pad Key` or click the small [REC] button to record directly from your mic.
+- **Pad Recording:** Hold `CTRL + Pad Key` or click the small `[REC]` button to record directly from your mic.
 - **BPM Detection:** Each loaded pad auto-detects its BPM for sync.
 - **Right-Click Menu:**
   - **LOAD SAMPLE** — Browse and load an audio file.
@@ -45,12 +41,22 @@ This is the ultimate **ghetto-tech sampler and tape deck** for the streets. **Ga
 - **BPM Sync:** Matches the tempo of the next song to the current one for seamless mixing.
 - **Auto-Cruise:** Just hit "MIX" and let it flow using proper crossfades.
 - **Fast Mix:** Hit Next/Prev buttons (`>|` or `|<`) for a fast 4-second DJ cut.
+- **Transport Lock:** All transport controls are locked during crossfade blending for stability.
 - **Customizable:** Open Settings (`⚙️`) to toggle effects and customize fade durations.
 
 ### 🎙️ STUDIO RECORDING
 
 - **Master Rec:** Hit the big RED button to record your **entire performance** (beats + music) to a high-quality `.wav` file.
 - **Visualizer:** 16-band frequency analyzer with "Scanner" LED rack.
+- **AudioWorklet Capture:** Zero-latency PCM capture via dedicated AudioWorkletProcessor.
+
+### 🛡️ SECURITY & RELIABILITY
+
+- **Path Validation:** All file I/O hardened against directory traversal and null-byte injection.
+- **Crash Recovery:** Persistent auto-save snapshots every 30s with post-mortem diagnostic reports.
+- **Event Listener Discipline:** `Disposable` utility class prevents listener leaks in dynamic components.
+- **Audio Signature Validation:** Magic-number verification ensures only valid WAV/MP3/OGG/FLAC files are loaded.
+- **Worklet Race Protection:** Retry logic for AudioWorklet initialization prevents silent engine startup failures.
 
 ---
 
@@ -72,7 +78,7 @@ This is the ultimate **ghetto-tech sampler and tape deck** for the streets. **Ga
 | **Navigate Down** | `↓` (Down Arrow) |
 | **Navigate Up** | `↑` (Up Arrow) |
 | **Multi-Select (Extend)** | `SHIFT` + `↑` / `↓` |
-| **Delete Selected Track(s)** | `DELETE` |
+| **Delete Selected Track(s)** | `DELETE` / `BACKSPACE` |
 
 ### Sampler Pads
 
@@ -88,6 +94,7 @@ This is the ultimate **ghetto-tech sampler and tape deck** for the streets. **Ga
 | **Master Volume** | Slick Knob Slider |
 | **Tempo/Speed** | Chopper & Screwer Slider |
 | **Settings** | `⚙️` Button |
+| **Close Modal / Context Menu** | `ESC` |
 
 ---
 
@@ -138,6 +145,16 @@ This is the ultimate **ghetto-tech sampler and tape deck** for the streets. **Ga
 
 ---
 
+## 🛡️ Security & Reliability
+
+- **Sandboxed File I/O**: The renderer process can only write files to paths returned by native OS save dialogs or to the app's `userData` directory. All file paths are validated for traversal attacks and null-byte injection.
+- **Audio Validation**: Incoming audio files are checked for valid magic-number signatures (WAV, MP3, OGG, FLAC) before decoding, preventing non-audio files from crashing the pipeline.
+- **AutoMix Crash Recovery**: The AI mixer server auto-restarts on failure with exponential backoff (max 3 attempts). Python dependencies are auto-installed via `pip install -r sonetra-requirements.txt` when the server starts.
+- **Memory Safety**: Blob URLs are revoked with a delayed "graveyard" mechanism to prevent race conditions during rapid track skipping. All Web Audio nodes and event listeners are explicitly cleaned up via `Disposable` patterns.
+- **Test Coverage**: 77 automated tests covering audio engine, player logic, settings persistence, state management, and utility functions.
+
+---
+
 ## 🛠️ DEVELOPMENT & INSTALLATION
 
 ### Prerequisites
@@ -149,17 +166,42 @@ This is the ultimate **ghetto-tech sampler and tape deck** for the streets. **Ga
 
 ### Setup
 
-1. `git clone https://github.com/coreyshearwater/gangstaplayer-mod.git`
-2. `npm install`
-3. `npm start`
+```bash
+git clone https://github.com/coreyshearwater/ug-gangsta-player-pro-3.git
+npm install
+
+# (Optional) Setup Sonetra AI dependencies:
+npm run setup:sonetra      # macOS/Linux
+npm run setup:sonetra:win  # Windows
+```
+
+### Start Development
+
+```bash
+npm start
+```
 
 ### Production Build
 
 To generate a minified, obfuscated build:
-`node scripts/build.js`
+
+```bash
+node scripts/build.js --prod
+```
 
 To bundle into an installer:
-`npm run dist`
+
+```bash
+npm run dist
+```
+
+### Testing
+
+```bash
+npm test
+```
+
+Runs the Jest test suite (77+ tests across 6 test files).
 
 ---
 

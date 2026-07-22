@@ -25,11 +25,30 @@ export interface FileSystemAPI {
     getLogPath(): Promise<string>;
 }
 
+export interface SonetraAPI {
+    startServer(): Promise<{ success: boolean; error?: string }>;
+    stopServer(): Promise<{ success: boolean }>;
+    getStatus(): Promise<{ isRunning: boolean; port?: number; sonetraPath?: string; error?: string }>;
+    createTransition(track1Path: string, track2Path: string, style: string): Promise<{ success: boolean; audioBuffer?: any; error?: string }>;
+    analyzeTrack(trackPath: string): Promise<any>;
+    getCachedTransition(track1Path: string, track2Path: string): Promise<{ success: boolean; audioBuffer?: any; error?: string }>;
+    precomputeTransition(track1Path: string, track2Path: string): Promise<{ success: boolean; cached?: boolean; error?: string }>;
+}
+
+export interface DatabaseAPI {
+    upsertTrack(track: any): Promise<any>;
+    getTrack(path: string): Promise<any>;
+    searchTracks(query: string): Promise<any[]>;
+    getAllTracks(): Promise<any[]>;
+}
+
 // === Global Window Augmentation ===
 declare global {
     interface Window {
         electronAPI: ElectronAPI;
         fileSystem: FileSystemAPI;
+        sonetra: SonetraAPI;
+        database: DatabaseAPI;
     }
 }
 

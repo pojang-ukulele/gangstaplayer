@@ -1,4 +1,5 @@
-import { audioCtx, bufferToWave } from './audio';
+import { audioCtx } from './audio';
+import { bufferToWaveWorker } from './worker-client';
 import { logger } from './logger';
 
 export class HighFidelityRecorder {
@@ -50,17 +51,25 @@ export class HighFidelityRecorder {
         const blockSize = this.chunks[0][0].length;
         const totalLength = this.chunks.length * blockSize;
 
-        const audioBuffer = audioCtx.createBuffer(numChannels, totalLength, audioCtx.sampleRate);
-
+        // Build interleaved Float32Array per channel directly from raw chunks
+        const channels: Float32Array[] = [];
         for (let channel = 0; channel < numChannels; channel++) {
-            const channelData = audioBuffer.getChannelData(channel);
+            const channelData = new Float32Array(totalLength);
             for (let i = 0; i < this.chunks.length; i++) {
                 channelData.set(this.chunks[i][channel], i * blockSize);
             }
+            channels.push(channelData);
         }
 
-        // Use our existing worker-based WAV converter
-        return await bufferToWave(audioBuffer);
+        // Build a minimal AudioBuffer-like object for the worker (avoids AudioBuffer + round-trip)
+        const bufferLike = {
+            numberOfChannels: numChannels,
+            sampleRate: audioCtx.sampleRate,
+            channels
+        };
+
+        // Send directly to worker — skip AudioBuffer creation on main thread
+        return await bufferToWaveWorker(bufferLike, totalLength);
     }
 
     dispose(): void {

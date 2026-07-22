@@ -3,33 +3,6 @@
  * Optimized for high-frequency audio application updates.
  */
 
-export interface Component<T = any> {
-    element: HTMLElement;
-    update(props: T): void;
-    dispose?(): void;
-}
-
-/**
- * Creates a reactive element that updates only when specific state keys change
- */
-export function createReactiveElement<T>(
-    tagName: string,
-    state: any,
-    keys: string[],
-    render: (props: T) => void
-): HTMLElement {
-    const el = document.createElement(tagName);
-    
-    const update = () => {
-        render(state);
-    };
-
-    keys.forEach(key => state.subscribe(key, update));
-    update();
-
-    return el;
-}
-
 /**
  * Virtual Scroller Engine
  * Only renders what is visible.
@@ -42,6 +15,8 @@ export class VirtualScroller<T> {
     private overflowEl: HTMLElement;
     private contentEl: HTMLElement;
     private visibleItems: Map<number, HTMLElement> = new Map();
+    private disposables: Map<number, () => void> = new Map();
+    private _onScroll: () => void;
 
     constructor(options: {
         container: HTMLElement;
@@ -79,7 +54,8 @@ export class VirtualScroller<T> {
         this.container.appendChild(this.overflowEl);
         this.container.appendChild(this.contentEl);
 
-        this.container.addEventListener('scroll', () => this.refresh());
+        this._onScroll = () => this.refresh();
+        this.container.addEventListener('scroll', this._onScroll);
         this.updateItems(this.items);
     }
 
@@ -98,6 +74,9 @@ export class VirtualScroller<T> {
         // Remove items no longer visible
         for (const [idx, el] of this.visibleItems) {
             if (idx < startIdx || idx > endIdx || idx >= this.items.length) {
+                // Clean up row-level disposables before removing the element
+                const dispose = this.disposables.get(idx);
+                if (dispose) { try { dispose(); } catch { /* ignore */ } this.disposables.delete(idx); }
                 el.remove();
                 this.visibleItems.delete(idx);
             } else if (force) {
@@ -122,5 +101,24 @@ export class VirtualScroller<T> {
 
     public scrollTo(index: number) {
         this.container.scrollTop = index * this.itemHeight;
+    }
+
+    /**
+     * Register a cleanup callback for a visible row index.
+     * Called automatically when the row scrolls out of view.
+     */
+    public registerDisposable(index: number, cleanup: () => void): void {
+        this.disposables.set(index, cleanup);
+    }
+
+    /** Destroy the scroller — cleans up all disposables and DOM. */
+    public destroy(): void {
+        this.container.removeEventListener('scroll', this._onScroll);
+        for (const [, cleanup] of this.disposables) {
+            try { cleanup(); } catch { /* ignore */ }
+        }
+        this.disposables.clear();
+        this.visibleItems.clear();
+        this.container.innerHTML = '';
     }
 }

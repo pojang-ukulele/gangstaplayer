@@ -1,8 +1,9 @@
-import { DRAG_THRESHOLD_PX } from './constants';
 import { audioCtx } from './audio';
 import { detectBPMWorker } from './worker-client';
 import { state, Track } from './state';
 import { VirtualScroller } from './reactive/ui';
+import { normalizeToArrayBuffer } from './utils';
+import './types';
 
 interface PlaylistDeps {
     loadTrack: (index: number) => Promise<void>;
@@ -13,7 +14,6 @@ let anchorIndex = -1;
 let pivotIndex = -1; // Start of selection range
 let draggedIndex = -1;
 let isDragging = false;
-let dragStartY = 0;
 
 let playlistEl: HTMLElement | null = null;
 let playlistInput: HTMLInputElement | null = null;
@@ -33,7 +33,7 @@ export function initPlaylist(deps: PlaylistDeps): void {
     const searchInput = document.getElementById('playlistSearch') as HTMLInputElement;
 
     // === INITIAL LOAD FROM DB ===
-    const db = (window as any).database;
+    const db = window.database;
     if (db) {
         db.getAllTracks().then((tracks: Track[]) => {
             if (tracks && tracks.length > 0) {
@@ -88,7 +88,7 @@ export function setBlendingIndex(index: number): void {
  */
 async function analyzeTrackInBackground(track: Track): Promise<void> {
     try {
-        const db = (window as any).database;
+        const db = window.database;
         
         // 1. Check DB Cache first
         if (db) {
@@ -101,22 +101,14 @@ async function analyzeTrackInBackground(track: Track): Promise<void> {
             }
         }
 
-        const rawData = await (window as any).fileSystem.readFile(track.path);
+        const rawData = await window.fileSystem.readFile(track.path);
         if (!rawData) {
             console.warn(`[Playlist] Analysis skipped for ${track.name} (File unreadable)`);
             return;
         }
 
 
-        // Robust buffer alignment (IPC returns varying types)
-        let arrayBuffer: ArrayBuffer;
-        if (rawData instanceof ArrayBuffer) {
-            arrayBuffer = rawData.slice(0);
-        } else if (rawData.buffer instanceof ArrayBuffer) {
-            arrayBuffer = rawData.buffer.slice(rawData.byteOffset, rawData.byteOffset + rawData.byteLength);
-        } else {
-            arrayBuffer = Uint8Array.from(rawData).buffer;
-        }
+        const arrayBuffer = normalizeToArrayBuffer(rawData);
         
         // Use native decoder (decoder pool workers are unreliable)
         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
@@ -149,9 +141,9 @@ export function addTracksToPlaylist(files: File[]): void {
     const currentPlaylist = [...state.playlist];
     const startIdx = currentPlaylist.length;
     files.forEach((file) => {
-        const fullPath = (window as any).electronAPI.getPathForFile(file);
+        const fullPath = window.electronAPI.getPathForFile(file);
         const track: Track = { 
-            id: Math.random().toString(36).substr(2, 9),
+            id: crypto.randomUUID(),
             name: file.name, 
             path: fullPath, 
             duration: 0, 
@@ -160,7 +152,7 @@ export function addTracksToPlaylist(files: File[]): void {
         currentPlaylist.push(track);
         
         // Instant DB Indexing (metadata comes later via analysis)
-        const db = (window as any).database;
+        const db = window.database;
         if (db) {
             db.upsertTrack({
                 id: track.id,
@@ -249,11 +241,80 @@ function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HT
             }
         });
 
-        li.addEventListener('mousedown', (e) => {
-            if (e.button === 0) { 
-                draggedIndex = parseInt(li.dataset.index || "0"); 
-                dragStartY = e.clientY; 
-            } 
+        li.draggable = true;
+
+        li.addEventListener('dragstart', (e) => {
+            const idx = parseInt(li.dataset.index || "-1");
+            if (idx < 0) { e.preventDefault(); return; }
+            isDragging = true;
+            draggedIndex = idx;
+            if (e.dataTransfer) {
+                e.dataTransfer.effectAllowed = 'move';
+                e.dataTransfer.setData('text/plain', idx.toString());
+            }
+            li.classList.add('dragging');
+        });
+
+        li.addEventListener('dragend', () => {
+            isDragging = false;
+            draggedIndex = -1;
+            li.classList.remove('dragging');
+            // Clear all drop indicators on every visible item
+            if (playlistEl) {
+                playlistEl.querySelectorAll('.drop-above, .drop-below').forEach(el => {
+                    el.classList.remove('drop-above', 'drop-below');
+                });
+            }
+        });
+
+        li.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            if (!isDragging) return;
+            if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+            
+            const targetIdx = parseInt(li.dataset.index || "-1");
+            if (targetIdx === draggedIndex) return;
+            
+            // Determine if dropping above or below
+            const rect = li.getBoundingClientRect();
+            const midY = rect.top + rect.height / 2;
+            
+            li.classList.remove('drop-above', 'drop-below');
+            if (e.clientY < midY) {
+                li.classList.add('drop-above');
+            } else {
+                li.classList.add('drop-below');
+            }
+        });
+
+        li.addEventListener('dragleave', () => {
+            li.classList.remove('drop-above', 'drop-below');
+        });
+
+        li.addEventListener('drop', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (!isDragging || draggedIndex < 0) return;
+            
+            const targetIdx = parseInt(li.dataset.index || "-1");
+            if (targetIdx < 0 || targetIdx === draggedIndex) return;
+            
+            // Determine insert position (before or after target)
+            const rect = li.getBoundingClientRect();
+            const midY = rect.top + rect.height / 2;
+            const insertAfter = e.clientY >= midY;
+            
+            reorderPlaylist(draggedIndex, targetIdx, insertAfter);
+            
+            // Clean up
+            isDragging = false;
+            draggedIndex = -1;
+            li.classList.remove('drop-above', 'drop-below');
+            if (playlistEl) {
+                playlistEl.querySelectorAll('.drop-above, .drop-below').forEach(el => {
+                    el.classList.remove('drop-above', 'drop-below');
+                });
+            }
         });
 
         li.addEventListener('contextmenu', (e) => {
@@ -294,6 +355,57 @@ function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HT
 
 export function renderPlaylist(): void {
     if (vScroller) vScroller.refresh(true);
+}
+
+/**
+ * Reorder the playlist by moving an item from `fromIndex` to `toIndex`.
+ * If `insertAfter` is true, the item is placed after `toIndex` instead of before it.
+ * Updates selection indices to follow the moved item.
+ */
+function reorderPlaylist(fromIndex: number, toIndex: number, insertAfter: boolean): void {
+    const playlist = [...state.playlist];
+    if (fromIndex < 0 || fromIndex >= playlist.length) return;
+    if (toIndex < 0 || toIndex >= playlist.length) return;
+    if (fromIndex === toIndex) return;
+
+    const [moved] = playlist.splice(fromIndex, 1);
+    let target = toIndex;
+    // If we removed from before target, target shifts back by one
+    if (fromIndex < target) target--;
+    if (insertAfter) target++;
+    target = Math.min(target, playlist.length);
+    playlist.splice(target, 0, moved);
+
+    // Adjust selection: follow the moved item
+    const newSelected = state.selectedIndices.map(idx => {
+        if (idx === fromIndex) {
+            // The moved item — goes to new position
+            return target;
+        }
+        // Adjust indices that shifted
+        if (fromIndex < target) {
+            // Item moved forward: indices between fromIndex and target-1 shift left
+            if (idx > fromIndex && idx < target) return idx - 1;
+        } else {
+            // Item moved backward: indices between target and fromIndex-1 shift right
+            if (idx >= target && idx < fromIndex) return idx + 1;
+        }
+        return idx;
+    });
+
+    // Adjust anchor/pivot
+    if (anchorIndex === fromIndex) anchorIndex = target;
+    else if (fromIndex < target && anchorIndex > fromIndex && anchorIndex < target) anchorIndex--;
+    else if (fromIndex > target && anchorIndex >= target && anchorIndex < fromIndex) anchorIndex++;
+
+    if (pivotIndex === fromIndex) pivotIndex = target;
+    else if (fromIndex < target && pivotIndex > fromIndex && pivotIndex < target) pivotIndex--;
+    else if (fromIndex > target && pivotIndex >= target && pivotIndex < fromIndex) pivotIndex++;
+
+    state.update({
+        playlist,
+        selectedIndices: newSelected,
+    });
 }
 
 // === NEW: KEYBOARD NAVIGATION ===
@@ -401,7 +513,7 @@ export function setupPlaylistHandlers(): void {
             }
         });
 
-        // DRAG & DROP
+        // DRAG & DROP (external files)
         playlistEl.addEventListener('dragover', (e) => {
             e.preventDefault();
             e.stopPropagation();
@@ -418,6 +530,20 @@ export function setupPlaylistHandlers(): void {
             e.preventDefault();
             e.stopPropagation();
             if (playlistEl) playlistEl.classList.remove('drag-over');
+            
+            // Internal reorder drop (handled by li.drop) — skip if already handled
+            if (isDragging && draggedIndex >= 0) {
+                // Dropped on empty area — append to end
+                const idx = state.playlist.length - 1;
+                if (draggedIndex !== idx) {
+                    reorderPlaylist(draggedIndex, idx, true);
+                }
+                isDragging = false;
+                draggedIndex = -1;
+                return;
+            }
+
+            // External file drop
             if (e.dataTransfer && e.dataTransfer.files.length > 0) {
                 addTracksToPlaylist(Array.from(e.dataTransfer.files));
             }

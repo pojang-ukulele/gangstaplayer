@@ -19,15 +19,18 @@
         </div>
         <div class="titlebar-right">
             <div class="kit-controls">
-                <button class="kit-btn" id="btnSaveKit">SAVE KIT</button>
-                <button class="kit-btn" id="btnLoadKit">LOAD KIT</button>
+                <button class="kit-btn" id="btnSaveKit" aria-label="Save kit">SAVE KIT</button>
+                <button class="kit-btn" id="btnLoadKit" aria-label="Load kit">LOAD KIT</button>
+                <span class="kit-btn-sep" aria-hidden="true">|</span>
+                <button class="kit-btn" id="btnSaveSession" aria-label="Save session">SAVE SESSION</button>
+                <button class="kit-btn" id="btnLoadSession" aria-label="Load session">LOAD SESSION</button>
             </div>
-            <span id="midiStatus" class="midi-status">MIDI: OFF</span>
+            <span id="midiStatus" class="midi-status" aria-live="polite">MIDI: OFF</span>
             <div class="window-controls">
-                <button class="win-btn settings-btn-large" id="settingsBtn" title="Settings">⚙️</button>
-                <button class="win-btn" id="minBtn">_</button>
-                <button class="win-btn" id="maxBtn" title="Maximize">☐</button>
-                <button class="win-btn close-btn" id="closeBtn">X</button>
+                <button class="win-btn settings-btn-large" id="settingsBtn" title="Settings" aria-label="Open settings">⚙️</button>
+                <button class="win-btn" id="minBtn" aria-label="Minimize window">_</button>
+                <button class="win-btn" id="maxBtn" title="Maximize" aria-label="Maximize window">☐</button>
+                <button class="win-btn close-btn" id="closeBtn" aria-label="Close application">X</button>
             </div>
         </div>
     </div>
@@ -52,62 +55,61 @@
             <div class="led" id="r3"></div>
         </div>
         <div class="sampler-section">
-            <div class="label-text">SAMPLER PADS (DRAG & DROP AUDIO OR CLICK THE PAD)</div>
-            <div class="pad-grid" id="padGrid"></div>
+            <div class="label-text" id="samplerLabel">SAMPLER PADS (DRAG & DROP AUDIO OR CLICK THE PAD)</div>
+            <div class="pad-grid" id="padGrid" role="group" aria-labelledby="samplerLabel"></div>
         </div>
         <div class="player-section">
             <!-- REMOVED: TAPE DECK LABEL -->
             <div class="screen">
-                <canvas id="waveformCanvas" class="waveform-canvas"></canvas>
-                <span id="trackTitle">INSERT TAPE...</span>
-                <!-- BPM merged into trackTitle -->
-                <div class="visualizer" id="visualizer"></div>
+                <span id="trackTitle" aria-live="polite" aria-atomic="true">INSERT TAPE...</span>
+                <span class="track-spinner" id="trackSpinner" role="status" aria-label="Loading"></span>
+                <div class="visualizer" id="visualizer" aria-hidden="true"></div>
             </div>
             <div class="progress-container">
                 <span id="currentTime" class="time-display">0:00</span>
-                <input type="range" class="progress-slider" id="progressBar" value="0" min="0" max="100" step="0.1" title="Track Progress">
+                <input type="range" class="progress-slider" id="progressBar" value="0" min="0" max="100" step="0.1" title="Track Progress" aria-label="Track seek progress" role="slider">
                 <span id="totalTime" class="time-display">0:00</span>
             </div>
-            <div class="transport-controls">
-                <button class="btn" id="prevBtn">|&lt;</button>
-                <button class="btn" id="playPauseBtn">PLAY</button>
-                <button class="btn" id="loopBtn" title="Loop Current Track">LOOP</button>
-                <button class="btn master-rec-btn" id="masterRecBtn">REC</button>
-                <button class="btn auto-mix-btn" id="autoMixBtn" title="AI Auto-Mix: Seamlessly blend songs">MIX</button>
-                <button class="btn" id="stopBtn">STOP</button>
-                <button class="btn" id="nextBtn">&gt;|</button>
+            <div class="transport-controls" role="group" aria-label="Transport controls">
+                <button class="btn" id="prevBtn" aria-label="Previous track">|&lt;</button>
+                <button class="btn" id="playPauseBtn" aria-pressed="false">PLAY</button>
+                <button class="btn" id="loopBtn" title="Loop Current Track" aria-pressed="false">LOOP</button>
+                <button class="btn master-rec-btn" id="masterRecBtn" aria-pressed="false">REC</button>
+                <button class="btn auto-mix-btn" id="autoMixBtn" title="AI Auto-Mix: Seamlessly blend songs" aria-pressed="false">MIX</button>
+                <button class="btn" id="stopBtn" aria-label="Stop playback">STOP</button>
+                <button class="btn" id="nextBtn" aria-label="Next track">&gt;|</button>
             </div>
             <div class="flex-row-gap">
-                <span class="label-text">VOL:</span>
+                <span class="label-text" id="volLabel">VOL:</span>
                 <div class="volume-wrapper">
-                    <input type="range" class="volume-slider" id="masterVol" min="0" max="1" step="0.01" value="1" title="Master Volume">
-                    <div id="volKnob" class="vol-knob">100%</div>
+                    <input type="range" class="volume-slider" id="masterVol" min="0" max="1" step="0.01" value="1" title="Master Volume" aria-label="Master volume" aria-labelledby="volLabel">
+                    <div id="volKnob" class="vol-knob" aria-hidden="true">100%</div>
                 </div>
             </div>
-            <label class="file-upload-btn">
+            <label class="file-upload-btn" id="loadAudioLabel">
                 [+] LOAD AUDIO
-                <input type="file" id="playlistInput" multiple accept="audio/*" class="hidden-input">
+                <input type="file" id="playlistInput" multiple accept="audio/*" class="hidden-input" aria-labelledby="loadAudioLabel">
             </label>
             <div class="playlist-search-container">
-                <svg class="search-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="10.5" cy="10.5" r="6.5"/><line x1="15.5" y1="15.5" x2="21" y2="21"/></svg>
-                <input type="text" id="playlistSearch" placeholder="SEARCH LIBRARY..." class="playlist-search-input">
+                <svg class="search-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><line x1="15.5" y1="15.5" x2="21" y2="21"/></svg>
+                <input type="text" id="playlistSearch" placeholder="SEARCH LIBRARY..." class="playlist-search-input" aria-label="Search playlist">
             </div>
-            <ul class="playlist" id="playlist"></ul>
+            <ul class="playlist" id="playlist" role="listbox" aria-label="Track playlist"></ul>
             <div class="chopper-section">
                 <div id="chopperTitle" class="label-text chopper-title">CHOPPER AND SCREWER</div>
-                <div id="chopperBPM" class="label-text chopper-bpm">SPEED: 100% (BPM: ---)</div>
+                <div id="chopperBPM" class="label-text chopper-bpm" aria-live="polite">SPEED: 100% (BPM: ---)</div>
                 <div id="tempoContainer">
                     <div id="tempoMarker"></div>
-                    <input type="range" class="progress-slider tempo-slider-wrapper" id="tempoSlider" min="0.5" max="1.5" step="0.01" value="1" title="Tempo/Speed Control">
+                    <input type="range" class="progress-slider tempo-slider-wrapper" id="tempoSlider" min="0.5" max="1.5" step="0.01" value="1" title="Tempo/Speed Control" aria-label="Tempo speed control">
                 </div>
             </div>
         </div>
     </div>
 
     <!-- HELP MODAL -->
-    <div id="helpModal" class="modal">
+    <div id="helpModal" class="modal" role="dialog" aria-modal="true" aria-label="Help and manual">
         <div class="modal-content modal-small">
-            <span id="closeHelp" class="close">&times;</span>
+            <span id="closeHelp" class="close" aria-label="Close help">&times;</span>
             <h2 class="modal-title">GANGSTA PLAYER PRO 3 - MANUAL</h2>
 
             <div class="help-grid">
@@ -153,11 +155,11 @@
     </div>
 
     <!-- RESTORED COOL SETTINGS MODAL -->
-    <div id="settingsModal" class="modal">
+    <div id="settingsModal" class="modal" role="dialog" aria-modal="true" aria-label="Settings">
         <div class="modal-content">
             <div class="modal-header">
-            <h2>SETTINGS</h2>
-                <span class="close-modal" id="closeSettings">&times;</span>
+            <h2 id="settingsTitle">SETTINGS</h2>
+                <span class="close-modal" id="closeSettings" aria-label="Close settings">&times;</span>
             </div>
             <div class="modal-body">
                 <label for="inputDeviceSelect">INPUT DEVICE (MIC/LINE IN):</label>
@@ -183,6 +185,8 @@
 
                 <div class="settings-button-section">
                     <button id="openHelpFromSettings" class="btn btn-manual">HOW TO USE / MANUAL</button>
+
+                    <button id="openConsoleBtn" class="btn btn-console">🖥 CONSOLE</button>
                     
                     <button id="restoreDefaultsBtn" class="btn btn-restore">RESTORE DEFAULT SETTINGS</button>
                 </div>
@@ -195,12 +199,29 @@
         </div>
     </div>
 
+    <!-- CONSOLE MODAL -->
+    <div id="consoleModal" class="modal" role="dialog" aria-modal="true" aria-label="Console logs">
+        <div class="modal-content modal-console">
+            <div class="modal-header">
+                <h2 id="consoleTitle">CONSOLE</h2>
+                <span class="close-modal" id="closeConsole" aria-label="Close console">&times;</span>
+            </div>
+            <div class="modal-body">
+                <div class="console-toolbar">
+                    <button id="consoleCopyBtn" class="btn btn-console-copy">📋 COPY LOGS</button>
+                    <button id="consoleClearBtn" class="btn btn-console-clear">🗑 CLEAR</button>
+                </div>
+                <div id="consoleOutput" class="console-output"></div>
+            </div>
+        </div>
+    </div>
+
     <!-- NEW: Auto-Mix Settings Modal -->
-    <div id="autoMixModal" class="modal">
+    <div id="autoMixModal" class="modal" role="dialog" aria-modal="true" aria-label="Auto-mix settings">
         <div class="modal-content">
             <div class="modal-header">
                 <h2>AUTOMIX SETTINGS</h2>
-                <span class="close-modal" id="closeAutoMix">&times;</span>
+                <span class="close-modal" id="closeAutoMix" aria-label="Close automix settings">&times;</span>
             </div>
             <div class="modal-body">
                 <div class="automix-options">
@@ -260,6 +281,11 @@
         <div class="context-item" id="ctxLoadSample" role="menuitem" tabindex="-1">LOAD SAMPLE</div>
         <div id="padCtxDivider" class="context-divider hidden" role="separator"></div>
         <div class="context-item hidden" id="ctxSync" role="menuitem" tabindex="-1">SYNC</div>
+        <div class="context-divider hidden" id="padCtxLoopDivider"></div>
+        <div class="context-item hidden" id="ctxSetLoop1Bar" role="menuitem" tabindex="-1">1-BAR LOOP</div>
+        <div class="context-item hidden" id="ctxSetLoopStart" role="menuitem" tabindex="-1">SET LOOP START (SHIFT+CLICK)</div>
+        <div class="context-item hidden" id="ctxSetLoopEnd" role="menuitem" tabindex="-1">SET LOOP END (CTRL+CLICK)</div>
+        <div class="context-item hidden" id="ctxClearLoop" role="menuitem" tabindex="-1">CLEAR LOOP</div>
         <div class="context-divider"></div>
         <div class="context-item" id="ctxPadMidiLearn" role="menuitem" tabindex="-1">MIDI LEARN (BIND CONTROLLER)</div>
         <div class="context-item" id="ctxPadKeyBind" role="menuitem" tabindex="-1">BIND KEY (COMPUTER KEYBOARD)</div>
@@ -278,7 +304,7 @@
         <div class="context-item" id="ctxLoopAll" role="menuitem" tabindex="-1">LOOP PLAYLIST</div>
     </div>
     
-    <div id="controlContextMenu" class="context-menu hidden" role="menu">
+    <div id="controlContextMenu" class="context-menu hidden" role="menu" aria-label="Control context menu">
         <div class="context-item" id="ctxControlMidiLearn" role="menuitem" tabindex="-1">MIDI LEARN (BIND CC)</div>
     </div>
 
@@ -286,13 +312,13 @@
 
 
     <!-- NEW: Confirmation Modal -->
-    <div id="confirmModal" class="modal">
+    <div id="confirmModal" class="modal" role="alertdialog" aria-modal="true" aria-labelledby="confirmTitle">
         <div class="modal-content modal-extra-small">
             <h2 id="confirmTitle" class="modal-title">ARE YOU SURE?</h2>
             <p id="confirmMessage" class="label-text mb-20 text-center"></p>
             <div class="flex-row-gap justify-center">
-                <button id="confirmYes" class="btn btn-restore">YES</button>
-                <button id="confirmNo" class="btn automix-btn-full">NO</button>
+                <button id="confirmYes" class="btn btn-restore" aria-label="Confirm">YES</button>
+                <button id="confirmNo" class="btn automix-btn-full" aria-label="Cancel">NO</button>
             </div>
         </div>
     </div>

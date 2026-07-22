@@ -1,11 +1,13 @@
 // === VISUALS & LIGHTS MODULE ===
 import { VISUALIZER_BARS } from './constants';
-import { analyser, masterGain, audioCtx, resumeAudioContext, createAudioBuffer } from './audio';
-import { decoderPool } from './decoder-pool';
+import { analyser, masterGain, audioCtx, resumeAudioContext } from './audio';
 import { logger } from './logger';
 import { state } from './state';
 
-const dataArray = new Uint8Array(analyser.frequencyBinCount);
+let dataArray: Uint8Array | null = null;
+if (analyser) {
+    dataArray = new Uint8Array(analyser.frequencyBinCount);
+}
 const visualizerBars: HTMLElement[] = [];
 const barColors = ['#ff0000', '#d4002b', '#aa0055', '#800080', '#990ae6', '#bc13fe', '#bc13fe', '#a030f0', '#8a50d0', '#7070b0', '#509090', '#30b070', '#20d050', '#10f030', '#39ff14', '#39ff14'];
 
@@ -16,15 +18,15 @@ let lastScannerUpdate = 0;
 
 export function initVisuals(): void {
     const visualizerContainer = document.getElementById('visualizer');
-    if (!visualizerContainer) return;
-
-    visualizerContainer.innerHTML = '';
-    for (let i = 0; i < VISUALIZER_BARS; i++) {
-        const bar = document.createElement('div');
-        bar.className = 'bar';
-        bar.style.backgroundColor = barColors[i];
-        visualizerContainer.appendChild(bar);
-        visualizerBars.push(bar);
+    if (visualizerContainer) {
+        visualizerContainer.innerHTML = '';
+        for (let i = 0; i < VISUALIZER_BARS; i++) {
+            const bar = document.createElement('div');
+            bar.className = 'bar';
+            bar.style.backgroundColor = barColors[i];
+            visualizerContainer.appendChild(bar);
+            visualizerBars.push(bar);
+        }
     }
 
     leds = ([
@@ -78,11 +80,16 @@ function setupScrews(): void {
 
 function masterLoop(): void {
     requestAnimationFrame(masterLoop);
-    analyser.getByteFrequencyData(dataArray);
+    // Skip expensive processing when tab is hidden
+    if (document.hidden) return;
+    if (analyser && dataArray) analyser.getByteFrequencyData(dataArray as unknown as Uint8Array<ArrayBuffer>);
     
     let totalVol = 0;
-    for (let i = 0; i < dataArray.length; i++) totalVol += dataArray[i];
-    const totalAvg = totalVol / dataArray.length;
+    let totalAvg = 0;
+    if (dataArray) {
+        for (let i = 0; i < dataArray.length; i++) totalVol += dataArray[i];
+        totalAvg = totalVol / dataArray.length;
+    }
 
     const BASS_THRESHOLD = 200;
     const MID_THRESHOLD = 160;
@@ -92,7 +99,7 @@ function masterLoop(): void {
     // Force EQ-reactive mode when crossfade is blending (both channels are always producing audio)
     const isAudioActive = totalAvg > AVG_THRESHOLD || state.isCrossfadeInProgress;
 
-    if (isAudioActive) {
+    if (isAudioActive && dataArray && visualizerBars.length > 0) {
         // Only update visualizer bars every frame
         const step = Math.floor(dataArray.length / 16);
         for (let i = 0; i < 16; i++) {
@@ -101,7 +108,7 @@ function masterLoop(): void {
                 visualizerBars[i].style.height = Math.max(5, (value / 255) * 100) + '%';
             }
         }
-
+        
         // Only run heavy LED logic every 2nd frame or so (optimization)
         if (scannerIndex % 2 === 0) {
             let bassSum = 0, midSum = 0, highSum = 0;

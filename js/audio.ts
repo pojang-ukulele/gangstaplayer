@@ -9,22 +9,74 @@ declare global {
 }
 
 const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-export const audioCtx = new AudioContextClass();
-export const masterGain = audioCtx.createGain();
-export const analyser = audioCtx.createAnalyser();
-analyser.fftSize = VISUALIZER_FFT_SIZE;
 
-masterGain.connect(analyser);
-analyser.connect(audioCtx.destination);
+let _audioCtx: AudioContext;
+let _audioCtxFailed = false;
+
+try {
+    _audioCtx = new AudioContextClass();
+} catch (e) {
+    console.error("AudioContext creation failed:", e);
+    _audioCtxFailed = true;
+    // Create a dummy that fails gracefully on method calls
+    _audioCtx = null as unknown as AudioContext;
+}
+
+export let audioCtx: AudioContext = _audioCtx;
+export const isAudioAvailable = !_audioCtxFailed;
+
+export let masterGain: GainNode;
+export let analyser: AnalyserNode;
+
+try {
+    masterGain = audioCtx.createGain();
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = VISUALIZER_FFT_SIZE;
+    masterGain.connect(analyser);
+    analyser.connect(audioCtx.destination);
+} catch (e) {
+    console.error("Audio node creation failed:", e);
+    masterGain = null as unknown as GainNode;
+    analyser = null as unknown as AnalyserNode;
+}
 
 /**
  * Resumes the audio context if it's suspended
  */
-export function resumeAudioContext(): Promise<void> {
-    if (audioCtx.state === 'suspended') {
-        return audioCtx.resume();
+export async function resumeAudioContext(): Promise<void> {
+    if (!isAudioAvailable) {
+        console.warn("Cannot resume: AudioContext is not available.");
+        return;
     }
-    return Promise.resolve();
+    try {
+        if (audioCtx.state === 'suspended') {
+            await audioCtx.resume();
+        }
+    } catch (e) {
+        console.error("Error resuming AudioContext:", e);
+    }
+}
+
+/**
+ * Attempt to recreate the AudioContext after a failure
+ */
+export function recreateAudioContext(): boolean {
+    try {
+        const newCtx = new AudioContextClass();
+        // Override the readonly property on the exported reference
+        (audioCtx as any) = newCtx;
+        masterGain = newCtx.createGain();
+        analyser = newCtx.createAnalyser();
+        analyser.fftSize = VISUALIZER_FFT_SIZE;
+        masterGain.connect(analyser);
+        analyser.connect(newCtx.destination);
+        (_audioCtxFailed as boolean) = false;
+        console.log("[Audio] AudioContext recreated successfully");
+        return true;
+    } catch (e) {
+        console.error("[Audio] Failed to recreate AudioContext:", e);
+        return false;
+    }
 }
 
 /**
@@ -41,6 +93,10 @@ let isWorkletRegistered = false;
  */
 export async function initWorklets(): Promise<void> {
     if (isWorkletRegistered) return;
+    if (!isAudioAvailable) {
+        console.warn("Cannot init worklets: AudioContext not available.");
+        return;
+    }
     try {
         await audioCtx.audioWorklet.addModule('js/workers/gangsta-processor.js');
         await audioCtx.audioWorklet.addModule('js/workers/recorder-processor.js');
@@ -49,23 +105,4 @@ export async function initWorklets(): Promise<void> {
     } catch (e) {
         console.error('[Audio] Worklet registration failed', e);
     }
-}
-
-export interface DecodeResult {
-    numberOfChannels: number;
-    sampleRate: number;
-    length: number;
-    duration: number;
-    channels: Float32Array[];
-}
-
-/**
- * Reconstructs an AudioBuffer from background-decoded PCM data
- */
-export function createAudioBuffer(data: DecodeResult): AudioBuffer {
-    const buffer = audioCtx.createBuffer(data.numberOfChannels, data.length, data.sampleRate);
-    for (let i = 0; i < data.numberOfChannels; i++) {
-        buffer.copyToChannel(data.channels[i] as any, i);
-    }
-    return buffer;
 }

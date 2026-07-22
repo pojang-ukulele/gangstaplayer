@@ -113,6 +113,12 @@
     color: black;
 }
 
+.kit-btn-sep {
+    color: #333;
+    margin: 0 4px;
+    user-select: none;
+}
+
 body {
     background-image: linear-gradient(rgba(0, 0, 0, 0.9), rgba(0, 0, 0, 0.9)), url('assets/wallpaper.jpg');
     background-size: cover;
@@ -120,22 +126,20 @@ body {
     background-color: var(--bg-color);
     color: white;
     font-family: 'VT323', monospace;
-    font-size: 1.3rem;
+    font-size: clamp(1rem, 2vw, 1.5rem);
     display: flex;
     flex-direction: column;
     align-items: center;
     min-height: 100vh;
     margin: 0;
-    padding: 30px 20px 100px 20px;
-    /* Big bottom padding to reveal wallpaper */
+    padding: 30px 20px 40px 20px;
     overflow: hidden;
     justify-content: flex-start;
-    /* Stick to top, but pushed down by padding */
 }
 
 h1 {
     font-family: 'Press Start 2P', cursive;
-    font-size: 1.5rem;
+    font-size: clamp(1rem, 2.5vw, 2rem);
     color: #2a9e14;
     text-shadow: 2px 2px 0px #000;
     margin-bottom: 5px;
@@ -208,7 +212,10 @@ h1 {
     border-right: 2px solid #111;
     max-width: 1100px;
     width: 100%;
+    min-height: calc(100vh - 90px);
+    height: auto;
     position: relative;
+    align-items: stretch;
 }
 
 /* SCREWS */
@@ -361,11 +368,18 @@ h1 {
     align-items: center;
 }
 
+.sampler-section .label-text {
+    flex-shrink: 0;
+}
+
 .pad-grid {
     display: grid;
     grid-template-columns: repeat(4, 1fr);
+    grid-auto-rows: 1fr;
     gap: 12px;
     width: 100%;
+    flex: 1;
+    min-height: 200px;
     background: #0a0a0a;
     padding: 20px;
     border-radius: 4px;
@@ -389,8 +403,7 @@ h1 {
     display: flex;
     justify-content: center;
     align-items: center;
-    font-size: 1.4rem;
-    /* Increased for visibility */
+    font-size: clamp(1rem, 2vw, 1.8rem);
     font-family: 'VT323', 'Courier New', monospace;
     font-weight: 400;
     letter-spacing: 0.2px;
@@ -462,6 +475,22 @@ h1 {
     box-shadow: 0 0 0 var(--pad-active-side), 0 0 30px var(--neon-green) !important;
     color: #000 !important;
     border-color: #fff;
+}
+
+/* Waveform preview canvas inside each pad */
+.pad-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+    z-index: 1;
+}
+
+.pad-canvas + span {
+    position: relative;
+    z-index: 2;
 }
 
 .pad-filename {
@@ -572,24 +601,29 @@ input[type=range].progress-slider:hover::-webkit-slider-thumb {
     display: flex;
     flex-direction: column;
     gap: 8px;
-
-
 }
+
+.player-section > :not(.playlist) {
+    flex-shrink: 0;
+}
+
+
+
 
 .screen {
     background: #051105;
     border: 4px solid #444;
     border-radius: 4px;
-    height: 120px;
-    /* INCREASED from 90px */
+    height: clamp(90px, 14vh, 180px);
+    min-height: 90px;
     display: flex;
+    flex-shrink: 0;
     align-items: center;
     justify-content: center;
     position: relative;
     color: var(--neon-green);
     font-family: 'VT323';
-    font-size: 1.0rem;
-    /* DECREASED from 1.4rem */
+    font-size: clamp(0.8rem, 2vh, 1.4rem);
     text-shadow: 0 0 5px var(--neon-green);
     box-shadow: inset 0 0 30px #000;
     overflow: hidden;
@@ -666,9 +700,8 @@ input[type=range].progress-slider:hover::-webkit-slider-thumb {
     border-radius: 2px;
     cursor: pointer;
     font-family: 'VT323';
-    font-size: 1.2rem;
+    font-size: clamp(0.9rem, 1.8vw, 1.4rem);
     flex: 1;
-    /* min-width: 60px; REMOVED GLOBAL, targeting specific button */
     text-shadow: 0 1px 0 #000;
     box-shadow: 0 2px 0 #000;
     transition: all 0.1s;
@@ -746,14 +779,13 @@ input[type=range].progress-slider:hover::-webkit-slider-thumb {
 .file-upload-btn {
     background: #1a1a1a;
     color: #888;
-    padding: 15px;
+    padding: 10px;
     text-align: center;
     cursor: pointer;
     border: 2px dashed #444;
     display: block;
-    font-size: 1.3rem;
+    font-size: clamp(0.9rem, 1.6vw, 1.3rem);
     margin-top: 5px;
-    /* REDUCED from 10px */
     transition: all 0.2s;
 }
 
@@ -801,8 +833,10 @@ input[type=range].progress-slider:hover::-webkit-slider-thumb {
 .playlist {
     background: #000;
     border: 1px solid #333;
-    height: 180px;
-    /* INCREASED from 120px */
+    height: auto;
+    flex: 1;
+    min-height: 80px;
+    max-height: min(400px, 40vh);
     overflow-y: auto;
     list-style: none;
     padding: 0;
@@ -843,7 +877,7 @@ input[type=range].progress-slider:hover::-webkit-slider-thumb {
     outline: none;
     color: #aaa;
     font-family: 'VT323', monospace;
-    font-size: 0.95rem;
+    font-size: clamp(0.8rem, 1.5vw, 1.1rem);
     padding: 5px 6px;
     letter-spacing: 1px;
 }
@@ -932,7 +966,7 @@ input[type=range].progress-slider:hover::-webkit-slider-thumb {
 
 .label-text {
     color: var(--neon-green);
-    font-size: 0.9rem;
+    font-size: clamp(0.7rem, 1.4vw, 1rem);
     margin-bottom: 5px;
     font-weight: bold;
     letter-spacing: 1px;
@@ -1003,6 +1037,30 @@ input[type=range].progress-slider:hover::-webkit-slider-thumb {
 }
 
 @keyframes padSpin {
+    to { transform: rotate(360deg); }
+}
+
+/* Track Loading Spinner (visible during BPM detection) */
+.track-spinner {
+    display: inline-block;
+    width: 16px;
+    height: 16px;
+    margin-left: 8px;
+    border: 2px solid rgba(57, 255, 20, 0.2);
+    border-top-color: var(--neon-green);
+    border-radius: 50%;
+    animation: trackSpin 0.6s linear infinite;
+    vertical-align: middle;
+    opacity: 0;
+    transition: opacity 0.2s;
+    pointer-events: none;
+}
+
+.track-spinner.active {
+    opacity: 1;
+}
+
+@keyframes trackSpin {
     to { transform: rotate(360deg); }
 }
 
@@ -1506,6 +1564,45 @@ input[type=range].volume-slider::-webkit-slider-thumb {
     transition: opacity 0.15s, transform 0.15s, background 0.15s;
 }
 
+/* === VISIBLE FOCUS INDICATORS === */
+/* Override outline:none with visible focus styles using :focus-visible */
+:focus-visible {
+    outline: 2px solid var(--neon-green) !important;
+    outline-offset: 2px !important;
+}
+
+/* Sliders need more offset so the ring doesn't overlap the track */
+input[type=range]:focus-visible {
+    outline: 2px solid var(--neon-green) !important;
+    outline-offset: 4px !important;
+}
+
+/* Pads: keep existing outline removal but add a glow */
+.pad:focus-visible {
+    outline: none !important;
+    box-shadow: 0 0 12px var(--neon-green), inset 0 0 8px var(--neon-green) !important;
+}
+
+/* Context menu items */
+.context-item:focus-visible {
+    outline: 1px solid var(--neon-green) !important;
+    outline-offset: -1px !important;
+    background: #222 !important;
+}
+
+/* Playlist items */
+#playlist .playlist-item:focus-visible {
+    outline: 2px solid var(--neon-green) !important;
+    outline-offset: -2px !important;
+}
+
+/* Suppress default focus on elements that have clear visual state already */
+.btn:focus:not(:focus-visible),
+.kit-btn:focus:not(:focus-visible),
+.win-btn:focus:not(:focus-visible) {
+    outline: none !important;
+}
+
 .playlist li:active {
     cursor: grabbing;
 }
@@ -1770,6 +1867,121 @@ input[type=range].volume-slider::-webkit-slider-thumb {
     border-color: #600;
     color: #c00;
     font-size: 0.9rem;
+}
+
+/* === CONSOLE BUTTON === */
+.btn-console {
+    width: 100%;
+    margin-top: 10px;
+    border-color: #336;
+    color: #88ccff;
+}
+
+/* === CONSOLE MODAL === */
+.modal-console {
+    width: 80%;
+    max-width: 700px;
+    max-height: 80vh;
+    display: flex;
+    flex-direction: column;
+}
+
+.modal-console .modal-body {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+
+.console-toolbar {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 10px;
+    flex-shrink: 0;
+}
+
+.btn-console-copy,
+.btn-console-clear {
+    padding: 4px 12px;
+    font-size: 0.8rem;
+    border-color: #444;
+    color: #aaa;
+    background: #1a1a1a;
+    cursor: pointer;
+    border-radius: 3px;
+}
+
+.btn-console-copy:hover {
+    border-color: #4a4;
+    color: #4f4;
+    box-shadow: 0 0 6px rgba(68, 255, 68, 0.3);
+}
+
+.btn-console-clear:hover {
+    border-color: #844;
+    color: #f44;
+    box-shadow: 0 0 6px rgba(255, 68, 68, 0.3);
+}
+
+.console-output {
+    background: #0a0a0a;
+    border: 1px solid #222;
+    border-radius: 3px;
+    padding: 8px;
+    font-family: 'Courier New', Courier, monospace;
+    font-size: 0.75rem;
+    line-height: 1.4;
+    overflow-y: auto;
+    flex: 1;
+    min-height: 200px;
+    max-height: 55vh;
+}
+
+.console-output::-webkit-scrollbar {
+    width: 6px;
+}
+
+.console-output::-webkit-scrollbar-track {
+    background: #111;
+}
+
+.console-output::-webkit-scrollbar-thumb {
+    background: #333;
+    border-radius: 3px;
+}
+
+.console-output::-webkit-scrollbar-thumb:hover {
+    background: #555;
+}
+
+.console-line {
+    padding: 1px 0;
+    border-bottom: 1px solid #111;
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+
+.console-time {
+    color: #555;
+    margin-right: 4px;
+}
+
+.console-level {
+    font-weight: bold;
+    margin-right: 6px;
+}
+
+.console-info .console-level { color: #4af; }
+.console-warn .console-level { color: #fa0; }
+.console-error .console-level { color: #f44; }
+.console-debug .console-level { color: #888; }
+
+.console-msg {
+    color: #ccc;
+}
+
+.console-error .console-msg {
+    color: #faa;
 }
 
 /* === VOLUME SLIDER FIX === */

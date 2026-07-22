@@ -22,12 +22,41 @@ function addToCache(key: string, value: any) {
  * Validates that a path is not attempting to escape safe boundaries
  * and is a valid system path.
  */
+/**
+ * Tracks paths returned by native save dialogs so fs:save-file
+ * only permits writing to user-approved locations.
+ */
+const dialogReturnedPaths = new Set<string>();
+
+/**
+ * Validates that a path is safe to read/write.
+ * - Must be a non-empty string
+ * - Must not contain null bytes
+ * - Must be absolute
+ * - Must not contain directory traversal (after normalization, resolved path must match)
+ */
 function validatePath(p: string): string | null {
   if (!p || typeof p !== 'string') return null;
   const normalized = path.normalize(p);
-  // Prevent poisoning or illegal characters
   if (normalized.includes('\0')) return null;
-  return normalized;
+  if (!path.isAbsolute(normalized)) return null;
+  const resolved = path.resolve(normalized);
+  if (resolved !== normalized) return null;
+  return resolved;
+}
+
+/**
+ * Returns true if the path is allowed for writing.
+ * Path is allowed if it:
+ *   1) Was returned by a native save dialog (user-approved), OR
+ *   2) Resides under app.getPath('userData')
+ */
+function isSavePathAllowed(p: string): boolean {
+  if (dialogReturnedPaths.has(p)) return true;
+  const userDataPath = app.getPath('userData');
+  const relative = path.relative(userDataPath, p);
+  if (relative && !relative.startsWith('..') && !path.isAbsolute(relative)) return true;
+  return false;
 }
 
 function logToDisk(level: string, message: string) {
@@ -80,15 +109,18 @@ function createWindow() {
     } else {
         fullPath = path.join(app.getAppPath(), relativePath);
     }
-    // Try notepad first (Windows), fall back to system default
-    try {
-        const { execFile } = require('child_process');
-        execFile('notepad.exe', [fullPath], (err: any) => {
-            if (err) shell.openPath(fullPath);
-        });
-    } catch {
-        await shell.openPath(fullPath);
+    if (process.platform === 'win32') {
+      try {
+          const { execFile } = require('child_process');
+          execFile('notepad.exe', [fullPath], (err: any) => {
+              if (err) shell.openPath(fullPath);
+          });
+          return;
+      } catch {
+          // Fall through to shell.openPath
+      }
     }
+    await shell.openPath(fullPath);
   });
 
   ipcMain.handle('dialog:save-kit', async () => {
@@ -98,6 +130,7 @@ function createWindow() {
       filters: [{ name: 'JSON Kit File', extensions: ['json'] }]
     })
     if (canceled) return null
+    dialogReturnedPaths.add(filePath);
     return filePath
   })
 
@@ -118,6 +151,7 @@ function createWindow() {
       filters: [{ name: 'WAV Audio', extensions: ['wav'] }]
     })
     if (canceled) return null
+    dialogReturnedPaths.add(filePath);
     return filePath
   })
 
@@ -128,8 +162,18 @@ function createWindow() {
         logToDisk('ERROR', `Security: Blocked illegal write attempt to ${pathStr}`);
         return false;
     }
-    fs.writeFileSync(validated, data);
-    return true;
+    if (!isSavePathAllowed(validated)) {
+        logToDisk('ERROR', `Security: Blocked write to non-sandboxed path ${validated}`);
+        return false;
+    }
+    try {
+      fs.writeFileSync(validated, data);
+      dialogReturnedPaths.delete(validated);
+      return true;
+    } catch (err) {
+      logToDisk('ERROR', `Security: Write failed for ${validated}: ${err}`);
+      return false;
+    }
   });
 
   ipcMain.handle('fs:read-file', async (_event, pathStr: string) => {
@@ -138,8 +182,22 @@ function createWindow() {
         logToDisk('ERROR', `Security: Blocked illegal read attempt from ${pathStr}`);
         return null;
     }
-    const buffer = fs.readFileSync(validated);
-    return buffer;
+    try {
+      if (!fs.existsSync(validated)) {
+        logToDisk('ERROR', `Security: Blocked read of non-existent path ${validated}`);
+        return null;
+      }
+      const stat = fs.statSync(validated);
+      if (!stat.isFile()) {
+        logToDisk('ERROR', `Security: Blocked read of non-file path ${validated}`);
+        return null;
+      }
+      const buffer = fs.readFileSync(validated);
+      return buffer;
+    } catch (err) {
+      logToDisk('ERROR', `Security: Read failed for ${validated}: ${err}`);
+      return null;
+    }
   });
 
   ipcMain.handle('fs:ensure-recordings-dir', async () => {
@@ -200,6 +258,12 @@ function createWindow() {
     return await sonetraBridge.stopServer();
   });
 
+  ipcMain.handle('sonetra:restart-server', async () => {
+    if (!sonetraBridge) return { success: false, error: 'Sonetra bridge not loaded' };
+    logToDisk('INFO', 'Manual Sonetra server restart requested...');
+    return await sonetraBridge.restartServer();
+  });
+
   ipcMain.handle('sonetra:get-status', async () => {
     if (!sonetraBridge) return { isRunning: false, error: 'Bridge not loaded' };
     return sonetraBridge.getStatus();
@@ -243,6 +307,13 @@ function createWindow() {
     return result;
   });
 
+  // Wire up sonetraBridge status events to forward to renderer
+  sonetraBridge.onStatusChange((status) => {
+    if (win && !win.isDestroyed()) {
+      win.webContents.send('sonetra:restart-status', status);
+    }
+  });
+
   // ==================== DATABASE HANDLERS ====================
   
   ipcMain.handle('db:upsert-track', async (_event, track) => {
@@ -266,11 +337,6 @@ function createWindow() {
     return dbManager.getAllTracks();
   });
 
-  ipcMain.on('app:close', () => { 
-    dbManager.close();
-    win.close(); 
-  });
-  
   win.on('close', async () => {
     dbManager.close();
     if (sonetraBridge) {

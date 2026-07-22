@@ -1,6 +1,7 @@
 // === SETTINGS MODULE ===
 import { toast } from './toast';
 import { showConfirm } from './player';
+import { logger } from './logger';
 
 interface AutoMixSettings {
     eqCrossfade: boolean;
@@ -23,7 +24,7 @@ import './types';
 
 const bridge = window.electronAPI;
 
-export const settings: Settings = {
+const _settings: Settings = {
     fullScreen: false,
     inputDevice: 'default',
     outputDevice: 'default',
@@ -38,7 +39,48 @@ export const settings: Settings = {
     }
 };
 
+/** Settings accessor — read-only reference. Use updateSettings() to make changes. */
+export const settings: Readonly<Settings> = _settings;
+
+/**
+ * Update settings with partial patch and auto-save to localStorage.
+ * This is the ONLY way to mutate settings that guarantees persistence.
+ */
+export function updateSettings(patch: Partial<Settings>): void {
+    Object.assign(_settings, patch);
+    saveSettings(); // persist immediately
+}
+
 let setAutoMixEnabledFn: ((enabled: boolean) => void) | null = null;
+
+/** Track the last focused element before a modal opened, for focus restoration */
+let _lastFocused: HTMLElement | null = null;
+
+/**
+ * Opens a modal with focus management.
+ * Saves the currently focused element and moves focus into the modal.
+ */
+function openModal(modal: HTMLElement): void {
+    _lastFocused = document.activeElement as HTMLElement;
+    modal.style.display = 'block';
+    // Focus the first focusable element inside the modal
+    const firstFocusable = modal.querySelector<HTMLElement>('button, input, select, textarea, [tabindex]:not([tabindex="-1"])');
+    if (firstFocusable) {
+        setTimeout(() => firstFocusable.focus(), 50);
+    }
+}
+
+/**
+ * Closes a modal with focus restoration.
+ */
+function closeModal(modal: HTMLElement): void {
+    modal.style.display = 'none';
+    // Restore focus to the element that was focused before the modal opened
+    if (_lastFocused) {
+        _lastFocused.focus();
+        _lastFocused = null;
+    }
+}
 
 export function initSettings(deps: { setAutoMixEnabled: (enabled: boolean) => void }): void {
     setAutoMixEnabledFn = deps.setAutoMixEnabled;
@@ -48,21 +90,23 @@ export function initSettings(deps: { setAutoMixEnabled: (enabled: boolean) => vo
     
     if (settingsBtn && settingsModal) {
         settingsBtn.addEventListener('click', () => {
-            settingsModal.style.display = 'block';
+            openModal(settingsModal);
             refreshAudioDevices();
         });
     }
     if (closeSettings && settingsModal) {
-        closeSettings.addEventListener('click', () => settingsModal.style.display = 'none');
+        closeSettings.addEventListener('click', () => closeModal(settingsModal));
     }
 
     // Modal Click-outside to close
     window.addEventListener('click', (e) => {
-        if (e.target === settingsModal && settingsModal) settingsModal.style.display = 'none';
+        if (e.target === settingsModal && settingsModal) closeModal(settingsModal);
         const autoMixModal = document.getElementById('autoMixModal');
-        if (e.target === autoMixModal && autoMixModal) autoMixModal.style.display = 'none';
+        if (e.target === autoMixModal && autoMixModal) closeModal(autoMixModal);
         const helpModal = document.getElementById('helpModal');
-        if (e.target === helpModal && helpModal) helpModal.style.display = 'none';
+        if (e.target === helpModal && helpModal) closeModal(helpModal);
+        const consoleModal = document.getElementById('consoleModal');
+        if (e.target === consoleModal && consoleModal) closeModal(consoleModal);
     });
 
     setupSettingsHandlers();
@@ -72,7 +116,7 @@ export function initSettings(deps: { setAutoMixEnabled: (enabled: boolean) => vo
     document.addEventListener('keydown', (e) => {
         if (e.key !== 'Escape') return;
         // Priority order: child modals first, then parent settings modal, then context menus
-        const modals = ['confirmModal', 'autoMixModal', 'helpModal', 'settingsModal', 'padContextMenu', 'contextMenu'];
+        const modals = ['confirmModal', 'autoMixModal', 'helpModal', 'consoleModal', 'settingsModal', 'padContextMenu', 'contextMenu', 'controlContextMenu', 'playContextMenu', 'loopContextMenu'];
         for (const id of modals) {
             const el = document.getElementById(id);
             if (!el) continue;
@@ -80,7 +124,7 @@ export function initSettings(deps: { setAutoMixEnabled: (enabled: boolean) => vo
                               el.style.display === 'flex' ||
                               (el.style.display !== 'none' && getComputedStyle(el).display !== 'none');
             if (isVisible) {
-                el.style.display = 'none';
+                closeModal(el);
                 e.preventDefault();
                 e.stopPropagation();
                 break;
@@ -94,7 +138,7 @@ export function loadSettings(): void {
         const saved = localStorage.getItem('ug_settings');
         if (saved) {
             const s = JSON.parse(saved);
-            Object.assign(settings, s);
+            Object.assign(_settings, s);
             applySettingsToUI();
             // Apply Full Screen on load
             if (bridge && bridge.setFullScreen) bridge.setFullScreen(settings.fullScreen);
@@ -127,16 +171,16 @@ export function saveSettings(): void {
     const mixOptHPFSweep = document.getElementById('mixOptHPFSweep') as HTMLInputElement;
     const mixOptBPMSync = document.getElementById('mixOptBPMSync') as HTMLInputElement;
 
-    settings.fullScreen = fullScreenToggle ? fullScreenToggle.checked : settings.fullScreen;
-    if (mixOptEQCrossfade) settings.autoMix.eqCrossfade = mixOptEQCrossfade.checked;
-    if (mixOptFilterSweep) settings.autoMix.filterSweep = mixOptFilterSweep.checked;
-    if (mixOptHPFSweep) settings.autoMix.hpfSweep = mixOptHPFSweep.checked;
-    if (mixOptBPMSync) settings.autoMix.bpmSync = mixOptBPMSync.checked;
+    _settings.fullScreen = fullScreenToggle ? fullScreenToggle.checked : _settings.fullScreen;
+    if (mixOptEQCrossfade) _settings.autoMix.eqCrossfade = mixOptEQCrossfade.checked;
+    if (mixOptFilterSweep) _settings.autoMix.filterSweep = mixOptFilterSweep.checked;
+    if (mixOptHPFSweep) _settings.autoMix.hpfSweep = mixOptHPFSweep.checked;
+    if (mixOptBPMSync) _settings.autoMix.bpmSync = mixOptBPMSync.checked;
 
-    localStorage.setItem('ug_settings', JSON.stringify(settings));
+    localStorage.setItem('ug_settings', JSON.stringify(_settings));
     
     // Actuate Full Screen
-    if (bridge && bridge.setFullScreen) bridge.setFullScreen(settings.fullScreen);
+    if (bridge && bridge.setFullScreen) bridge.setFullScreen(_settings.fullScreen);
 }
 
 function updateSliderUI(sliderId: string, labelId: string, val: number): void {
@@ -154,9 +198,9 @@ export function setupSettingsHandlers(): void {
     const closeAutoMix = document.getElementById('closeAutoMix');
     const closeAutoMixBtn = document.getElementById('closeAutoMixBtn');
 
-    if (btnOpenAutoMix && autoMixModal) btnOpenAutoMix.addEventListener('click', () => { autoMixModal.style.display = 'block'; });
-    if (closeAutoMix && autoMixModal) closeAutoMix.addEventListener('click', () => { autoMixModal.style.display = 'none'; });
-    if (closeAutoMixBtn && autoMixModal) closeAutoMixBtn.addEventListener('click', () => { autoMixModal.style.display = 'none'; });
+    if (btnOpenAutoMix && autoMixModal) btnOpenAutoMix.addEventListener('click', () => { openModal(autoMixModal); });
+    if (closeAutoMix && autoMixModal) closeAutoMix.addEventListener('click', () => { closeModal(autoMixModal); });
+    if (closeAutoMixBtn && autoMixModal) closeAutoMixBtn.addEventListener('click', () => { closeModal(autoMixModal); });
 
     // Auto-save on any change
     const inputs = ['fullScreenToggle', 'mixOptEQCrossfade', 'mixOptFilterSweep', 'mixOptHPFSweep', 'mixOptBPMSync'];
@@ -173,11 +217,11 @@ export function setupSettingsHandlers(): void {
     if (restoreBtn) {
         restoreBtn.addEventListener('click', () => {
             showConfirm("RESTORE DEFAULTS?", "This will reset all your audio and Auto-Mix preferences.", () => {
-                settings.fullScreen = false;
-                settings.inputDevice = 'default';
-                settings.outputDevice = 'default';
-                settings.midiDevice = 'all';
-                settings.autoMix = {
+                _settings.fullScreen = false;
+                _settings.inputDevice = 'default';
+                _settings.outputDevice = 'default';
+                _settings.midiDevice = 'all';
+                _settings.autoMix = {
                     eqCrossfade: true,
                     filterSweep: true,
                     hpfSweep: true,
@@ -199,14 +243,79 @@ export function setupSettingsHandlers(): void {
 
     if (openHelpBtn && helpModal) {
         openHelpBtn.addEventListener('click', () => {
-            helpModal.style.display = 'block';
+            openModal(helpModal);
         });
     }
     if (closeHelpBtn && helpModal) {
         closeHelpBtn.addEventListener('click', () => {
-            helpModal.style.display = 'none';
+            closeModal(helpModal);
         });
     }
+
+    // --- Console Modal Logic ---
+    const consoleModal = document.getElementById('consoleModal');
+    const openConsoleBtn = document.getElementById('openConsoleBtn');
+    const closeConsoleBtn = document.getElementById('closeConsole');
+    const consoleCopyBtn = document.getElementById('consoleCopyBtn');
+    const consoleClearBtn = document.getElementById('consoleClearBtn');
+    const consoleOutput = document.getElementById('consoleOutput');
+
+    // Function to render logs into the console output
+    function renderConsoleLogs(): void {
+        if (!consoleOutput) return;
+        const logs = logger.getLogs();
+        consoleOutput.innerHTML = logs.map(e => {
+            const levelClass = e.level.toLowerCase();
+            return `<div class="console-line console-${levelClass}">
+                <span class="console-time">[${e.timestamp}]</span>
+                <span class="console-level">[${e.level}]</span>
+                <span class="console-msg">${escapeHtml(e.message)}</span>
+            </div>`;
+        }).join('');
+        consoleOutput.scrollTop = consoleOutput.scrollHeight;
+    }
+
+    if (openConsoleBtn && consoleModal) {
+        openConsoleBtn.addEventListener('click', () => {
+            openModal(consoleModal);
+            renderConsoleLogs();
+        });
+    }
+    if (closeConsoleBtn && consoleModal) {
+        closeConsoleBtn.addEventListener('click', () => {
+            closeModal(consoleModal);
+        });
+    }
+    if (consoleCopyBtn) {
+        consoleCopyBtn.addEventListener('click', () => {
+            const text = logger.getLogsAsText();
+            navigator.clipboard.writeText(text).then(() => {
+                toast.success("LOGS COPIED TO CLIPBOARD");
+            }).catch(() => {
+                // Fallback for environments without clipboard API
+                const textarea = document.createElement('textarea');
+                textarea.value = text;
+                document.body.appendChild(textarea);
+                textarea.select();
+                document.execCommand('copy');
+                document.body.removeChild(textarea);
+                toast.success("LOGS COPIED TO CLIPBOARD");
+            });
+        });
+    }
+    if (consoleClearBtn) {
+        consoleClearBtn.addEventListener('click', () => {
+            if (consoleOutput) consoleOutput.innerHTML = '';
+            toast.info("CONSOLE CLEARED");
+        });
+    }
+}
+
+/** Utility: escape HTML entities to prevent XSS in log display */
+function escapeHtml(str: string): string {
+    const div = document.createElement('div');
+    div.appendChild(document.createTextNode(str));
+    return div.innerHTML;
 }
 
 function setupDurationSlider(sliderId: string, labelId: string, isTrackFade: boolean): void {
@@ -218,8 +327,8 @@ function setupDurationSlider(sliderId: string, labelId: string, isTrackFade: boo
         const target = e.target as HTMLInputElement;
         const val = parseFloat(target.value);
         label.innerText = val.toFixed(1) + 's';
-        if (isTrackFade) settings.autoMix.trackDuration = val;
-        else settings.autoMix.btnDuration = val;
+        if (isTrackFade) _settings.autoMix.trackDuration = val;
+        else _settings.autoMix.btnDuration = val;
         saveSettings();
     });
 }
@@ -230,7 +339,19 @@ async function refreshAudioDevices(): Promise<void> {
     if (!inputSelect || !outputSelect) return;
 
     try {
-        await navigator.mediaDevices.getUserMedia({ audio: true });
+        // Check if we already have mic permission before requesting
+        let hasPermission = false;
+        if (navigator.permissions?.query) {
+            const permStatus = await navigator.permissions.query({ name: 'microphone' as PermissionName });
+            hasPermission = permStatus.state === 'granted';
+            if (permStatus.state === 'denied') {
+                console.warn("Microphone permission denied — audio device list may be incomplete");
+                // Fall through — enumerateDevices() still returns limited info without permission
+            }
+        }
+        if (!hasPermission) {
+            await navigator.mediaDevices.getUserMedia({ audio: true });
+        }
         const devices = await navigator.mediaDevices.enumerateDevices();
         inputSelect.innerHTML = '';
         outputSelect.innerHTML = '';
