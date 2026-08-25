@@ -4,7 +4,7 @@ import { analyser, masterGain, audioCtx, resumeAudioContext } from './audio';
 import { logger } from './logger';
 import { state } from './state';
 import { throttle } from './utils';
-import { BASS_THRESHOLD, MID_THRESHOLD, HIGH_THRESHOLD, AVG_THRESHOLD, SCANNER_INTERVAL_MS, LED_FRAME_SKIP } from './constants';
+import { BASS_THRESHOLD, MID_THRESHOLD, HIGH_THRESHOLD, AVG_THRESHOLD, SCANNER_INTERVAL_MS } from './constants';
 
 let dataArray: Uint8Array | null = null;
 if (analyser) {

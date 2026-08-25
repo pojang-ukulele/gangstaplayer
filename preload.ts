@@ -5,6 +5,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   maximize: () => ipcRenderer.send('app:maximize'),
   close: () => ipcRenderer.send('app:close'),
   saveKit: () => ipcRenderer.invoke('dialog:save-kit'),
+  saveSessionDialog: () => ipcRenderer.invoke('dialog:save-session'),
   loadKit: () => ipcRenderer.invoke('dialog:load-kit'),
   saveAudioDialog: () => ipcRenderer.invoke('dialog:save-audio'),
   getPathForFile: (file: File) => webUtils.getPathForFile(file),
@@ -38,9 +39,14 @@ contextBridge.exposeInMainWorld('sonetra', {
     ipcRenderer.invoke('sonetra:get-cached-transition', track1Path, track2Path),
   precomputeTransition: (track1Path: string, track2Path: string) =>
     ipcRenderer.invoke('sonetra:precompute-transition', track1Path, track2Path),
-  // Listen for restart/status events from main process
+  // Listen for restart/status events from main process.
+  // Returns an unsubscribe function so callers don't leak listeners.
   onRestartStatus: (callback: (status: any) => void) => {
-    ipcRenderer.on('sonetra:restart-status', (_event, status) => callback(status));
+    const handler = (_event: unknown, status: any) => callback(status);
+    ipcRenderer.on('sonetra:restart-status', handler as any);
+    return () => {
+      ipcRenderer.removeListener('sonetra:restart-status', handler as any);
+    };
   }
 });
 // Database Bridge

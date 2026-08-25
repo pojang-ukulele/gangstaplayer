@@ -2,12 +2,15 @@ import { audioCtx } from './audio';
 import { detectBPMWorker } from './worker-client';
 import { state, Track } from './state';
 import { VirtualScroller } from './reactive/ui';
-import { normalizeToArrayBuffer } from './utils';
+import { normalizeToArrayBuffer, validateAudioSignature } from './utils';
+import { engine } from './audio-engine';
 import './types';
 
 interface PlaylistDeps {
     loadTrack: (index: number) => Promise<void>;
     playTrack: () => void;
+    /** Skip the initial DB load — used when a crash snapshot was just restored */
+    skipDbLoad?: boolean;
 }
 
 let anchorIndex = -1;
@@ -33,11 +36,16 @@ export function initPlaylist(deps: PlaylistDeps): void {
     const searchInput = document.getElementById('playlistSearch') as HTMLInputElement;
 
     // === INITIAL LOAD FROM DB ===
+    // Skipped when a crash snapshot was restored, otherwise the async DB read
+    // resolves later and clobbers the restored playlist.
     const db = window.database;
-    if (db) {
+    if (db && !deps.skipDbLoad) {
         db.getAllTracks().then((tracks: Track[]) => {
             if (tracks && tracks.length > 0) {
-                state.update({ playlist: tracks });
+                // Selection indices were computed against the pre-load list
+                state.update({ playlist: tracks, selectedIndices: [] });
+                anchorIndex = -1;
+                pivotIndex = -1;
             }
         });
     }
@@ -47,10 +55,15 @@ export function initPlaylist(deps: PlaylistDeps): void {
             const query = searchInput.value;
             if (db && query.length > 0) {
                 const results = await db.searchTracks(query);
-                state.update({ playlist: results });
+                // Filtered results invalidate every existing index
+                state.update({ playlist: results, selectedIndices: [] });
+                anchorIndex = -1;
+                pivotIndex = -1;
             } else if (db) {
                 const all = await db.getAllTracks();
-                state.update({ playlist: all });
+                state.update({ playlist: all, selectedIndices: [] });
+                anchorIndex = -1;
+                pivotIndex = -1;
             }
         });
     }
@@ -109,7 +122,17 @@ async function analyzeTrackInBackground(track: Track): Promise<void> {
 
 
         const arrayBuffer = normalizeToArrayBuffer(rawData);
-        
+
+        // Same validation policy as the sampler — reject non-audio early
+        // instead of feeding garbage to the decoder.
+        const validationError = validateAudioSignature(arrayBuffer, track.name);
+        if (validationError) {
+            console.warn(`[Playlist] Analysis skipped for ${track.name}: ${validationError}`);
+            track.bpm = 0;
+            state.update({ playlist: [...state.playlist] });
+            return;
+        }
+
         // Use native decoder (decoder pool workers are unreliable)
         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
 
@@ -402,10 +425,23 @@ function reorderPlaylist(fromIndex: number, toIndex: number, insertAfter: boolea
     else if (fromIndex < target && pivotIndex > fromIndex && pivotIndex < target) pivotIndex--;
     else if (fromIndex > target && pivotIndex >= target && pivotIndex < fromIndex) pivotIndex++;
 
-    state.update({
-        playlist,
-        selectedIndices: newSelected,
-    });
+    // The playing indicator must follow its track through the reorder,
+    // otherwise it jumps to whatever landed in the old slot.
+    const curIdx = state.currentTrackIndex;
+    if (curIdx === fromIndex) {
+        state.update({ playlist, selectedIndices: newSelected, currentTrackIndex: target });
+    } else {
+        let newCur = curIdx;
+        if (curIdx >= 0) {
+            if (fromIndex < target && curIdx > fromIndex && curIdx <= target) newCur = curIdx - 1;
+            else if (fromIndex > target && curIdx >= target && curIdx < fromIndex) newCur = curIdx + 1;
+        }
+        state.update({
+            playlist,
+            selectedIndices: newSelected,
+            ...(newCur !== curIdx ? { currentTrackIndex: newCur } : {})
+        });
+    }
 }
 
 // === NEW: KEYBOARD NAVIGATION ===
@@ -421,7 +457,6 @@ export function handlePlaylistNavigation(e: KeyboardEvent): void {
     if (e.key === 'ArrowUp') {
         e.preventDefault();
         newAnchor = Math.max(0, anchorIndex - 1);
-        if (anchorIndex === -1 && state.playlist.length > 0) newAnchor = state.playlist.length - 1; 
     } else if (e.key === 'ArrowDown') {
         e.preventDefault();
         newAnchor = Math.min(state.playlist.length - 1, anchorIndex + 1);
@@ -460,13 +495,32 @@ export function removeSelectedTracks(): void {
     
     const currentPlaylist = [...state.playlist];
     const currentSelected = [...state.selectedIndices];
+    const currentIndex = state.currentTrackIndex;
     
     // Sort descending to remove safe
     currentSelected.sort((a, b) => b - a);
     
+    let playingTrackRemoved = false;
     currentSelected.forEach(idx => {
+        if (idx === currentIndex) playingTrackRemoved = true;
+        // Indices after a removed row shift down by one
         currentPlaylist.splice(idx, 1);
     });
+    
+    // Remap currentTrackIndex against the new list — previously deleting the
+    // playing track left the index pointing at an unrelated song.
+    let newIndex = currentIndex;
+    if (playingTrackRemoved) {
+        newIndex = -1;
+        // Kill audible playback of the removed track
+        engine.main.audio.pause();
+        engine.main.audio.src = "";
+        state.update({ isPlaying: false, masterBPM: 0 });
+    } else if (currentIndex >= 0) {
+        const removedBefore = currentSelected.filter(idx => idx < currentIndex).length;
+        newIndex = currentIndex - removedBefore;
+        if (newIndex >= currentPlaylist.length) newIndex = currentPlaylist.length - 1;
+    }
     
     let newAnchor = Math.min(anchorIndex, currentPlaylist.length - 1);
     let newPivot = newAnchor; 
@@ -487,7 +541,8 @@ export function removeSelectedTracks(): void {
     pivotIndex = newPivot;
     state.update({ 
         playlist: currentPlaylist, 
-        selectedIndices: newSelected 
+        selectedIndices: newSelected,
+        ...(newIndex !== state.currentTrackIndex ? { currentTrackIndex: newIndex } : {})
     });
 }
 

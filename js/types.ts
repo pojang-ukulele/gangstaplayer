@@ -12,8 +12,9 @@ export interface ElectronAPI {
     appReadyToShow(): void;
     openExternal(relativePath: string): Promise<void>;
     saveKit(): Promise<string | undefined>;
+    saveSessionDialog(): Promise<string | undefined>;
     loadKit(): Promise<string | undefined>;
-    getPathForFile(): Promise<string>;
+    getPathForFile(file: File): string;
     saveAudioDialog(): Promise<string | undefined>;
     openSampleDialog(): Promise<string | undefined>;
     generateCrashReport(snapshot: any): Promise<string>;
@@ -45,8 +46,6 @@ export interface DatabaseAPI {
     getTrack(path: string): Promise<any>;
     searchTracks(query: string): Promise<any[]>;
     getAllTracks(): Promise<any[]>;
-    saveKit(id: string, name: string, path: string, data: any): Promise<void>;
-    loadKit(path: string): Promise<any>;
 }
 
 // === Global Window Augmentation ===
@@ -90,7 +89,6 @@ export type IpcChannels =
     | 'db:get-track'
     | 'db:search-tracks'
     | 'db:get-all-tracks'
-    | 'db:save-kit'
-    | 'db:load-kit';
+    | 'dialog:save-session';
 
 export {};

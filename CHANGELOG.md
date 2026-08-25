@@ -1,5 +1,58 @@
 # Changelog
 
+## [v4.20.1] — 2026-08-25 — "Full Audit Fix Batch"
+
+Full-codebase defect audit (5 critical, 9 high, 23 medium findings) with fixes applied and verified via `tsc --noEmit`, the full Jest suite, esbuild bundle, and Playwright smoke test.
+
+### 🚨 Critical Fixes
+
+- **Session save silently failed**: renderer rewrote the dialog-returned path (`.json` → `.session.json`), desyncing it from the main-process write allowlist — every save was rejected while the UI toasted "SESSION SAVED". Added dedicated `dialog:save-session` IPC channel with a correct default filename; the save result is checked and failures surface an error toast.
+- **Player died after first AutoMix crossfade**: transport/metadata listeners were bound to one `<audio>` element; `swapChannels()` promoted the other (handler-less) element, freezing the progress bar, auto-advance, and AutoMix triggering permanently. Handlers now wire both channel elements with identity guards; the loop flag follows the promoted channel.
+- **`require()` crashed the browser bundle**: four `require('./sampler')`/`require('./playlist')` calls compiled to throwing `__require` shims under esbuild ESM output. Crash snapshots never captured pad state, pad restore was dead code, and "1-BAR LOOP" threw on every click. Replaced with static imports; built bundle verified shim-free.
+- **Sampler tempo reference was permanently null**: `initSampler()` ran before `initPlayer()` cached the tempo slider DOM node, so pads always played at rate 1.0 and SYNC ignored the Chopper & Screwer slider. Init order fixed.
+- **Sonetra AI feature was unwired**: no renderer code ever called `window.sonetra.*`. The "AI Auto-Mix (Sonetra)" checkbox now pre-warms the transition cache during AutoMix blends (full AI-transition playback remains future work).
+
+### 🔒 Security
+
+- `fs:read-file` restricted to media/kit extensions (wav/mp3/ogg/flac/m4a/aac/json) with a 100 MB cap; `fs:save-file` enforces the same cap.
+- `app:open-external` whitelisted to README.md only (blocks path traversal into Notepad).
+- Sonetra path fallback now requires an audio extension and an existing file instead of approving any path.
+- CSP hardened: dropped `unsafe-eval` and script `unsafe-inline`; added `worker-src 'self'`.
+- Kit loading validates pad indices (0–15) from untrusted JSON before writing sampler arrays.
+- Single-instance lock prevents two processes racing SQLite WAL and the Sonetra port.
+
+### 🐛 High-Severity Bugs
+
+- **Playlist index corruption**: delete/search/reorder no longer desync `currentTrackIndex` or leave stale multi-select indices; deleting the playing track stops playback cleanly.
+- **Audio worker hang**: worker crashes are recoverable — pending requests reject with typed errors and the next request spawns a fresh worker (previously all later requests hung forever).
+- **Recording tail truncation**: recorder waits for the worklet's STOPPED ack and detaches chunks before compiling WAV.
+- **Session settings restore**: loaded AutoMix toggles are applied to the DOM before persisting — stale checkboxes were overwriting them immediately.
+- **Mic leak**: opening Settings stops its temporary microphone stream instead of leaving it hot.
+- **macOS relaunch crash**: IPC handlers register once at top level instead of inside `createWindow()`.
+- **ESC couldn't close the crash-recovery prompt**: modal visibility unified through the shared modals API; conflicting duplicate ESC handler removed.
+- **Kit save bugs**: volume-0 pads saved as volume 1 (`||` → `??`); mic-recorded pads excluded with an explanatory toast.
+- **Out-of-scope DOM references**: `padContextMenu`/`controlContextMenu` referenced outside their declaring scope in play/loop menu handlers — guaranteed ReferenceError on use (exposed by the project's first typecheck run).
+
+### 🛠️ Improvements
+
+- `←`/`→` seek ±5 s implemented (was documented but missing).
+- Master volume/tempo sliders lock during crossfade; volume drag no longer stomps fade automation.
+- Loading a track during an active crossfade is blocked; Stop cancels scheduled gain/EQ automation and reclaims blob URLs.
+- Audio elements log media errors instead of failing silently; canceling the recording save dialog warns instead of discarding the take.
+- MP3 magic numbers extended (MPEG2/2.5 variants) + M4A/WebM recognized; playlist analysis applies the same audio-signature policy as the sampler.
+- Log manager flushes buffered INFO/WARN entries to disk every 10 s — the log file is no longer empty in normal operation.
+- Crash recovery uses rotation keys `_1`/`_2`; the restore prompt resolves before DB load so restores aren't clobbered.
+- VirtualScroller observes resize (no more blank rows after maximize); blob URLs revoked on unload.
+- Sonetra: async pip install (no more 120 s main-process freeze), spawn race guard, health-check kill preserves auto-restart semantics.
+- Toast stack capped; Console CLEAR also clears the logger ring buffer; MIDI learn times out after 10 s; CC map defaults deduplicated (CC7 = master volume only).
+- Device selects persist selections and route output via `setSinkId` where supported.
+- Dead code purged across utils/modals/logger/session/crash-recovery/audio/reactive-ui; dead constants deleted, hardcoded duplicates adopted.
+- `package.json`: removed unused `webmidi` runtime dependency; artifact names use `${version}`; added `"typecheck": "tsc --noEmit"` script.
+
+### 🧪 Testing
+
+- Updated `tests/state.test.ts` CC-map default assertion to match the corrected mapping. All 77 tests pass.
+
 ## [v4.20.0] — 2026-07-22 — "Structural Overhaul & Performance"
 
 ### 🧩 Architecture

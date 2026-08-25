@@ -7,27 +7,46 @@ export type LogLevel = 'INFO' | 'WARN' | 'ERROR' | 'DEBUG';
 
 class LogManager {
     private readonly MAX_BUFFER_SIZE = 1 * 1024 * 1024; // 1MB
+    private readonly FLUSH_INTERVAL_MS = 10_000;
     private buffer: string[] = [];
     private currentBufferSize = 0;
     private logFilePath: string;
+    private flushTimer: ReturnType<typeof setInterval> | null = null;
 
     constructor() {
         const userDataPath = app.getPath('userData');
         this.logFilePath = path.join(userDataPath, 'gangsta_log.txt');
+        // Buffered entries must reach disk even without a crash — otherwise
+        // the log file stays empty in normal operation.
+        this.flushTimer = setInterval(() => this.flushBuffer(), this.FLUSH_INTERVAL_MS);
+        this.flushTimer.unref?.();
         this.info('=== LOG MANAGER INITIALIZED ===');
     }
 
     public log(level: LogLevel, source: 'MAIN' | 'RENDERER', message: string) {
         const timestamp = new Date().toISOString();
         const entry = `[${timestamp}] [${source}] [${level}] ${message}\n`;
-        
+
         // Add to ring buffer
         this.addToBuffer(entry);
 
         // Immediate flush for High Interest events
-        if (level === 'ERROR' || (level === 'WARN' && message.includes('CRITICAL'))) {
+        if (level === 'ERROR' || level === 'WARN') {
             this.flushEntryToDisk(entry);
+            const idx = this.buffer.indexOf(entry);
+            if (idx !== -1) {
+                this.buffer.splice(idx, 1);
+                this.currentBufferSize -= Buffer.byteLength(entry, 'utf8');
+            }
         }
+    }
+
+    private flushBuffer(): void {
+        if (this.buffer.length === 0) return;
+        const batch = this.buffer.join('');
+        this.buffer = [];
+        this.currentBufferSize = 0;
+        this.flushEntryToDisk(batch);
     }
 
     private addToBuffer(entry: string) {
@@ -53,6 +72,14 @@ class LogManager {
 
     public info(msg: string) { this.log('INFO', 'MAIN', msg); }
     public error(msg: string) { this.log('ERROR', 'MAIN', msg); }
+
+    public close(): void {
+        if (this.flushTimer) {
+            clearInterval(this.flushTimer);
+            this.flushTimer = null;
+        }
+        this.flushBuffer();
+    }
 
     public getBufferContents(): string {
         return this.buffer.join('');

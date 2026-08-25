@@ -2,6 +2,7 @@
 import { toast } from './toast';
 import { showConfirm, openModal, closeModal } from './modals';
 import { logger } from './logger';
+import { DEFAULT_TRACK_DURATION_S, DEFAULT_BTN_DURATION_S } from './constants';
 
 interface AutoMixSettings {
     eqCrossfade: boolean;
@@ -35,8 +36,8 @@ const _settings: Settings = {
         filterSweep: true,
         hpfSweep: true,
         bpmSync: false,
-        trackDuration: 10.0,
-        btnDuration: 4.0,
+        trackDuration: DEFAULT_TRACK_DURATION_S,
+        btnDuration: DEFAULT_BTN_DURATION_S,
         enableAI: false
     }
 };
@@ -86,26 +87,9 @@ export function initSettings(deps: { setAutoMixEnabled: (enabled: boolean) => vo
 
     setupSettingsHandlers();
     loadSettings();
-
-    // Escape key closes topmost modal or context menu
-    document.addEventListener('keydown', (e) => {
-        if (e.key !== 'Escape') return;
-        // Priority order: child modals first, then parent settings modal, then context menus
-        const modals = ['confirmModal', 'autoMixModal', 'helpModal', 'consoleModal', 'settingsModal', 'padContextMenu', 'contextMenu', 'controlContextMenu', 'playContextMenu', 'loopContextMenu'];
-        for (const id of modals) {
-            const el = document.getElementById(id);
-            if (!el) continue;
-            const isVisible = el.style.display === 'block' || 
-                              el.style.display === 'flex' ||
-                              (el.style.display !== 'none' && getComputedStyle(el).display !== 'none');
-            if (isVisible) {
-                closeModal(el);
-                e.preventDefault();
-                e.stopPropagation();
-                break;
-            }
-        }
-    });
+    // ESC-close is handled once in js/main.ts setupGlobalKeyboardShortcuts —
+    // a second handler here used a different visibility model (.active class
+    // vs style.display) and left crash-recovery prompts stuck open.
 }
 
 export function loadSettings(): void {
@@ -123,7 +107,7 @@ export function loadSettings(): void {
     }
 }
 
-function applySettingsToUI(): void {
+export function applySettingsToUI(): void {
     const fullScreenToggle = document.getElementById('fullScreenToggle') as HTMLInputElement;
     if (fullScreenToggle) fullScreenToggle.checked = !!settings.fullScreen;
 
@@ -186,6 +170,17 @@ export function setupSettingsHandlers(): void {
     if (btnOpenAutoMix && autoMixModal) btnOpenAutoMix.addEventListener('click', () => { openModal(autoMixModal); });
     if (closeAutoMix && autoMixModal) closeAutoMix.addEventListener('click', () => { closeModal(autoMixModal); });
     if (closeAutoMixBtn && autoMixModal) closeAutoMixBtn.addEventListener('click', () => { closeModal(autoMixModal); });
+
+    // Device selects were stored but never actuated — persist + route output
+    const inputSelect = document.getElementById('inputDeviceSelect') as HTMLSelectElement;
+    const outputSelect = document.getElementById('outputDeviceSelect') as HTMLSelectElement;
+    inputSelect?.addEventListener('change', () => {
+        updateSettings({ inputDevice: inputSelect.value });
+    });
+    outputSelect?.addEventListener('change', () => {
+        updateSettings({ outputDevice: outputSelect.value });
+        applyOutputDevice(outputSelect.value);
+    });
 
     // Auto-save on any change
     const inputs = ['fullScreenToggle', 'mixOptEQCrossfade', 'mixOptFilterSweep', 'mixOptHPFSweep', 'mixOptBPMSync', 'mixOptEnableAI'];
@@ -291,6 +286,9 @@ export function setupSettingsHandlers(): void {
     }
     if (consoleClearBtn) {
         consoleClearBtn.addEventListener('click', () => {
+            // Clear the ring buffer too — previously "CLEARED" only wiped the
+            // DOM and every log resurrected on the next modal open.
+            logger.clearLogs();
             if (consoleOutput) consoleOutput.innerHTML = '';
             toast.info("CONSOLE CLEARED");
         });
@@ -324,6 +322,7 @@ async function refreshAudioDevices(): Promise<void> {
     const outputSelect = document.getElementById('outputDeviceSelect') as HTMLSelectElement;
     if (!inputSelect || !outputSelect) return;
 
+    let stream: MediaStream | null = null;
     try {
         // Check if we already have mic permission before requesting
         let hasPermission = false;
@@ -336,7 +335,9 @@ async function refreshAudioDevices(): Promise<void> {
             }
         }
         if (!hasPermission) {
-            await navigator.mediaDevices.getUserMedia({ audio: true });
+            // The stream exists ONLY to unlock device labels — it must be
+            // released immediately or the mic stays hot at the OS level.
+            stream = await navigator.mediaDevices.getUserMedia({ audio: true });
         }
         const devices = await navigator.mediaDevices.enumerateDevices();
         inputSelect.innerHTML = '';
@@ -349,7 +350,36 @@ async function refreshAudioDevices(): Promise<void> {
             if (device.kind === 'audioinput') inputSelect.appendChild(option);
             else if (device.kind === 'audiooutput') outputSelect.appendChild(option);
         });
+
+        // Reflect persisted selections
+        if (settings.inputDevice && settings.inputDevice !== 'default') {
+            inputSelect.value = settings.inputDevice;
+        }
+        if (settings.outputDevice && settings.outputDevice !== 'default') {
+            outputSelect.value = settings.outputDevice;
+        }
     } catch (e) { 
         logger.warn("Device refresh failed", e); 
+    } finally {
+        stream?.getTracks().forEach(t => t.stop());
+    }
+}
+
+/**
+ * Best-effort output routing via setSinkId on the deck audio elements.
+ * Chromium supports it; failures are non-fatal.
+ */
+async function applyOutputDevice(deviceId: string): Promise<void> {
+    try {
+        const { engine } = await import('./audio-engine');
+        for (const channel of [engine.main, engine.crossfade]) {
+            const audio = channel.audio as HTMLAudioElement & { setSinkId?: (id: string) => Promise<void> };
+            if (typeof audio.setSinkId === 'function') {
+                await audio.setSinkId(deviceId === 'default' ? '' : deviceId);
+            }
+        }
+        logger.info(`[Settings] Output device applied: ${deviceId}`);
+    } catch (e) {
+        logger.warn(`[Settings] Could not apply output device: ${e}`);
     }
 }

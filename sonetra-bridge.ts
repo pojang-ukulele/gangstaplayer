@@ -8,11 +8,22 @@
  *   - Callbacks for status changes (notifies main process)
  */
 
-import { spawn, ChildProcess, execSync } from 'child_process';
+import { spawn, ChildProcess, execFile } from 'child_process';
 import * as path from 'path';
 import * as http from 'http';
 import * as fs from 'fs';
 import FormData from 'form-data';
+
+const AUDIO_EXTENSIONS = new Set(['wav', 'mp3', 'ogg', 'flac', 'm4a', 'aac']);
+
+function execFileAsync(cmd: string, args: string[], timeoutMs: number): Promise<void> {
+    return new Promise((resolve, reject) => {
+        execFile(cmd, args, { timeout: timeoutMs, windowsHide: true }, (err) => {
+            if (err) reject(err);
+            else resolve();
+        });
+    });
+}
 
 // ==================== PATH WHITELISTING ====================
 // List of allowed directories for audio file access.
@@ -70,11 +81,18 @@ function isSafeAudioPath(filePath: string): { safe: boolean; resolved?: string; 
             return { safe: true, resolved };
         }
 
-        // FALLBACK: If the path came from a native file dialog, it's already user-consented.
-        // Check if the file exists and is accessible to the current user.
-        // This provides defense-in-depth: even without a whitelist match, paths from
-        // user-authorized sources (file dialogs, drag-drop) are accepted.
-        // In production, this fallback should only accept paths from user-authorized sources.
+        // FALLBACK: Paths that arrive here come from native file dialogs or
+        // drag-drop in the renderer (user-consented sources). The whitelist
+        // cannot enumerate every music folder, so consented paths are accepted
+        // — but only if they exist and look like audio files.
+        const ext = path.extname(resolved).replace('.', '').toLowerCase();
+        if (!AUDIO_EXTENSIONS.has(ext)) {
+            return { safe: false, error: `Non-audio file type rejected (.${ext})` };
+        }
+        if (!fs.existsSync(resolved)) {
+            return { safe: false, error: 'File does not exist' };
+        }
+        console.warn(`[Sonetra] Path outside whitelist accepted via user-consent fallback: ${resolved}`);
         return { safe: true, resolved };
 
     } catch (err: any) {
@@ -149,10 +167,7 @@ class SonetraBridge {
     private async _ensureDependencies(pythonCmd: string): Promise<{ ok: boolean; error?: string }> {
         // Check if uvicorn is already importable (fast path)
         try {
-            execSync(`"${pythonCmd}" -c "import uvicorn; import fastapi"`, {
-                stdio: 'pipe',
-                timeout: 10000
-            });
+            await execFileAsync(pythonCmd, ['-c', 'import uvicorn; import fastapi'], 10_000);
             return { ok: true }; // Already installed
         } catch {
             // Not installed — check for requirements file
@@ -180,10 +195,8 @@ class SonetraBridge {
 
         console.log(`[Sonetra] Installing Python dependencies from ${reqPath}...`);
         try {
-            execSync(`"${pythonCmd}" -m pip install -r "${reqPath}"`, {
-                stdio: 'pipe',
-                timeout: 120_000 // 2 minutes for first install
-            });
+            // Async — a 2-minute pip install must NOT freeze the main process event loop
+            await execFileAsync(pythonCmd, ['-m', 'pip', 'install', '-r', reqPath], 120_000);
             console.log('[Sonetra] Dependencies installed successfully');
             return { ok: true };
         } catch (err: any) {
@@ -236,12 +249,25 @@ class SonetraBridge {
             console.log('[Sonetra] Server already running');
             return { success: true, message: 'Server already running' };
         }
+        // Re-entry guard: during the 3–8 s health-check window isRunning is
+        // still false; without this a second caller spawns a duplicate uvicorn.
+        if ((this as any)._starting) {
+            return { success: false, error: 'Server start already in progress' };
+        }
+        (this as any)._starting = true;
+        try {
+            return await this._startServerInner();
+        } finally {
+            (this as any)._starting = false;
+        }
+    }
 
+    private async _startServerInner(): Promise<{ success: boolean; message?: string, port?: number, error?: string }> {
         this.sonetraPath = this._findSonetraPath();
         if (!this.sonetraPath) {
-            return { 
-                success: false, 
-                error: 'Sonetra AI Mixer not found. Please ensure the Sonetra-AI-Mixer-main folder is in the app directory.' 
+            return {
+                success: false,
+                error: 'Sonetra AI Mixer not found. Please ensure the Sonetra-AI-Mixer-main folder is in the app directory.'
             };
         }
 
@@ -254,11 +280,7 @@ class SonetraBridge {
             const setupScript = path.join(__dirname, '..', 'scripts', 'setup-sonetra.js');
             if (fs.existsSync(setupScript)) {
                 try {
-                    execSync(`node "${setupScript}"`, {
-                        cwd: path.join(__dirname, '..'),
-                        stdio: 'inherit',
-                        timeout: 120000
-                    });
+                    await execFileAsync(process.execPath, [setupScript], 120_000);
                     console.log('[Sonetra] Auto-setup succeeded — re-resolving Python');
                     pythonCmd = this._resolvePythonCmd();
                 } catch (e: any) {
@@ -268,7 +290,7 @@ class SonetraBridge {
         }
 
         // Ensure Python dependencies are installed before spawning
-        let depsOk = { ok: false, error: 'Unknown error during dependency check' };
+        let depsOk: { ok: boolean; error?: string } = { ok: false, error: 'Unknown error during dependency check' };
         try {
             depsOk = await this._ensureDependencies(pythonCmd);
         } catch (e: any) {
@@ -330,8 +352,8 @@ class SonetraBridge {
                     this.serverProcess = null;
                     this._stopHealthPolling();
 
-                    if (wasRunning && code !== 0) {
-                        // Unexpected crash — attempt auto-restart
+                    if (wasRunning && (code === null || code !== 0)) {
+                        // Unexpected crash (non-zero exit or signal kill) — attempt auto-restart
                         this._fireStatus('crashed', { 
                             message: `Server exited with code ${code}`, 
                             attempt: this._restartCount + 1 
@@ -447,12 +469,31 @@ class SonetraBridge {
             if (!healthy) {
                 console.warn('[Sonetra] Health check failed — server is unresponsive.');
                 this._fireStatus('crashed', { message: 'Health check failed' });
-                // Force-kill and let the close handler trigger restart
-                this.stopServer().then(() => {
-                    // After stop, _attemptRestart will be called from close handler
-                });
+                // Kill the process WITHOUT clearing isRunning first — the close
+                // handler must see wasRunning=true so it triggers _attemptRestart.
+                this._forceKill();
             }
         }, this._healthPollIntervalMs);
+    }
+
+    /**
+     * Kill the running process while preserving "was running" state, so the
+     * close handler treats it as a crash and auto-restarts.
+     */
+    private _forceKill(): void {
+        const proc = this.serverProcess;
+        if (!proc) return;
+        this.serverProcess = null;
+        this._stopHealthPolling();
+        if (process.platform === 'win32' && proc.pid) {
+            const killer = spawn('taskkill', ['/pid', String(proc.pid), '/f', '/t']);
+            killer.on('error', (e) => {
+                console.warn('[Sonetra] taskkill failed:', e.message);
+                try { proc.kill(); } catch { /* already dead */ }
+            });
+        } else {
+            try { proc.kill('SIGTERM'); } catch { /* already dead */ }
+        }
     }
 
     /**
@@ -520,7 +561,7 @@ class SonetraBridge {
         }
         // It's a system command (e.g. 'py', 'python3') — try to run it
         try {
-            execSync(`"${cmd}" --version`, { stdio: 'ignore', timeout: 5000 });
+            await execFileAsync(cmd, ['--version'], 5000);
             return true;
         } catch {
             return false;
@@ -556,7 +597,14 @@ class SonetraBridge {
             console.log('[Sonetra] Stopping server...');
             
             if (process.platform === 'win32') {
-                spawn('taskkill', ['/pid', String(this.serverProcess.pid), '/f', '/t']);
+                const proc = this.serverProcess;
+                if (proc?.pid) {
+                    const killer = spawn('taskkill', ['/pid', String(proc.pid), '/f', '/t']);
+                    killer.on('error', (e) => {
+                        console.warn('[Sonetra] taskkill failed:', e.message);
+                        try { proc.kill(); } catch { /* already dead */ }
+                    });
+                }
             } else {
                 this.serverProcess.kill('SIGTERM');
             }

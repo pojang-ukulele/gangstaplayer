@@ -8,6 +8,15 @@ import { engine } from './audio-engine';
 import { logger } from './logger';
 import { normalizeToArrayBuffer } from './utils';
 import { showConfirm } from './modals';
+import {
+    BLOB_REVOKE_DELAY_MS,
+    BLOB_REVOKE_CROSSFADE_MS,
+    CROSSFADE_RAMP_LOW_DB,
+    CROSSFADE_RAMP_MID_DB,
+    CROSSFADE_LP_SWEEP_HZ,
+    CROSSFADE_HP_SWEEP_HZ,
+    SLIDER_SNAP_THRESHOLD,
+} from './constants';
 import './types';
 
 interface PlayerDeps {
@@ -22,7 +31,7 @@ let crossfadeBlobUrl: string = "";
  * Revokes a Blob URL after a delay to ensure the browser has finished buffering.
  * Prevents "Source Error" when skipping tracks rapidly.
  */
-function revokeLater(url: string, delay = 5000): void {
+function revokeLater(url: string, delay = BLOB_REVOKE_DELAY_MS): void {
     if (!url || !url.startsWith('blob:')) return;
     setTimeout(() => {
         try {
@@ -84,9 +93,12 @@ let _loadTrackId = 0;
 
 export function setPlaybackMode(mode: PlaybackMode): void { state.update({ playbackMode: mode }); }
 export function getPlaybackMode(): PlaybackMode { return state.playbackMode; }
-export function setLoopMode(mode: LoopMode): void { 
-    state.update({ loopMode: mode }); 
+export function setLoopMode(mode: LoopMode): void {
+    state.update({ loopMode: mode });
+    // Apply to both channels: after a swap the promoted element must inherit
+    // the flag or LOOP ONE silently dies post-crossfade.
     engine.main.audio.loop = (mode === 'one');
+    engine.crossfade.audio.loop = false;
 }
 export function getLoopMode(): LoopMode { return state.loopMode; }
 
@@ -129,6 +141,7 @@ export function initPlayer(deps: PlayerDeps): void {
             loopBtn.setAttribute('aria-pressed', String(mode !== 'off'));
         }
         engine.main.audio.loop = (mode === 'one');
+        engine.crossfade.audio.loop = false;
     });
 
     setupPlayerHandlers();
@@ -151,7 +164,21 @@ export function getMasterBPMRef(): { value: number } {
 export function getTempoSlider(): HTMLInputElement | null { return tempoSlider; }
 export function getPlayerAudio(): HTMLAudioElement { return engine.main.audio; }
 
+/** Immediately revoke tracked blob URLs (called on app teardown). */
+export function disposePlayerUrls(): void {
+    for (const url of [mainBlobUrl, crossfadeBlobUrl]) {
+        if (url && url.startsWith('blob:')) {
+            try { URL.revokeObjectURL(url); } catch { /* ignore */ }
+        }
+    }
+    mainBlobUrl = "";
+    crossfadeBlobUrl = "";
+}
+
 export async function loadTrack(index: number): Promise<void> {
+    // Loading into main mid-crossfade would clobber the outgoing channel's
+    // gain/EQ automation while the blend is running.
+    if (state.isCrossfadeInProgress) return;
     const playlist = state.playlist;
     if (!playlist.length || index < 0 || index >= playlist.length) return;
     const track = playlist[index];
@@ -182,7 +209,7 @@ export async function loadTrack(index: number): Promise<void> {
         try {
             const rawData = await window.fileSystem.readFile(track.path);
             if (_loadTrackId !== loadId) {
-                hideSpinnerIfCurrent(loadId, index);
+                hideSpinnerIfCurrent(loadId);
                 return; // cancelled by newer loadTrack call
             }
             
@@ -191,7 +218,7 @@ export async function loadTrack(index: number): Promise<void> {
             // Use native decoder (reliable)
             const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
             if (_loadTrackId !== loadId) {
-                hideSpinnerIfCurrent(loadId, index);
+                hideSpinnerIfCurrent(loadId);
                 return; // cancelled
             }
 
@@ -199,16 +226,17 @@ export async function loadTrack(index: number): Promise<void> {
             if (!hasBpm) {
                 const detectedValue = await detectBPMWorker(audioBuffer);
                 if (_loadTrackId !== loadId) {
-                    hideSpinnerIfCurrent(loadId, index);
+                    hideSpinnerIfCurrent(loadId);
                     return; // cancelled
                 }
                 track.bpm = detectedValue;
                 state.update({ masterBPM: detectedValue });
+                if (renderPlaylistFn) renderPlaylistFn();
                 logger.info(`[Player] Async analysis complete: ${detectedValue} BPM`);
             }
 
             // Hide spinner now that analysis is done
-            hideSpinnerIfCurrent(loadId, index);
+            hideSpinnerIfCurrent(loadId);
 
             // 2. Final display update
             if (trackTitle && state.currentTrackIndex === index) {
@@ -217,7 +245,7 @@ export async function loadTrack(index: number): Promise<void> {
             }
         } catch (e) {
             logger.warn("[Player] Load/Analysis pipeline issue", e);
-            hideSpinnerIfCurrent(loadId, index);
+            hideSpinnerIfCurrent(loadId);
             // Don't show error to user — just show the track name
             if (trackTitle && state.currentTrackIndex === index) {
                 trackTitle.innerText = track.name;
@@ -229,7 +257,10 @@ export async function loadTrack(index: number): Promise<void> {
 function updateControlsLock(locked: boolean): void {
     const nextBtn = document.getElementById('nextBtn');
     const prevBtn = document.getElementById('prevBtn');
-    const lockable = [progressBar, playPauseBtn, stopBtn, nextBtn, prevBtn];
+    const loopBtn = document.getElementById('loopBtn');
+    // Sliders must lock too: dragging volume mid-blend executes
+    // gain automation on the outgoing channel and desyncs the mix.
+    const lockable = [progressBar, playPauseBtn, stopBtn, nextBtn, prevBtn, loopBtn, masterVol, tempoSlider];
     lockable.forEach(el => {
         if (el) {
             (el as HTMLButtonElement | HTMLInputElement).disabled = locked;
@@ -258,7 +289,9 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
     }
     resumeAudioContext();
     const nextIdx = targetIndex !== null ? targetIndex : ((state.currentTrackIndex + 1) % playlist.length);
-    if (playlist[nextIdx].path === engine.main.audio.src && !targetIndex) return; 
+    // Only bail when auto-advancing into the track that's already loaded.
+    // (Comparing against audio.src is useless here — src is a blob: URL.)
+    if (targetIndex === null && nextIdx === state.currentTrackIndex) return;
 
     state.update({ isCrossfadeInProgress: true });
     updateControlsLock(true);
@@ -269,7 +302,20 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
     engine.crossfade.reset();
     const safeUrl = await getSafeUrl(playlist[nextIdx].path, false);
     engine.crossfade.load(safeUrl);
-    
+
+    // Sonetra AI integration (minimal): when enabled, pre-warm the transition
+    // cache for this pair so future mixes have AI transitions available.
+    // Full AI-generated transition playback requires the Python backend to
+    // return a playable buffer AND a playback design decision — the checkbox
+    // previously did literally nothing.
+    if (settings.autoMix.enableAI && window.sonetra) {
+        const cur = playlist[state.currentTrackIndex];
+        const nxt = playlist[nextIdx];
+        window.sonetra.precomputeTransition(cur.path, nxt.path)
+            .then((r) => logger.info(`[AutoMix] Sonetra transition cache: ${r.success ? (r.cached ? 'hit' : 'generated') : r.error}`))
+            .catch(() => { /* offline / server down — non-fatal */ });
+    }
+
     cross.lowEQ.gain.value = settings.autoMix.eqCrossfade ? -24 : 0;
     cross.midEQ.gain.value = settings.autoMix.eqCrossfade ? -6 : 0;
     cross.gain.gain.value = 0.001;
@@ -293,13 +339,13 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
     if (settings.autoMix.eqCrossfade) {
         main.lowEQ.gain.cancelScheduledValues(now);
         main.lowEQ.gain.setValueAtTime(0, now);
-        main.lowEQ.gain.linearRampToValueAtTime(-24, now + duration * 0.8);
-        main.midEQ.gain.linearRampToValueAtTime(-12, now + duration);
+        main.lowEQ.gain.linearRampToValueAtTime(CROSSFADE_RAMP_LOW_DB, now + duration * 0.8);
+        main.midEQ.gain.linearRampToValueAtTime(CROSSFADE_RAMP_MID_DB, now + duration);
     }
     if (settings.autoMix.filterSweep) {
         main.lpFilter.frequency.cancelScheduledValues(now);
         main.lpFilter.frequency.setValueAtTime(20000, now);
-        main.lpFilter.frequency.exponentialRampToValueAtTime(600, now + duration);
+        main.lpFilter.frequency.exponentialRampToValueAtTime(CROSSFADE_LP_SWEEP_HZ, now + duration);
     }
     main.gain.gain.cancelScheduledValues(now);
     main.gain.gain.setValueAtTime(main.gain.gain.value, now);
@@ -308,13 +354,13 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
     // --- AUTOMATION: INCOMING (Crossfade) ---
     if (settings.autoMix.eqCrossfade) {
         cross.lowEQ.gain.cancelScheduledValues(now);
-        cross.lowEQ.gain.setValueAtTime(-24, now);
+        cross.lowEQ.gain.setValueAtTime(CROSSFADE_RAMP_LOW_DB, now);
         cross.lowEQ.gain.linearRampToValueAtTime(0, now + duration * 0.8); 
         cross.midEQ.gain.linearRampToValueAtTime(0, now + duration);
     }
     if (settings.autoMix.hpfSweep) {
         cross.hpFilter.frequency.cancelScheduledValues(now);
-        cross.hpFilter.frequency.setValueAtTime(2000, now);
+        cross.hpFilter.frequency.setValueAtTime(CROSSFADE_HP_SWEEP_HZ, now);
         cross.hpFilter.frequency.exponentialRampToValueAtTime(30, now + duration * 0.8);
     }
     cross.gain.gain.cancelScheduledValues(now);
@@ -343,7 +389,7 @@ function finishCrossfade(nextIndex: number): void {
     crossfadeBlobUrl = ""; 
     
     // Nuking the old main only after it's definitely stopped and a new one is playing.
-    if (oldMainUrl) revokeLater(oldMainUrl, 3000);
+    if (oldMainUrl) revokeLater(oldMainUrl, BLOB_REVOKE_CROSSFADE_MS);
 
     state.update({ currentTrackIndex: nextIndex, isCrossfadeInProgress: false });
     updateControlsLock(false);
@@ -384,36 +430,63 @@ export function stopPlayback(): void {
     engine.main.audio.currentTime = 0;
     engine.crossfade.audio.pause();
     engine.crossfade.audio.src = "";
-    
+
+    // Cancel any in-flight crossfade automation — otherwise scheduled gain/EQ
+    // ramps keep running and the next replay starts muted or swept.
+    engine.main.reset();
+    engine.crossfade.reset();
+
+    // The crossfade source is dead now; reclaim its blob URL
+    if (crossfadeBlobUrl) {
+        revokeLater(crossfadeBlobUrl);
+        crossfadeBlobUrl = "";
+    }
+
     state.update({ isPlaying: false, isCrossfadeInProgress: false });
     updateControlsLock(false);
-    
+
     if (progressBar) progressBar.value = "0";
     if (setBlendingIndexFn) setBlendingIndexFn(-1);
     if (autoMixBtn) autoMixBtn.classList.remove('blending');
 }
 
 export function setupPlayerHandlers(): void {
-    if (!engine.main.audio) return;
-    
-    engine.main.audio.ontimeupdate = () => {
-        if (!isDraggingProgress && engine.main.audio.duration) {
-            const progress = (engine.main.audio.currentTime / engine.main.audio.duration) * 100;
+    // Wire BOTH channel elements. swapChannels() promotes the other element
+    // after every crossfade — listeners bound to a single element die with the
+    // first swap, freezing the progress bar and auto-advance. Each listener
+    // guards on element identity so only the CURRENT main channel acts.
+    for (const channel of [engine.main, engine.crossfade]) {
+        wireChannelHandlers(channel.audio);
+    }
+    setupTransportHandlers();
+}
+
+function wireChannelHandlers(el: HTMLAudioElement): void {
+    if (!el || (el as any).__ugWired) return;
+    (el as any).__ugWired = true;
+
+    const isCurrentMain = () => engine.main.audio === el;
+
+    el.addEventListener('timeupdate', () => {
+        if (!isCurrentMain()) return;
+        if (!isDraggingProgress && el.duration) {
+            const progress = (el.currentTime / el.duration) * 100;
             if (progressBar) progressBar.value = progress.toString();
-            if (timeDisplay) timeDisplay.innerText = formatTime(engine.main.audio.currentTime);
-            if (state.isAutoMixEnabled && !state.isCrossfadeInProgress && engine.main.audio.duration > settings.autoMix.trackDuration * 2) {
-                if (engine.main.audio.currentTime >= engine.main.audio.duration - settings.autoMix.trackDuration) {
+            if (timeDisplay) timeDisplay.innerText = formatTime(el.currentTime);
+            if (state.isAutoMixEnabled && !state.isCrossfadeInProgress && el.duration > settings.autoMix.trackDuration * 2) {
+                if (el.currentTime >= el.duration - settings.autoMix.trackDuration) {
                     startCrossfade();
                 }
             }
         }
-    };
+    });
 
-    engine.main.audio.onended = () => {
+    el.addEventListener('ended', () => {
+        if (!isCurrentMain()) return;
         if (!state.isAutoMixEnabled && !state.isCrossfadeInProgress) {
             if (state.loopMode === 'one') {
-                engine.main.audio.currentTime = 0;
-                engine.main.audio.play();
+                el.currentTime = 0;
+                el.play();
                 return;
             }
 
@@ -427,14 +500,17 @@ export function setupPlayerHandlers(): void {
                 loadTrack(nextIndex).then(() => playTrack());
             }
         }
-    };
+    });
 
-    engine.main.audio.onloadedmetadata = () => {
-        if (totalTimeDisplay && engine.main.audio.duration) {
-            totalTimeDisplay.innerText = formatTime(engine.main.audio.duration);
+    el.addEventListener('loadedmetadata', () => {
+        if (!isCurrentMain()) return;
+        if (totalTimeDisplay && el.duration) {
+            totalTimeDisplay.innerText = formatTime(el.duration);
         }
-    };
+    });
+}
 
+function setupTransportHandlers(): void {
     if (progressBar) {
         progressBar.oninput = (e: Event) => {
             isDraggingProgress = true;
@@ -479,10 +555,11 @@ export function setupPlayerHandlers(): void {
     }
 
     if (tempoSlider) {
-        tempoSlider.oninput = (e: Event) => {
+        const slider = tempoSlider;
+        slider.oninput = (e: Event) => {
             const target = e.target as HTMLInputElement;
             let val = parseFloat(target.value);
-            if (Math.abs(val - 1.0) < 0.05) { val = 1.0; tempoSlider.value = "1.0"; }
+            if (Math.abs(val - 1.0) < SLIDER_SNAP_THRESHOLD) { val = 1.0; slider.value = "1.0"; }
             engine.main.audio.playbackRate = val;
             if (tempoVal) {
                 const displayBpm = state.masterBPM > 0 ? Math.round(state.masterBPM * val) : "---";
@@ -497,13 +574,12 @@ export function setupPlayerHandlers(): void {
     };
     if (stopBtn) stopBtn.onclick = stopPlayback;
     if (autoMixBtn) autoMixBtn.onclick = toggleAutoMix;
-    
+
     if (masterVol) {
         masterVol.oninput = () => {
+            // Master volume belongs ONLY to masterGain — touching the channel
+            // gain here would stomp crossfade fade automation.
             const val = parseFloat(masterVol!.value);
-            if (engine.main.gain) {
-                engine.main.gain.gain.value = 1.0;
-            }
             if (masterGain) {
                 masterGain.gain.value = val;
             }
@@ -519,7 +595,7 @@ export function setupPlayerHandlers(): void {
  * Hide the track spinner only if the given loadId is still the current one.
  * Prevents stale async completions from hiding the spinner for a newer loadTrack call.
  */
-function hideSpinnerIfCurrent(loadId: number, expectedIndex: number): void {
+function hideSpinnerIfCurrent(loadId: number): void {
     if (_loadTrackId === loadId && trackSpinner) {
         trackSpinner.classList.remove('active');
     }

@@ -27,6 +27,10 @@ class RecorderProcessor extends BaseProcessor {
         this.isRecording = true;
       } else if (event.data.type === 'STOP') {
         this.isRecording = false;
+        // Acknowledge so the client knows all DATA blocks are flushed.
+        // Without this, stop() compiled WAV while final blocks were in flight
+        // and the recording tail got truncated.
+        this.port.postMessage({ type: 'STOPPED' });
       }
     };
   }

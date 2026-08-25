@@ -2,6 +2,7 @@ import { audioCtx } from './audio';
 import { state, AppStateData } from './state';
 import { toast } from './toast';
 import { logger } from './logger';
+import { MIDI_LEARN_TIMEOUT_MS } from './constants';
 
 const MIDI_MAPPINGS_STORAGE_KEY = 'ug_midi_mappings';
 
@@ -99,6 +100,23 @@ export function initMIDI(deps: MidiDeps): void {
     loadMidiMappings();
     // Auto-save on future changes
     subscribeMappingAutoSave();
+
+    // Learn modes previously never timed out — a stray click stranded the
+    // app capturing every incoming note/CC until a successful bind.
+    let learnTimeout: ReturnType<typeof setTimeout> | null = null;
+    state.subscribe('isLearningMidi', (learning) => {
+        if (learnTimeout) {
+            clearTimeout(learnTimeout);
+            learnTimeout = null;
+        }
+        if (!learning) return;
+        learnTimeout = setTimeout(() => {
+            if (!state.isLearningMidi) return;
+            state.update({ isLearningMidi: false, midiLearnTarget: null });
+            toast.info("MIDI LEARN TIMED OUT");
+            logger.info('[MIDI] Learn mode timed out');
+        }, MIDI_LEARN_TIMEOUT_MS);
+    });
 }
 
 export function enableMIDI(): void {

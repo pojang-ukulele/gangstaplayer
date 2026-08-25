@@ -52,11 +52,12 @@
 
 ### 🛡️ SECURITY & RELIABILITY
 
-- **Path Validation:** All file I/O hardened against directory traversal and null-byte injection.
+- **Path Validation:** All file I/O hardened against directory traversal, null-byte injection, and oversized payloads. Reads are restricted to media/kit file types; writes go only to dialog-approved paths or the app data directory.
+- **Single Instance Lock:** Only one app instance can run at a time (protects the track database).
 - **Crash Recovery:** Persistent auto-save snapshots every 30s with post-mortem diagnostic reports.
-- **Event Listener Discipline:** `Disposable` utility class prevents listener leaks in dynamic components.
-- **Audio Signature Validation:** Magic-number verification ensures only valid WAV/MP3/OGG/FLAC files are loaded.
+- **Audio Signature Validation:** Magic-number verification ensures only valid WAV/MP3/OGG/FLAC/M4A/WebM files are loaded.
 - **Worklet Race Protection:** Retry logic for AudioWorklet initialization prevents silent engine startup failures.
+- **Recoverable Audio Worker:** BPM/WAV worker crashes reject pending work with clear errors and respawn on demand — no permanent hangs.
 
 ---
 
@@ -139,19 +140,19 @@
 
 ### Save Your Session
 
-- **Save Kit:** Click `SAVE KIT` to save your sampler pad configuration.
-- **Load Kit:** Click `LOAD KIT` to restore a saved configuration.
+- **Save Kit / Load Kit:** Click `SAVE KIT` / `LOAD KIT` to save or restore your sampler pad configuration (samples by path + volumes). Mic-recorded pads have no source file and are not included in kits.
+- **Save Session / Load Session:** Click `SAVE SESSION` to capture everything — pads, playlist, AutoMix settings, volume/tempo/loop/mode — into a single integrity-checked `.session.json` file. `LOAD SESSION` restores it all.
 - **Master Record:** Click the big `REC` button to record your entire output to WAV.
 
 ---
 
 ## 🛡️ Security & Reliability
 
-- **Sandboxed File I/O**: The renderer process can only write files to paths returned by native OS save dialogs or to the app's `userData` directory. All file paths are validated for traversal attacks and null-byte injection.
-- **Audio Validation**: Incoming audio files are checked for valid magic-number signatures (WAV, MP3, OGG, FLAC) before decoding, preventing non-audio files from crashing the pipeline.
-- **AutoMix Crash Recovery**: The AI mixer server auto-restarts on failure with exponential backoff (max 3 attempts). Python dependencies are auto-installed via `pip install -r sonetra-requirements.txt` when the server starts.
-- **Memory Safety**: Blob URLs are revoked with a delayed "graveyard" mechanism to prevent race conditions during rapid track skipping. All Web Audio nodes and event listeners are explicitly cleaned up via `Disposable` patterns.
-- **Test Coverage**: 77 automated tests covering audio engine, player logic, settings persistence, state management, and utility functions.
+- **Sandboxed File I/O**: The renderer process can only write files to paths returned by native OS save dialogs or to the app's `userData` directory. All file paths are validated for traversal attacks, null-byte injection, size limits, and media file types.
+- **Audio Validation**: Incoming audio files are checked for valid magic-number signatures (WAV, MP3, OGG, FLAC, M4A, WebM) before decoding, preventing non-audio files from crashing the pipeline.
+- **AutoMix Crash Recovery**: The AI mixer server auto-restarts on failure with backoff (max 3 attempts). Python dependencies are auto-installed via pip when the server starts (non-blocking).
+- **Memory Safety**: Blob URLs are revoked with a delayed "graveyard" mechanism to prevent race conditions during rapid track skipping, and reclaimed on app exit.
+- **Test Coverage**: 77 automated tests covering audio engine, player logic, settings persistence, state management, and utility functions, plus a Playwright smoke test. Run `npm run typecheck` before committing.
 
 ---
 
@@ -195,13 +196,12 @@ To bundle into an installer:
 npm run dist
 ```
 
-### Testing
+### Testing & Typecheck
 
 ```bash
-npm test
+npm test        # Jest suite (77 tests across 6 files, incl. Playwright smoke)
+npm run typecheck  # tsc --noEmit — esbuild does NOT typecheck; run this before committing
 ```
-
-Runs the Jest test suite (77 tests across 6 test files).
 
 ---
 

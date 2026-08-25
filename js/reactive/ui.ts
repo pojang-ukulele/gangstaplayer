@@ -15,7 +15,7 @@ export class VirtualScroller<T> {
     private overflowEl: HTMLElement;
     private contentEl: HTMLElement;
     private visibleItems: Map<number, HTMLElement> = new Map();
-    private disposables: Map<number, () => void> = new Map();
+    private resizeObserver: ResizeObserver | null = null;
     private _onScroll: () => void;
 
     constructor(options: {
@@ -56,6 +56,14 @@ export class VirtualScroller<T> {
 
         this._onScroll = () => this.refresh();
         this.container.addEventListener('scroll', this._onScroll);
+
+        // Without this, resizing/maximizing the window leaves stale viewport
+        // math and rows go missing until the next scroll event.
+        if (typeof ResizeObserver !== 'undefined') {
+            this.resizeObserver = new ResizeObserver(() => this.refresh());
+            this.resizeObserver.observe(this.container);
+        }
+
         this.updateItems(this.items);
     }
 
@@ -72,11 +80,8 @@ export class VirtualScroller<T> {
         const endIdx = Math.min(this.items.length - 1, Math.ceil((scrollTop + viewportHeight) / this.itemHeight) + 5);
 
         // Remove items no longer visible
-        for (const [idx, el] of this.visibleItems) {
+        for (const [idx, el] of Array.from(this.visibleItems)) {
             if (idx < startIdx || idx > endIdx || idx >= this.items.length) {
-                // Clean up row-level disposables before removing the element
-                const dispose = this.disposables.get(idx);
-                if (dispose) { try { dispose(); } catch { /* ignore */ } this.disposables.delete(idx); }
                 el.remove();
                 this.visibleItems.delete(idx);
             } else if (force) {
@@ -103,21 +108,13 @@ export class VirtualScroller<T> {
         this.container.scrollTop = index * this.itemHeight;
     }
 
-    /**
-     * Register a cleanup callback for a visible row index.
-     * Called automatically when the row scrolls out of view.
-     */
-    public registerDisposable(index: number, cleanup: () => void): void {
-        this.disposables.set(index, cleanup);
-    }
-
-    /** Destroy the scroller — cleans up all disposables and DOM. */
+    /** Destroy the scroller — cleans up listeners and DOM. */
     public destroy(): void {
         this.container.removeEventListener('scroll', this._onScroll);
-        for (const [, cleanup] of this.disposables) {
-            try { cleanup(); } catch { /* ignore */ }
+        if (this.resizeObserver) {
+            this.resizeObserver.disconnect();
+            this.resizeObserver = null;
         }
-        this.disposables.clear();
         this.visibleItems.clear();
         this.container.innerHTML = '';
     }

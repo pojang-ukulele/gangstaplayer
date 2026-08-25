@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3';
 import * as path from 'path';
-import * as fs from 'fs';
 import { app } from 'electron';
+import { MAX_PLAYLIST_SEARCH_RESULTS } from './js/constants';
 
 export class DatabaseManager {
     private db: Database.Database;
@@ -9,7 +9,7 @@ export class DatabaseManager {
     constructor() {
         const userDataPath = app.getPath('userData');
         const dbPath = path.join(userDataPath, 'gangsta.db');
-        
+
         this.db = new Database(dbPath);
         this.initSchema();
     }
@@ -107,8 +107,13 @@ export class DatabaseManager {
 
     // SEARCH / FILTER
     public searchTracks(query: string) {
-        const stmt = this.db.prepare('SELECT * FROM tracks WHERE name LIKE ? OR path LIKE ?');
-        const wildcard = `%${query}%`;
+        // Escape LIKE wildcards so user input like "50%" doesn't match everything
+        const escaped = String(query ?? '').replace(/[\\%_]/g, ch => '\\' + ch);
+        const wildcard = `%${escaped}%`;
+        const stmt = this.db.prepare(
+            `SELECT * FROM tracks WHERE name LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\'
+             ORDER BY name ASC LIMIT ${MAX_PLAYLIST_SEARCH_RESULTS}`
+        );
         return stmt.all(wildcard, wildcard).map((row: any) => {
             if (row.metadata) row.metadata = JSON.parse(row.metadata);
             return row;
@@ -120,4 +125,17 @@ export class DatabaseManager {
     }
 }
 
-export const dbManager = new DatabaseManager();
+// Lazy singleton: constructing pre-`whenReady` relies on Electron internals.
+// Main process creates the DB only when the first IPC handler needs it.
+let _instance: DatabaseManager | null = null;
+
+export function getDbManager(): DatabaseManager | null {
+    if (_instance) return _instance;
+    try {
+        _instance = new DatabaseManager();
+    } catch (e) {
+        console.error('[DB] Failed to initialize database:', e);
+        _instance = null;
+    }
+    return _instance;
+}

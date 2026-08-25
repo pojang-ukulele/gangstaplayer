@@ -9,11 +9,17 @@
 import { state, Track, LoopMode, PlaybackMode } from './state';
 import { toast } from './toast';
 import { logger } from './logger';
+// Static imports — require() throws at runtime in the ESM browser bundle,
+// which silently killed snapshot collection and restore entirely.
+import {
+    padBuffers, padPaths, padVolumes, padBPMs, padSyncState,
+    loadSampleFromPath
+} from './sampler';
+import { openModal, closeModal } from './modals';
 
 // === Constants ===
 
 const STORAGE_KEY = 'ug_crash_snapshot';
-const STORAGE_KEY_BACKUP = 'ug_crash_snapshot_bak';
 const AUTO_SAVE_INTERVAL_MS = 30_000; // Save every 30s
 const MIN_SAVE_INTERVAL_MS = 10_000;  // Don't save more often than this
 const MAX_SNAPSHOTS = 3;
@@ -89,23 +95,15 @@ function removeFromStorage(key: string): void {
 
 function collectSnapshot(reason?: string): CrashSnapshot {
     const pads: Record<number, SnapshotPad> = {};
-    // Import sampler module dynamically to avoid circular dependency
-    // Use window reference as fallback; sampler exports are available at module level
-    try {
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        const sampler = require('./sampler');
-        for (let i = 0; i < 16; i++) {
-            if (sampler.padBuffers[i] || sampler.padPaths[i]) {
-                pads[i] = {
-                    path: sampler.padPaths[i] || '',
-                    vol: sampler.padVolumes[i] ?? 0.75,
-                    bpm: sampler.padBPMs[i] || 0,
-                    sync: sampler.padSyncState[i] || false,
-                };
-            }
+    for (let i = 0; i < 16; i++) {
+        if (padBuffers[i] || padPaths[i]) {
+            pads[i] = {
+                path: padPaths[i] || '',
+                vol: padVolumes[i] ?? 0.75,
+                bpm: padBPMs[i] || 0,
+                sync: padSyncState[i] || false,
+            };
         }
-    } catch (e) {
-        logger.warn('[CrashRecovery] Could not read sampler state', e);
     }
 
     const masterVolEl = document.getElementById('masterVol') as HTMLInputElement;
@@ -115,7 +113,7 @@ function collectSnapshot(reason?: string): CrashSnapshot {
         version: SNAPSHOT_VERSION,
         timestamp: Date.now(),
         reason,
-        playlist: state.playlist,
+        playlist: state.playlist.map(t => ({ ...t })),
         currentTrackIndex: state.currentTrackIndex,
         masterBPM: state.masterBPM,
         pads,
@@ -125,7 +123,7 @@ function collectSnapshot(reason?: string): CrashSnapshot {
             loopMode: state.loopMode,
             playbackMode: state.playbackMode,
             isAutoMixEnabled: state.isAutoMixEnabled,
-            isPlaying: state.isPlaying,
+            isPlaying: false,
         },
     };
 }
@@ -154,12 +152,14 @@ function saveSnapshot(reason?: string): void {
 // === Restore Snapshot ===
 
 export function getLatestSnapshot(): CrashSnapshot | null {
-    return loadFromStorage(STORAGE_KEY) || loadFromStorage(STORAGE_KEY_BACKUP);
+    // Rotation: newest is STORAGE_KEY, older copies land in _1/_2
+    return loadFromStorage(STORAGE_KEY) || loadFromStorage(getSnapshotKey(1)) || loadFromStorage(getSnapshotKey(2));
 }
 
 export function clearSnapshots(): void {
+    // Also purge the legacy _bak key from older builds
+    removeFromStorage('ug_crash_snapshot_bak');
     removeFromStorage(STORAGE_KEY);
-    removeFromStorage(STORAGE_KEY_BACKUP);
     for (let i = 1; i < MAX_SNAPSHOTS; i++) {
         removeFromStorage(getSnapshotKey(i));
     }
@@ -208,35 +208,29 @@ export async function restoreSnapshot(): Promise<boolean> {
         // 3. Restore sampler pads
         const padKeys = Object.keys(snapshot.pads);
         if (padKeys.length > 0) {
-            try {
-                const sampler = require('./sampler');
-                for (const key of padKeys) {
-                    const idx = parseInt(key);
-                    const p = snapshot.pads[idx];
-                    if (p?.path) {
-                        sampler.padPaths[idx] = p.path;
-                        sampler.padVolumes[idx] = p.vol ?? 0.75;
-                        sampler.padBPMs[idx] = p.bpm || 0;
-                        sampler.padSyncState[idx] = p.sync || false;
-                        // Restore volume slider UI
-                        const grid = document.getElementById('padGrid');
-                        const slider = grid?.children[idx]?.querySelector('.pad-slider') as HTMLInputElement;
-                        if (slider) slider.value = (p.vol ?? 0.75).toString();
-                        // Trigger async re-load of sample
-                        sampler.loadSampleFromPath(p.path, idx).catch((err: any) => {
-                            logger.warn(`[CrashRecovery] Pad ${idx} reload failed: ${err?.message || err}`);
-                        });
-                    }
-                }
-            } catch (e) {
-                logger.warn('[CrashRecovery] Could not restore sampler pads', e);
+            for (const key of padKeys) {
+                const idx = parseInt(key);
+                const p = snapshot.pads[idx];
+                if (!p || !Number.isInteger(idx) || idx < 0 || idx > 15 || !p.path) continue;
+                padPaths[idx] = p.path;
+                padVolumes[idx] = p.vol ?? 0.75;
+                padBPMs[idx] = p.bpm || 0;
+                padSyncState[idx] = p.sync || false;
+                // Restore volume slider UI
+                const grid = document.getElementById('padGrid');
+                const slider = grid?.children[idx]?.querySelector('.pad-slider') as HTMLInputElement;
+                if (slider) slider.value = (p.vol ?? 0.75).toString();
+                // Trigger async re-load of sample
+                loadSampleFromPath(p.path, idx).catch((err: any) => {
+                    logger.warn(`[CrashRecovery] Pad ${idx} reload failed: ${err?.message || err}`);
+                });
             }
         }
 
         // 4. Trigger playlist render
         try {
-            const playlistModule = require('./playlist');
-            if (playlistModule.renderPlaylist) playlistModule.renderPlaylist();
+            const { renderPlaylist } = await import('./playlist');
+            renderPlaylist();
         } catch (e) {
             // renderPlaylist may not be available yet
         }
@@ -252,12 +246,6 @@ export async function restoreSnapshot(): Promise<boolean> {
         toast.error("RESTORE FAILED");
         return false;
     }
-}
-
-// === Mark Unsaved Changes ===
-
-export function markChanged(): void {
-    _hasUnsavedChanges = true;
 }
 
 // === Initialization ===
@@ -287,23 +275,7 @@ export function initCrashRecovery(): void {
         }
     });
 
-    // Save on visibility change (tab hidden = potential close/crash)
-    document.addEventListener('visibilitychange', () => {
-        if (document.hidden && _hasUnsavedChanges) {
-            saveSnapshot('visibilitychange');
-        }
-    });
-
     logger.info('[CrashRecovery] Initialized (auto-save every 30s)');
-}
-
-export function destroyCrashRecovery(): void {
-    if (_timer) {
-        clearInterval(_timer);
-        _timer = null;
-    }
-    window.removeEventListener('beforeunload', () => {});
-    logger.info('[CrashRecovery] Destroyed');
 }
 
 /**
@@ -325,7 +297,6 @@ export function checkAndRestore(): Promise<boolean> {
 
         logger.info(`[CrashRecovery] Found snapshot from ${new Date(snapshot.timestamp).toLocaleString()} (${ageStr})`);
 
-        // Show confirmation modal
         const modal = document.getElementById('confirmModal');
         if (!modal) {
             resolve(false);
@@ -341,19 +312,20 @@ export function checkAndRestore(): Promise<boolean> {
         if (msgEl) msgEl.innerText = `We detected an unsaved session from ${ageStr}.\nRestore it?`;
         if (yesBtn) {
             yesBtn.onclick = async () => {
-                modal.style.display = 'none';
+                closeModal(modal);
                 const ok = await restoreSnapshot();
                 resolve(ok);
             };
         }
         if (noBtn) {
             noBtn.onclick = () => {
-                modal.style.display = 'none';
+                closeModal(modal);
                 clearSnapshots();
                 toast.info("Crash session discarded.");
                 resolve(false);
             };
         }
-        modal.style.display = 'block';
+        // Via the shared modal API so ESC/close behaves like every other modal
+        openModal(modal);
     });
 }

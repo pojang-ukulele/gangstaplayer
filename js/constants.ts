@@ -10,8 +10,6 @@ export const BPM_DETECTION_THRESHOLD = 0.1;
 export const BPM_MIN_STEP_SECONDS = 0.3;
 
 // === Audio ===
-export const DEFAULT_MASTER_VOLUME = 0.75;
-export const DEFAULT_TEMPO = 1.0;
 export const STARTUP_SOUND_VOLUME = 0.6;
 export const LOWSHELF_FREQ = 320;
 export const PEAKING_FREQ = 1000;
@@ -21,9 +19,7 @@ export const LOWPASS_FREQ = 20000;
 export const HIGHPASS_FREQ = 30;
 
 // === UI Timing ===
-export const BLINK_INTERVAL_MS = 500;
 export const TOAST_DURATION_MS = 3000;
-export const PROGRESS_UPDATE_INTERVAL_MS = 100;
 export const SLIDER_SNAP_THRESHOLD = 0.05;
 
 // === Crossfade / AutoMix ===
@@ -40,15 +36,10 @@ export const MID_THRESHOLD = 160;
 export const HIGH_THRESHOLD = 100;
 export const AVG_THRESHOLD = 2;
 export const SCANNER_INTERVAL_MS = 300;
-export const LED_FRAME_SKIP = 2;
 
 // === Sampler ===
 export const NUM_PADS = 16;
-export const WAVEFORM_POINTS = 100;
 export const POOL_SIZE = 32;
-export const PAD_MIDI_START_NOTE = 36;
-export const PAD_MIDI_NOTES = [36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51];
-export const DEFAULT_PAD_KEY_MAP = ['1', '2', '3', '4', 'q', 'w', 'e', 'r', 'a', 's', 'd', 'f', 'z', 'x', 'c', 'v'];
 
 // === Blob URL Management ===
 export const BLOB_REVOKE_DELAY_MS = 5000;

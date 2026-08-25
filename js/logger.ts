@@ -1,8 +1,6 @@
 /**
- * Gangsta Logger Module — Enterprise Edition
+ * Gangsta Logger Module
  * Features:
- *   - Structured JSON logging for SIEM ingestion
- *   - Correlation IDs for request tracing across processes
  *   - Runtime log level switching (no restart needed)
  *   - In-memory ring buffer for the Console UI
  *   - Disk persistence via Electron Bridge
@@ -25,30 +23,12 @@ interface LogEntry {
     level: LogLevel;
     message: string;
     timestamp: string;
-    correlationId?: string;
-    metadata?: Record<string, unknown>;
 }
-
-interface StructuredLogRecord {
-    '@timestamp': string;
-    level: LogLevel;
-    message: string;
-    correlation_id?: string;
-    session_id: string;
-    source: string;
-    metadata?: Record<string, unknown>;
-    pid: number;
-    _format_version: number;
-}
-
-const LOG_FORMAT_VERSION = 1;
 
 class GangstaLogger {
     private ringBuffer: LogEntry[] = [];
     private minLevel: LogLevel = 'DEBUG';
     private sessionId: string;
-    private _correlationIdCounter = 0;
-    private _structuredMode = false;
 
     constructor() {
         this.sessionId = this._generateSessionId();
@@ -56,11 +36,6 @@ class GangstaLogger {
     }
 
     // ==================== PUBLIC API ====================
-
-    /** Enable/disable structured JSON output for SIEM integration */
-    setStructuredMode(enabled: boolean): void {
-        this._structuredMode = enabled;
-    }
 
     /** Set minimum log level at runtime (blocks lower severity) */
     setLogLevel(level: LogLevel): void {
@@ -72,56 +47,42 @@ class GangstaLogger {
         return this.minLevel;
     }
 
-    /** Generate a new correlation ID for tracing an operation */
-    createCorrelationId(): string {
-        this._correlationIdCounter++;
-        return `${this.sessionId}-${this._correlationIdCounter}`;
-    }
-
     /** Returns a copy of the in-memory ring buffer */
     getLogs(): LogEntry[] {
         return [...this.ringBuffer];
     }
 
+    /** Clears the in-memory ring buffer */
+    clearLogs(): void {
+        this.ringBuffer = [];
+    }
+
     /** Returns log entries formatted as plain text for copying */
     getLogsAsText(): string {
         return this.ringBuffer.map(e =>
-            `[${e.timestamp}] [${e.level}]${e.correlationId ? ` [cid:${e.correlationId}]` : ''} ${e.message}`
+            `[${e.timestamp}] [${e.level}] ${e.message}`
         ).join('\n');
-    }
-
-    /** Returns structured JSON log export (for external tooling) */
-    getLogsAsJSON(): StructuredLogRecord[] {
-        return this.ringBuffer.map(e => this._toStructured(e));
     }
 
     // ==================== LOGGING METHODS ====================
 
-    info(msg: string, meta?: Record<string, unknown>, correlationId?: string): void {
-        this._log('INFO', msg, meta, correlationId);
+    info(msg: string): void {
+        this._log('INFO', msg);
     }
 
-    warn(msg: string, meta?: Record<string, unknown>, correlationId?: string): void {
-        this._log('WARN', msg, meta, correlationId);
+    warn(msg: string, meta?: unknown): void {
+        const text = meta !== undefined ? `${msg} ${this._stringify(meta)}` : msg;
+        this._log('WARN', text);
     }
 
-    error(msg: string, meta?: Record<string, unknown>, correlationId?: string): void {
-        this._log('ERROR', msg, meta, correlationId);
+    error(msg: string, meta?: unknown): void {
+        const text = meta !== undefined ? `${msg} ${this._stringify(meta)}` : msg;
+        this._log('ERROR', text);
     }
 
-    debug(msg: string, meta?: Record<string, unknown>, correlationId?: string): void {
-        this._log('DEBUG', msg, meta, correlationId);
-    }
-
-    /** Compatibility: allow old-style variadic args (e.g. logger.warn('msg', err)) */
-    warnCompat(...args: unknown[]): void {
-        const msg = args.map(a => typeof a === 'object' ? String(a) : String(a)).join(' ');
-        this._log('WARN', msg);
-    }
-
-    errorCompat(...args: unknown[]): void {
-        const msg = args.map(a => typeof a === 'object' ? String(a) : String(a)).join(' ');
-        this._log('ERROR', msg);
+    debug(msg: string, meta?: unknown): void {
+        if (meta !== undefined) console.debug(msg, meta);
+        this._log('DEBUG', msg);
     }
 
     async getLogPath(): Promise<string> {
@@ -135,7 +96,7 @@ class GangstaLogger {
         if (window.electronAPI?.generateCrashReport) {
             try {
                 const reportPath = await window.electronAPI.generateCrashReport(stateSnapshot);
-                this.error('CRITICAL: Render process crash detected. Diagnostic report generated.', { reportPath });
+                this.error('CRITICAL: Render process crash detected. Diagnostic report generated.');
                 return reportPath;
             } catch (e) {
                 console.error('[Logger] Failed to generate crash report', e);
@@ -146,17 +107,26 @@ class GangstaLogger {
 
     // ==================== PRIVATE IMPLEMENTATION ====================
 
+    private _stringify(value: unknown): string {
+        if (value instanceof Error) return value.stack || value.message;
+        try {
+            return typeof value === 'object' ? JSON.stringify(value) : String(value);
+        } catch {
+            return String(value);
+        }
+    }
+
     private _shouldLog(level: LogLevel): boolean {
         return LOG_LEVEL_SEVERITY[level] >= LOG_LEVEL_SEVERITY[this.minLevel];
     }
 
-    private _log(level: LogLevel, message: string, metadata?: Record<string, unknown>, correlationId?: string): void {
+    private _log(level: LogLevel, message: string): void {
         if (!this._shouldLog(level)) {
             return;
         }
 
         const timestamp = new Date().toLocaleTimeString('en-US', { hour12: false });
-        const entry: LogEntry = { level, message, timestamp, correlationId, metadata };
+        const entry: LogEntry = { level, message, timestamp };
         this._storeLog(entry);
         this._writeLog(entry);
     }
@@ -172,48 +142,13 @@ class GangstaLogger {
         // Console fallback for immediate dev feedback
         const consoleMethod = entry.level === 'ERROR' ? 'error' :
             (entry.level === 'WARN' ? 'warn' : 'log');
-        const consoleMessage = this._formatLog(entry);
-        // TypeScript 5.5+ supports index types on console; fallback to type assertion for safety
-        const consoleFn = console[consoleMethod as keyof Console];
-        if (typeof consoleFn === 'function') consoleFn(consoleMessage);
+        const consoleFn = console[consoleMethod as keyof Console] as ((...args: any[]) => void) | undefined;
+        if (typeof consoleFn === 'function') consoleFn(`[${entry.level}] ${entry.message}`);
 
         // Persist to disk via Electron Bridge
         if (window.fileSystem?.appendLog) {
-            const payload = this._formatPayload(entry);
-            window.fileSystem.appendLog(entry.level, payload).catch(() => {});
+            window.fileSystem.appendLog(entry.level, entry.message).catch(() => {});
         }
-    }
-
-    private _formatLog(entry: LogEntry): string {
-        const extras = entry.correlationId
-            ? ` [correlationId: ${entry.correlationId}]` +
-              (entry.metadata ? ` ${JSON.stringify(entry.metadata)}` : '')
-            : '';
-
-        const structuredMarker = this._structuredMode ? ' [STRUCTURED]' : '';
-        return `[${entry.level}]${structuredMarker} ${entry.message}${extras}`;
-    }
-
-    private _formatPayload(entry: LogEntry): string {
-        if (this._structuredMode) {
-            const record = this._toStructured(entry);
-            return JSON.stringify(record);
-        }
-        return entry.message;
-    }
-
-    private _toStructured(entry: LogEntry): StructuredLogRecord {
-        return {
-            '@timestamp': entry.timestamp,
-            _format_version: LOG_FORMAT_VERSION,
-            level: entry.level,
-            message: entry.message,
-            correlation_id: entry.correlationId,
-            session_id: this.sessionId,
-            source: 'GangstaPlayer-Pro3',
-            pid: 0, // Browser context - no PID access
-            metadata: entry.metadata,
-        };
     }
 
     private _generateSessionId(): string {

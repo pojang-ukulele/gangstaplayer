@@ -4,6 +4,8 @@
 
 export type ToastType = 'info' | 'error' | 'success';
 
+import { TOAST_DURATION_MS } from './constants';
+
 interface ToastSystem {
     container: HTMLElement | null;
     init(): void;
@@ -12,6 +14,8 @@ interface ToastSystem {
     success(msg: string): void;
     info(msg: string): void;
 }
+
+const MAX_VISIBLE_TOASTS = 6;
 
 export const toast: ToastSystem = {
     container: null,
@@ -23,9 +27,14 @@ export const toast: ToastSystem = {
         document.body.appendChild(this.container);
     },
     
-    show(message: string, type: ToastType = 'info', duration: number = 3000) {
+    show(message: string, type: ToastType = 'info', duration: number = TOAST_DURATION_MS) {
         if (!this.container) this.init();
         
+        // Cap the stack — error storms previously piled toasts indefinitely
+        while (this.container && this.container.children.length >= MAX_VISIBLE_TOASTS) {
+            this.container.firstElementChild?.remove();
+        }
+
         const toastEl = document.createElement('div');
         toastEl.className = `toast toast-${type}`;
         toastEl.innerText = message;

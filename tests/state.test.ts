@@ -40,10 +40,12 @@ describe('ReactiveStore (state singleton)', () => {
         expect(state.padKeyMap[15]).toBe('v');
     });
 
-    test('controlMidiMap has 3 entries', () => {
-        expect(state.controlMidiMap[1]).toBe('masterVol');
+    test('controlMidiMap has sane defaults (CC7 = master volume only)', () => {
+        // Old defaults mapped CC1 AND CC7 both to masterVol and CC10 (pan!)
+        // to tempoSlider — duplicates/oddities removed.
         expect(state.controlMidiMap[7]).toBe('masterVol');
-        expect(state.controlMidiMap[10]).toBe('tempoSlider');
+        expect(state.controlMidiMap[1]).toBeUndefined();
+        expect(state.controlMidiMap[10]).toBeUndefined();
     });
 
     // --- subscribe / unsubscribe ---

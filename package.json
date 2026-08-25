@@ -1,7 +1,7 @@
 {
   "name": "gangsta-player-pro-3",
   "productName": "Gangsta Player Pro 3",
-  "version": "4.20.0",
+  "version": "4.20.1",
   "description": "Gangsta Player Pro 3 - The Ultimate Sampler",
   "main": "main.js",
   "author": "Gangsta Player Pro 3",
@@ -9,6 +9,7 @@
   "scripts": {
     "start": "node scripts/build.js && electron app-build",
     "build:prod": "node scripts/build.js --prod",
+    "typecheck": "tsc --noEmit",
     "dist": "electron-builder",
     "test": "jest",
     "audit": "npm audit --audit-level=high",
@@ -18,8 +19,7 @@
   },
   "dependencies": {
     "better-sqlite3": "^11.0.0",
-    "form-data": "^4.0.5",
-    "webmidi": "^3.1.9"
+    "form-data": "^4.0.5"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
@@ -48,7 +48,7 @@
     "win": {
       "target": "nsis",
       "icon": "icon.png",
-      "artifactName": "${productName} Setup ${version} 2026-03-16.${ext}"
+      "artifactName": "${productName} Setup ${version}.${ext}"
     },
     "mac": {
       "target": [
@@ -60,7 +60,7 @@
         }
       ],
       "icon": "icon.png",
-      "artifactName": "${productName} Mac Installer ${version} 2026-03-16.${ext}"
+      "artifactName": "${productName} Mac Installer ${version}.${ext}"
     },
     "nsis": {
       "oneClick": false,

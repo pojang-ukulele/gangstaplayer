@@ -47,13 +47,21 @@ export function normalizeToArrayBuffer(data: any): ArrayBuffer {
 const AUDIO_SIGNATURES: Record<string, { offset: number; bytes: number[] }> = {
     // WAV: "RIFF" at offset 0 + "WAVE" at offset 8
     'wav':  { offset: 0, bytes: [0x52, 0x49, 0x46, 0x46] }, // "RIFF"
-    // MP3: 0xFF 0xFB / 0xFF 0xF3 / 0xFF 0xF2 / ID3 "ID3" tag at offset 0
-    'mp3':  { offset: 0, bytes: [0xFF, 0xFB] },
+    // MP3 frame syncs — MPEG1 Layer3 (0xFB), MPEG2/2.5 variants (0xF3, 0xF2, 0xFA).
+    // Previously only 0xFF 0xFB was checked and many valid MP3s were rejected.
+    'mp3':   { offset: 0, bytes: [0xFF, 0xFB] },
+    'mp3b':  { offset: 0, bytes: [0xFF, 0xF3] },
+    'mp3c':  { offset: 0, bytes: [0xFF, 0xF2] },
+    'mp3d':  { offset: 0, bytes: [0xFF, 0xFA] },
     'mp3v2': { offset: 0, bytes: [0x49, 0x44, 0x33] }, // "ID3" (tagged)
     // OGG: "OggS" at offset 0
     'ogg':  { offset: 0, bytes: [0x4F, 0x67, 0x67, 0x53] }, // "OggS"
     // FLAC: "fLaC" at offset 0
     'flac': { offset: 0, bytes: [0x66, 0x4C, 0x61, 0x43] }, // "fLaC"
+    // M4A/AAC: "ftyp" brand box at offset 4
+    'm4a':  { offset: 4, bytes: [0x66, 0x74, 0x79, 0x70] }, // "ftyp"
+    // WebM/Matroska: EBML header
+    'webm': { offset: 0, bytes: [0x1A, 0x45, 0xDF, 0xA3] },
     // WAV (secondary): verify "WAVE" at offset 8 for RIFF files
     'wave': { offset: 8, bytes: [0x57, 0x41, 0x56, 0x45] }, // "WAVE"
 };
@@ -95,9 +103,14 @@ export function validateAudioSignature(
     const isRealWav = hasRiff && hasWave;
     const hasAudioSignature = isRealWav ||
         matches.includes('mp3') ||
+        matches.includes('mp3b') ||
+        matches.includes('mp3c') ||
+        matches.includes('mp3d') ||
         matches.includes('mp3v2') || // ID3 tag - could be any audio
         matches.includes('ogg') ||
-        matches.includes('flac');
+        matches.includes('flac') ||
+        matches.includes('m4a') ||
+        matches.includes('webm');
 
     if (!hasAudioSignature) {
         const nameHint = fileName ? ` (file: ${fileName})` : '';
@@ -107,94 +120,7 @@ export function validateAudioSignature(
     return null; // null = valid audio
 }
 
-/**
- * Convenience function: validates an audio file and returns an error message,
- * or null if the file is valid audio.
- */
-export function isValidAudio(arrayBuffer: ArrayBuffer): boolean {
-    return validateAudioSignature(arrayBuffer) === null;
-}
-
-// ==================== EVENT LISTENER DISCIPLINE ====================
-
-/**
- * Disposable manages a collection of cleanup callbacks (event listeners,
- * timers, subscriptions) that can be torn down in one shot.
- *
- * Use this instead of raw addEventListener in dynamic components to
- * prevent listener leaks when the DOM subtree is not wholesale-replaced.
- *
- * @example
- * const disp = new Disposable();
- * disp.add(() => { window.removeEventListener('resize', onResize); });
- * // or use the on() helper:
- * disp.on(btn, 'click', handleClick);
- * // later:
- * disp.dispose();
- */
-export class Disposable {
-    private _cleanups: Array<() => void> = [];
-
-    /** Register a cleanup callback. Returns the same callback for convenience. */
-    add(fn: () => void): () => void {
-        this._cleanups.push(fn);
-        return fn;
-    }
-
-    /** Register an event listener that auto-removes on dispose. */
-    on<K extends keyof HTMLElementEventMap>(
-        el: HTMLElement | EventTarget,
-        event: K,
-        handler: (ev: HTMLElementEventMap[K]) => void,
-        options?: AddEventListenerOptions
-    ): void {
-        el.addEventListener(event, handler as EventListener, options);
-        this._cleanups.push(() => {
-            el.removeEventListener(event, handler as EventListener, options);
-        });
-    }
-
-    /** Dispose all registered cleanups. Further adds are no-ops. */
-    dispose(): void {
-        for (const cleanup of this._cleanups) {
-            try { cleanup(); } catch { /* ignore disposal errors */ }
-        }
-        this._cleanups = [];
-    }
-}
-
 // ==================== TIMING UTILITIES ====================
-
-/**
- * Creates a debounced function that delays invoking the provided function
- * until after wait milliseconds have elapsed since the last time it was invoked.
- * 
- * @param func - The function to debounce
- * @param wait - The number of milliseconds to delay
- * @returns A new debounced function
- */
-export function debounce<T extends (...args: any[]) => any>(func: T, wait: number): (...args: Parameters<T>) => ReturnType<T> {
-    let timeout: ReturnType<typeof setTimeout> | null = null;
-    
-    function debounced(...args: Parameters<T>): ReturnType<T> {
-        if (timeout) clearTimeout(timeout);
-        timeout = setTimeout(() => {
-            timeout = null;
-            func(...args);
-        }, wait);
-        // Return undefined for void functions, or the result if applicable
-        return undefined as ReturnType<T>;
-    }
-    
-    debounced.cancel = () => {
-        if (timeout) {
-            clearTimeout(timeout);
-            timeout = null;
-        }
-    };
-    
-    return debounced as (...args: Parameters<T>) => ReturnType<T>;
-}
 
 /**
  * Creates a throttled function that only invokes the provided function at most once per

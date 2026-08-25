@@ -79,7 +79,7 @@ class ReactiveStore implements AppStateData {
         isMidiActive: false,
         padMidiMap: { 36: 0, 37: 1, 38: 2, 39: 3, 40: 4, 41: 5, 42: 6, 43: 7, 44: 8, 45: 9, 46: 10, 47: 11, 48: 12, 49: 13, 50: 14, 51: 15 },
         padKeyMap: ['1', '2', '3', '4', 'q', 'w', 'e', 'r', 'a', 's', 'd', 'f', 'z', 'x', 'c', 'v'],
-        controlMidiMap: { 1: 'masterVol', 7: 'masterVol', 10: 'tempoSlider' },
+        controlMidiMap: { 7: 'masterVol' },
         isLearningMidi: false,
         midiLearnTarget: null,
         isLearningKey: false,

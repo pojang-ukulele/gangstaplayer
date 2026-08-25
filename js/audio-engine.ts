@@ -1,4 +1,9 @@
 import { audioCtx, masterGain } from './audio';
+import { state } from './state';
+import {
+    LOWSHELF_FREQ, PEAKING_FREQ, PEAKING_Q, HIGHSHELF_FREQ,
+    LOWPASS_FREQ, HIGHPASS_FREQ
+} from './constants';
 
 export class AudioChannel {
     audio: HTMLAudioElement;
@@ -19,6 +24,13 @@ export class AudioChannel {
     constructor() {
         this.audio = new Audio();
         this.audio.crossOrigin = "anonymous";
+        // Surface media errors — previously a broken file failed totally silently
+        this.audio.addEventListener('error', () => {
+            const err = this.audio.error;
+            if (err) {
+                console.error(`[AudioChannel] Media error code ${err.code}: ${err.message} (src=${this.audio.src.slice(0, 64)})`);
+            }
+        });
         if (!audioCtx || !masterGain) {
             console.error("AudioContext or masterGain is not available. Audio features will be limited.");
             return;
@@ -30,11 +42,11 @@ export class AudioChannel {
         this.lpFilter = audioCtx.createBiquadFilter();
         this.hpFilter = audioCtx.createBiquadFilter();
 
-        this.lowEQ.type = 'lowshelf'; this.lowEQ.frequency.value = 320;
-        this.midEQ.type = 'peaking'; this.midEQ.frequency.value = 1000; this.midEQ.Q.value = 0.5;
-        this.highEQ.type = 'highshelf'; this.highEQ.frequency.value = 3200;
-        this.lpFilter.type = 'lowpass'; this.lpFilter.frequency.value = 20000;
-        this.hpFilter.type = 'highpass'; this.hpFilter.frequency.value = 30;
+        this.lowEQ.type = 'lowshelf'; this.lowEQ.frequency.value = LOWSHELF_FREQ;
+        this.midEQ.type = 'peaking'; this.midEQ.frequency.value = PEAKING_FREQ; this.midEQ.Q.value = PEAKING_Q;
+        this.highEQ.type = 'highshelf'; this.highEQ.frequency.value = HIGHSHELF_FREQ;
+        this.lpFilter.type = 'lowpass'; this.lpFilter.frequency.value = LOWPASS_FREQ;
+        this.hpFilter.type = 'highpass'; this.hpFilter.frequency.value = HIGHPASS_FREQ;
 
         // Base signal chain: Source -> EQ -> LP -> HP -> Gain -> Out
         this.source = audioCtx.createMediaElementSource(this.audio);
@@ -94,9 +106,9 @@ export class AudioChannel {
         this.highEQ.gain.cancelScheduledValues(now);
         this.highEQ.gain.setValueAtTime(0, now);
         this.lpFilter.frequency.cancelScheduledValues(now);
-        this.lpFilter.frequency.setValueAtTime(20000, now);
+        this.lpFilter.frequency.setValueAtTime(LOWPASS_FREQ, now);
         this.hpFilter.frequency.cancelScheduledValues(now);
-        this.hpFilter.frequency.setValueAtTime(30, now);
+        this.hpFilter.frequency.setValueAtTime(HIGHPASS_FREQ, now);
     }
 
     load(url: string): void {
@@ -138,6 +150,10 @@ class AudioEngine {
 
         this.crossfade.audio.pause();
         this.crossfade.audio.src = "";
+
+        // The loop flag was set on the retired element — re-apply it to the
+        // promoted one or LOOP ONE silently stops working after any crossfade.
+        this.main.audio.loop = (state.loopMode === 'one');
     }
 }
 

@@ -38,24 +38,6 @@ export function closeModal(modal: HTMLElement): void {
     }
 }
 
-/**
- * Opens a modal by element ID with focus management.
- */
-export function showModalById(modalId: string): void {
-    const modal = document.getElementById(modalId);
-    if (!modal) return;
-    openModal(modal);
-}
-
-/**
- * Closes a modal by element ID with focus restoration.
- */
-export function closeModalById(modalId: string): void {
-    const modal = document.getElementById(modalId);
-    if (!modal) return;
-    closeModal(modal);
-}
-
 // UI Helper for Confirmation Modal
 export function showConfirm(title: string, message: string, onYes: () => void): void {
     const modal = document.getElementById('confirmModal');

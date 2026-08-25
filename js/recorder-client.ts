@@ -5,7 +5,7 @@ import { logger } from './logger';
 export class HighFidelityRecorder {
     private node: AudioWorkletNode | null = null;
     private chunks: Float32Array[][] = [];
-    private isRecording = false;
+    private stopAckHandler: ((event: MessageEvent) => void) | null = null;
 
     constructor(private sourceNode: AudioNode) {}
 
@@ -28,35 +28,60 @@ export class HighFidelityRecorder {
     start(): void {
         if (!this.node) return;
         this.chunks = [];
-        this.isRecording = true;
         this.node.port.postMessage({ type: 'START' });
         logger.info('[Recorder] Recording started');
     }
 
     async stop(): Promise<Blob> {
         if (!this.node) throw new Error('Recorder not initialized');
-        this.node.port.postMessage({ type: 'STOP' });
-        this.isRecording = false;
+
+        // Wait for the worklet's STOPPED ack — otherwise the final render
+        // quantum(s) arrive after we snapshot `chunks` and the tail is cut off.
+        await new Promise<void>((resolve) => {
+            const timeout = setTimeout(() => {
+                cleanup();
+                resolve(); // proceed with what we have rather than hanging
+            }, 500);
+            const cleanup = () => {
+                clearTimeout(timeout);
+                if (this.stopAckHandler && this.node) {
+                    this.node.port.removeEventListener('message', this.stopAckHandler);
+                    this.stopAckHandler = null;
+                }
+            };
+            this.stopAckHandler = (event: MessageEvent) => {
+                if (event.data?.type === 'STOPPED') {
+                    cleanup();
+                    resolve();
+                }
+            };
+            this.node!.port.addEventListener('message', this.stopAckHandler);
+            this.node!.port.postMessage({ type: 'STOP' });
+        });
+
         logger.info(`[Recorder] Recording stopped. Captured ${this.chunks.length} blocks.`);
 
-        // Flatten the chunks into a single AudioBuffer
-        const blob = await this.compileWav();
-        return blob;
+        // Detach chunks before compiling: late DATA messages can't mutate the
+        // array mid-flatten, and length math stays consistent.
+        const captured = this.chunks;
+        this.chunks = [];
+
+        return await this.compileWav(captured);
     }
 
-    private async compileWav(): Promise<Blob> {
-        if (this.chunks.length === 0) throw new Error('No data recorded');
+    private async compileWav(chunks: Float32Array[][]): Promise<Blob> {
+        if (chunks.length === 0) throw new Error('No data recorded');
 
-        const numChannels = this.chunks[0].length;
-        const blockSize = this.chunks[0][0].length;
-        const totalLength = this.chunks.length * blockSize;
+        const numChannels = chunks[0].length;
+        const blockSize = chunks[0][0].length;
+        const totalLength = chunks.length * blockSize;
 
         // Build interleaved Float32Array per channel directly from raw chunks
         const channels: Float32Array[] = [];
         for (let channel = 0; channel < numChannels; channel++) {
             const channelData = new Float32Array(totalLength);
-            for (let i = 0; i < this.chunks.length; i++) {
-                channelData.set(this.chunks[i][channel], i * blockSize);
+            for (let i = 0; i < chunks.length; i++) {
+                channelData.set(chunks[i][channel], i * blockSize);
             }
             channels.push(channelData);
         }

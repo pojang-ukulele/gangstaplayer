@@ -58,28 +58,6 @@ export async function resumeAudioContext(): Promise<void> {
 }
 
 /**
- * Attempt to recreate the AudioContext after a failure
- */
-export function recreateAudioContext(): boolean {
-    try {
-        const newCtx = new AudioContextClass();
-        // Override the readonly property on the exported reference
-        (audioCtx as any) = newCtx;
-        masterGain = newCtx.createGain();
-        analyser = newCtx.createAnalyser();
-        analyser.fftSize = VISUALIZER_FFT_SIZE;
-        masterGain.connect(analyser);
-        analyser.connect(newCtx.destination);
-        (_audioCtxFailed as boolean) = false;
-        console.log("[Audio] AudioContext recreated successfully");
-        return true;
-    } catch (e) {
-        console.error("[Audio] Failed to recreate AudioContext:", e);
-        return false;
-    }
-}
-
-/**
  * Convert AudioBuffer to a Blob (WAV) - Offloaded to Worker
  */
 export async function bufferToWave(ab: AudioBuffer): Promise<Blob> {

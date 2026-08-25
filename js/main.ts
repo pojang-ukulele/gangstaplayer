@@ -2,16 +2,18 @@
 // Gangsta Player Pro 3 - Modular Architecture
 import { resumeAudioContext, masterGain, audioCtx, bufferToWave, initWorklets } from './audio';
 import { enableMIDI, initMIDI } from './midi';
-import { 
+import {
     initSampler, createPadGrid, setupPadKeyboardHandlers, getPadGrid,
     startPad, stopPad, loadSampleFromPath, toggleSync,
-    padBuffers, activeVoices, padVolumes, padSyncState, padBPMs
+    padBuffers, activeVoices, padVolumes, padSyncState, padBPMs,
+    padLoopStart, padLoopEnd,
+    renderWaveform
 } from './sampler';
-import { 
+import {
     initPlayer, setupPlayerHandlers, loadTrack, playTrack, pauseTrack, 
     getMasterBPMRef, getTempoSlider, setAutoMixEnabled,
     getPlayerAudio, stopPlayback, getPlaybackMode, setPlaybackMode,
-    getLoopMode, setLoopMode
+    getLoopMode, setLoopMode, disposePlayerUrls
 } from './player';
 import { detectBPMWorker } from './worker-client';
 import { initPlaylist, setupPlaylistHandlers, renderPlaylist, setBlendingIndex, handlePlaylistNavigation } from './playlist';
@@ -36,10 +38,19 @@ const bridge = window.electronAPI;
 const fsBridge = window.fileSystem;
 
 // Context menu setup functions (extracted from initApp)
+
+// Hoisted so handlers outside setupContextMenus (play/loop menus, global
+// click) can reference them. Previously these names were scoped to
+// setupContextMenus while other handlers referenced them — a guaranteed
+// ReferenceError the moment those menus were used.
+let padContextMenuEl: HTMLElement | null = null;
+let controlContextMenuEl: HTMLElement | null = null;
+
 function setupContextMenus() {
     // Context Menu for Pads
     const padGrid = getPadGrid();
     const padContextMenu = document.getElementById('padContextMenu');
+    padContextMenuEl = padContextMenu;
     const ctxLoadSample = document.getElementById('ctxLoadSample');
     const ctxSync = document.getElementById('ctxSync');
     const padCtxDivider = document.getElementById('padCtxDivider');
@@ -68,10 +79,12 @@ function setupContextMenus() {
                         if (ctxSync) ctxSync.classList.add('hidden');
                     }
                     if (padCtxDivider) padCtxDivider.classList.toggle('hidden', !hasBuffer);
-                    
+
                     // Show loop items when sample is loaded
                     const hasBpm = hasBuffer && !!padBPMs[i];
-                    const padCtxLoopDivider = document.getElementById('ctxLoopDivider');
+                    // NOTE: element id is 'padCtxLoopDivider' in index.html —
+                    // the old 'ctxLoopDivider' lookup never resolved.
+                    const padCtxLoopDivider = document.getElementById('padCtxLoopDivider');
                     if (padCtxLoopDivider) padCtxLoopDivider.classList.toggle('hidden', !hasBuffer);
                     if (document.getElementById('ctxSetLoop1Bar')) document.getElementById('ctxSetLoop1Bar')!.classList.toggle('hidden', !hasBpm);
                     if (document.getElementById('ctxSetLoopStart')) document.getElementById('ctxSetLoopStart')!.classList.toggle('hidden', !hasBuffer);
@@ -135,20 +148,17 @@ function setupContextMenus() {
     if (ctxSetLoop1Bar && padContextMenu) {
         ctxSetLoop1Bar.addEventListener('click', () => {
             const index = parseInt(padContextMenu.dataset.padIndex || "0");
-            import('./sampler').then(({ padBuffers, padBPMs, padLoopStart, padLoopEnd, padBeatPositions }) => {
-                const buf = padBuffers[index];
-                const bpm = padBPMs[index];
-                if (!buf || !bpm) return;
-                const beatSec = 60 / bpm;
-                const barSec = beatSec * 4;
-                const currentPos = (buf.duration / 4); // roughly 1/4 into sample
-                const startBeat = Math.floor(currentPos / barSec) * barSec;
-                padLoopStart[index] = startBeat;
-                padLoopEnd[index] = Math.min(startBeat + barSec, buf.duration);
-                toast.success(`1-BAR LOOP SET`);
-                const { renderWaveform } = require('./sampler');
-                if (renderWaveform) renderWaveform(index);
-            });
+            const buf = padBuffers[index];
+            const bpm = padBPMs[index];
+            if (!buf || !bpm) return;
+            const beatSec = 60 / bpm;
+            const barSec = beatSec * 4;
+            const currentPos = (buf.duration / 4); // roughly 1/4 into sample
+            const startBeat = Math.floor(currentPos / barSec) * barSec;
+            padLoopStart[index] = startBeat;
+            padLoopEnd[index] = Math.min(startBeat + barSec, buf.duration);
+            toast.success(`1-BAR LOOP SET`);
+            renderWaveform(index);
         });
     }
     if (ctxSetLoopStart && padContextMenu) {
@@ -219,6 +229,7 @@ function setupContextMenus() {
     // Slider Context Menus
     const sliders = ['masterVol', 'tempoSlider'];
     const controlContextMenu = document.getElementById('controlContextMenu');
+    controlContextMenuEl = controlContextMenu;
     const ctxControlMidiLearn = document.getElementById('ctxControlMidiLearn');
 
     sliders.forEach(id => {
@@ -293,7 +304,19 @@ function setupGlobalKeyboardShortcuts() {
             e.preventDefault();
             if (state.isCrossfadeInProgress) return;
             stopPlayback();
-        } 
+        } else if (e.code === 'ArrowLeft' || e.code === 'ArrowRight') {
+            // Seek ±5s — documented in the help modal but never implemented
+            e.preventDefault();
+            if (state.isCrossfadeInProgress) return;
+            const playerAudio = getPlayerAudio();
+            if (playerAudio && isFinite(playerAudio.duration)) {
+                const delta = e.code === 'ArrowRight' ? 5 : -5;
+                playerAudio.currentTime = Math.min(
+                    Math.max(0, playerAudio.currentTime + delta),
+                    playerAudio.duration || Number.MAX_SAFE_INTEGER
+                );
+            }
+        }
         
         // Playlist Navigation
         if (['ArrowUp', 'ArrowDown', 'Delete', 'Backspace'].includes(e.key)) {
@@ -341,6 +364,10 @@ function setupMasterRecording() {
                              const safeBuffer = uint8.buffer.slice(uint8.byteOffset, uint8.byteOffset + uint8.byteLength);
                              const success = await fsBridge.saveFile(path, new Uint8Array(safeBuffer));
                              if (success) toast.success("HI-FI RECORDING SAVED");
+                             else toast.error("FAILED TO SAVE HI-FI RECORDING");
+                        } else {
+                            // Don't discard minutes of capture without telling the user
+                            toast.info("SAVE CANCELED — RECORDING DISCARDED");
                         }
                     } catch (e) {
                         logger.error("[MasterRec] Stop/Save failed", e);
@@ -373,17 +400,27 @@ async function initApp() {
     if (maxBtn) maxBtn.addEventListener('click', () => bridge.maximize());
     if (closeBtn) closeBtn.addEventListener('click', () => bridge.close());
 
+    // ORDER MATTERS: initPlayer caches tempoSlider in the DOM. initSampler
+    // captures getTempoSlider() — running the sampler first handed it a
+    // permanent null and pads ignored the chopper slider forever.
+    initPlayer({ renderPlaylist, setBlendingIndex });
+
     initSampler({
-        fsBridge, bridge, 
+        fsBridge, bridge,
         detectBPM: detectBPMWorker,
         masterBPMRef: getMasterBPMRef(),
         tempoSliderRef: getTempoSlider() as HTMLInputElement
     });
 
-    initPlayer({ renderPlaylist, setBlendingIndex });
-
-    initPlaylist({
-        loadTrack, playTrack
+    // Crash-recovery prompt must resolve BEFORE the playlist loads from DB —
+    // otherwise the async DB read races the restore and clobbers it.
+    checkAndRestore().then((restored) => {
+        initPlaylist({
+            loadTrack, playTrack,
+            skipDbLoad: restored
+        });
+        // Depends on DOM refs cached by initPlaylist — run after, not before
+        setupPlaylistHandlers();
     });
 
     initMIDI({ startPad, stopPad, activeVoices, padVolumes });
@@ -397,9 +434,11 @@ async function initApp() {
     // Setup handlers
     setupPadKeyboardHandlers();
     setupPlayerHandlers();
-    setupPlaylistHandlers();
     setupSettingsHandlers();
     loadSettings();
+
+    // Reclaim blob URLs on teardown
+    window.addEventListener('beforeunload', disposePlayerUrls);
 
     // Context menus, keyboard shortcuts, and master recording
     setupContextMenus();
@@ -436,7 +475,7 @@ async function initApp() {
             e.stopPropagation();
 
             // Hide others
-            if (padContextMenu) padContextMenu.classList.add('hidden');
+            if (padContextMenuEl) padContextMenuEl.classList.add('hidden');
             const playlistCtxMenu = document.getElementById('contextMenu');
             if (playlistCtxMenu) playlistCtxMenu.classList.add('hidden');
 
@@ -481,7 +520,7 @@ async function initApp() {
             e.preventDefault();
             e.stopPropagation();
 
-            if (padContextMenu) padContextMenu.classList.add('hidden');
+            if (padContextMenuEl) padContextMenuEl.classList.add('hidden');
             if (playContextMenu) playContextMenu.classList.add('hidden');
             const playlistCtxMenu = document.getElementById('contextMenu');
             if (playlistCtxMenu) playlistCtxMenu.classList.add('hidden');
@@ -539,9 +578,9 @@ async function initApp() {
             playlistCtxMenu.classList.add('hidden');
             playlistCtxMenu.setAttribute('aria-hidden', 'true');
         }
-        if (padContextMenu) {
-            padContextMenu.classList.add('hidden');
-            padContextMenu.setAttribute('aria-hidden', 'true');
+        if (padContextMenuEl) {
+            padContextMenuEl.classList.add('hidden');
+            padContextMenuEl.setAttribute('aria-hidden', 'true');
         }
         if (playContextMenu) {
             playContextMenu.classList.add('hidden');
@@ -551,8 +590,8 @@ async function initApp() {
             loopContextMenu.classList.add('hidden');
             loopContextMenu.setAttribute('aria-hidden', 'true');
         }
-        if (controlContextMenu) {
-            controlContextMenu.classList.add('hidden');
+        if (controlContextMenuEl) {
+            controlContextMenuEl.classList.add('hidden');
         }
     });
     

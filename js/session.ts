@@ -10,7 +10,7 @@
 
 import './types';
 import { state, Track, LoopMode, PlaybackMode } from './state';
-import { settings } from './settings';
+import { settings, saveSettings, applySettingsToUI } from './settings';
 import { toast } from './toast';
 import { logger } from './logger';
 import {
@@ -141,40 +141,21 @@ interface SessionData {
 
 const SESSION_VERSION = 1;
 
-// === Dialogs ===
-
-async function getSavePath(): Promise<string | undefined> {
-    // Use electronAPI if available (desktop), else fall back to download
-    if (window.electronAPI?.saveAudioDialog) {
-        const result = await window.electronAPI.saveAudioDialog();
-        // saveAudioDialog returns a path — we use it for .session.json
-        return result;
-    }
-    return undefined;
-}
-
-async function getOpenPath(): Promise<string | undefined> {
-    if (window.electronAPI?.openSampleDialog) {
-        return await window.electronAPI.openSampleDialog();
-    }
-    return undefined;
-}
-
 // === Save ===
 
 export async function saveSession(): Promise<void> {
     try {
-        // For desktop, prompt for save path
+        // Dedicated session dialog: the default filename already carries the
+        // .session.json extension. Rewriting the returned path (the old
+        // approach) desynced it from the main-process write allowlist and
+        // every save silently failed while claiming success.
         let filePath: string | undefined;
-
-        if (window.electronAPI?.saveKit) {
-            // Reuse the save dialog — returns a file path for a JSON save
+        if (window.electronAPI?.saveSessionDialog) {
+            filePath = await window.electronAPI.saveSessionDialog();
+            if (!filePath) return;
+        } else if (window.electronAPI?.saveKit) {
             filePath = await window.electronAPI.saveKit();
             if (!filePath) return;
-            // Ensure .session.json extension
-            if (!filePath.endsWith('.session.json')) {
-                filePath = filePath.replace(/\.json$/, '') + '.session.json';
-            }
         } else {
             toast.error("SESSION SAVE NOT AVAILABLE");
             return;
@@ -194,7 +175,7 @@ export async function saveSession(): Promise<void> {
             }
         }
 
-const session: SessionData = {
+        const session: SessionData = {
             version: SESSION_VERSION,
             name: "Gangsta Session",
             signature: undefined, // Will be set after HMAC computation
@@ -225,9 +206,16 @@ const session: SessionData = {
 
         const fs = window.fileSystem;
         if (fs?.saveFile) {
-            await fs.saveFile(filePath, new TextEncoder().encode(JSON.stringify(session, null, 2)));
-            toast.success("SESSION SAVED");
-            logger.info(`[Session] Saved to ${filePath}`);
+            const ok = await fs.saveFile(filePath, new TextEncoder().encode(JSON.stringify(session, null, 2)));
+            // fs.saveFile returns false when the main process rejects the write —
+            // previously this was ignored and "SESSION SAVED" was shown regardless.
+            if (ok) {
+                toast.success("SESSION SAVED");
+                logger.info(`[Session] Saved to ${filePath}`);
+            } else {
+                toast.error("SESSION SAVE FAILED (WRITE REJECTED)");
+                logger.error(`[Session] Main process rejected write to ${filePath}`);
+            }
         }
     } catch (err) {
         logger.error('[Session] Save failed', err);
@@ -318,7 +306,10 @@ export async function loadSession(): Promise<void> {
             await Promise.allSettled(loadPromises);
         }
 
-        // 4. Restore settings
+        // 4. Restore settings.
+        // applySettingsToUI() MUST run before saveSettings() — saveSettings
+        // reads the DOM checkboxes, and stale checkboxes were overwriting the
+        // restored values immediately after load.
         if (session.settings?.autoMix) {
             const { eqCrossfade, filterSweep, hpfSweep, bpmSync, trackDuration, btnDuration } = session.settings.autoMix;
             settings.autoMix.eqCrossfade = eqCrossfade ?? true;
@@ -327,7 +318,8 @@ export async function loadSession(): Promise<void> {
             settings.autoMix.bpmSync = bpmSync ?? false;
             settings.autoMix.trackDuration = trackDuration ?? 10;
             settings.autoMix.btnDuration = btnDuration ?? 4;
-            (await import('./settings')).saveSettings();
+            applySettingsToUI();
+            saveSettings();
         }
 
         // 5. Restore UI

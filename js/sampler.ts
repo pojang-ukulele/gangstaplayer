@@ -282,6 +282,7 @@ export async function loadSampleFile(file: File, index: number): Promise<void> {
 export async function loadSampleFromPath(path: string, index: number): Promise<void> {
     setPadLoading(index, true);
     try {
+        if (!fsBridgeRef) return;
         logger.info(`[Sampler] Loading path to pad ${index}: ${path}`);
         const rawData = await fsBridgeRef.readFile(path);
         if (!rawData) {
@@ -683,6 +684,7 @@ function updateRecVisuals(index: number, isRecording: boolean): void {
 
 // === KIT PERSISTENCE ===
 async function saveKit(): Promise<void> {
+    if (!bridgeRef || !fsBridgeRef) return;
     try {
         const path = await bridgeRef.saveKit();
         if (!path) return;
@@ -692,17 +694,26 @@ async function saveKit(): Promise<void> {
             pads: [] as Array<{ index: number, path: string, vol: number }>
         };
 
+        let skippedRecordings = 0;
         for (let i = 0; i < 16; i++) {
-            if (padPaths[i]) {
-                kit.pads.push({
-                    index: i,
-                    path: padPaths[i],
-                    vol: padVolumes[i] || 1
-                });
+            if (!padPaths[i]) continue;
+            // Mic recordings have no backing file path ("REC_<ts>") — they
+            // cannot be reloaded from a kit, so saving them writes broken refs.
+            if (padPaths[i].startsWith('REC_')) {
+                skippedRecordings++;
+                continue;
             }
+            kit.pads.push({
+                index: i,
+                path: padPaths[i],
+                vol: padVolumes[i] ?? DEFAULT_PAD_VOLUME
+            });
         }
-        
-        await fsBridgeRef.saveFile(path, JSON.stringify(kit, null, 2));
+
+        await fsBridgeRef.saveFile(path, new TextEncoder().encode(JSON.stringify(kit, null, 2)));
+        if (skippedRecordings > 0) {
+            toast.info(`${skippedRecordings} RECORDED PAD(S) NOT SAVED (NO SOURCE FILE)`);
+        }
         toast.success("KIT SAVED");
     } catch (err) {
         logger.error("Save Kit Failed", err);
@@ -711,6 +722,7 @@ async function saveKit(): Promise<void> {
 }
 
 async function loadKitDialog(): Promise<void> {
+    if (!bridgeRef || !fsBridgeRef) return;
     try {
         const path = await bridgeRef.loadKit();
         if (!path) return;
@@ -721,15 +733,17 @@ async function loadKitDialog(): Promise<void> {
         
         if (kit.pads && Array.isArray(kit.pads)) {
             kit.pads.forEach((p: { index: number, path: string, vol?: number }) => {
-                if (p.path) {
-                    loadSampleFromPath(p.path, p.index).then(() => {
-                        if (p.vol !== undefined) {
-                            padVolumes[p.index] = p.vol;
-                            const slider = padGrid?.children[p.index]?.querySelector('.pad-slider') as HTMLInputElement;
-                            if (slider) slider.value = p.vol.toString();
-                        }
-                    });
-                }
+                // Validate pad index from untrusted JSON — out-of-range values
+                // would write stray properties past the pad arrays.
+                const idx = Number(p.index);
+                if (!p.path || !Number.isInteger(idx) || idx < 0 || idx > 15) return;
+                loadSampleFromPath(p.path, idx).then(() => {
+                    if (p.vol !== undefined) {
+                        padVolumes[idx] = p.vol;
+                        const slider = padGrid?.children[idx]?.querySelector('.pad-slider') as HTMLInputElement;
+                        if (slider) slider.value = p.vol.toString();
+                    }
+                });
             });
         }
     } catch (err) {
