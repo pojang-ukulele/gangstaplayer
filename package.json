@@ -14,7 +14,7 @@
     "dist": "electron-builder",
     "test": "jest --selectProjects unit 2>nul || jest --testPathIgnorePatterns smoke",
     "test:unit": "jest --testPathIgnorePatterns smoke --coverage",
-    "test:smoke": "jest tests/smoke.test.js --coverage=false",
+    "test:smoke": "node scripts/build.js && jest tests/smoke.test.js --coverage=false --testPathIgnorePatterns=/node_modules/ /app-build/ /dist/ /dist_source/",
     "audit": "npm audit --audit-level=high",
     "audit:fix": "npm audit fix",
     "setup:sonetra": "pip install -r sonetra-requirements.txt",
