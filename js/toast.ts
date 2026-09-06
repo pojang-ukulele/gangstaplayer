@@ -21,6 +21,8 @@ export const toast: ToastSystem = {
     container: null,
     
     init() {
+        if (this.container && document.body.contains(this.container)) return;
+        if (!document.body) return;
         this.container = document.createElement('div');
         this.container.id = 'toastContainer';
         this.container.className = 'toast-container';
@@ -29,27 +31,45 @@ export const toast: ToastSystem = {
     
     show(message: string, type: ToastType = 'info', duration: number = TOAST_DURATION_MS) {
         if (!this.container) this.init();
-        
-        // Cap the stack — error storms previously piled toasts indefinitely
+        // Dedup: error storms (N decode failures) previously flooded the stack.
+        try {
+            const last = this.container?.lastElementChild as HTMLElement | null;
+            if (last && last.textContent === message && last.classList.contains(`toast-${type}`)) {
+                const t = Date.now();
+                const prev = (last as unknown as Record<string, number>).__ugToastAt || 0;
+                if (t - prev < 1000) return;
+                (last as unknown as Record<string, number>).__ugToastAt = t;
+            }
+        } catch { /* ignore */ }
+
+        // Cap the stack — error storms previously piled toasts indefinitely.
+        // Clear evicted toasts' timers so they don't fire on detached nodes.
         while (this.container && this.container.children.length >= MAX_VISIBLE_TOASTS) {
-            this.container.firstElementChild?.remove();
+            const first = this.container.firstElementChild as HTMLElement | null;
+            try {
+                const t = (first as any)?.__ugToastTimer;
+                if (t) clearTimeout(t);
+            } catch { /* ignore */ }
+            first?.remove();
         }
 
         const toastEl = document.createElement('div');
         toastEl.className = `toast toast-${type}`;
         toastEl.innerText = message;
-        
+
         if (this.container) {
             this.container.appendChild(toastEl);
         }
-        
+
         // Animation end cleanup
-        setTimeout(() => {
+        (toastEl as unknown as Record<string, number>).__ugToastAt = Date.now();
+        const timer = setTimeout(() => {
             toastEl.classList.add('fade-out');
             setTimeout(() => {
                 toastEl.remove();
             }, 500);
         }, duration);
+        (toastEl as any).__ugToastTimer = timer;
     },
     
     error(msg: string) { this.show(msg, 'error', 5000); },

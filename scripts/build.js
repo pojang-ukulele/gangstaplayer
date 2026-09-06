@@ -12,6 +12,8 @@ const SOURCEMAP = !IS_PROD ? 'inline' : false;
 const resolveEntry = (filePath) => {
     const tsPath = filePath.replace(/\.js$/, '.ts');
     if (fs.existsSync(tsPath)) return tsPath;
+    // Silent .js fallback previously built stale JS on typos — fail loud.
+    if (!fs.existsSync(filePath)) throw new Error(`Build entry missing: ${filePath} (and ${tsPath})`);
     return filePath;
 };
 
@@ -81,12 +83,15 @@ async function build() {
 
     console.log('Building Workers...');
     // 6. Bundle Worker
+    // Worklets/workers must stay classic scripts (registerProcessor / Worker
+    // entry) — pin iife explicitly so an esbuild default change can't ship ESM.
     const workerEntry = resolveEntry('js/workers/audio-worker.js');
     if (fs.existsSync(workerEntry)) {
         await esbuild.build({
             entryPoints: [workerEntry],
             bundle: true,
             platform: 'browser',
+            format: 'iife',
             outfile: path.join(BUILD_DIR, 'js', 'workers', 'audio-worker.js'),
             minify: MINIFY,
             sourcemap: SOURCEMAP,
@@ -99,6 +104,7 @@ async function build() {
             entryPoints: [processorEntry],
             bundle: true,
             platform: 'browser',
+            format: 'iife',
             outfile: path.join(BUILD_DIR, 'js', 'workers', 'gangsta-processor.js'),
             minify: MINIFY,
             sourcemap: SOURCEMAP,
@@ -111,6 +117,7 @@ async function build() {
             entryPoints: [recorderEntry],
             bundle: true,
             platform: 'browser',
+            format: 'iife',
             outfile: path.join(BUILD_DIR, 'js', 'workers', 'recorder-processor.js'),
             minify: MINIFY,
             sourcemap: SOURCEMAP,

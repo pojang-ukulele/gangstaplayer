@@ -44,22 +44,32 @@ class GangstaProcessor extends GBaseProcessor {
   private smoothBitDepth = 16;
   private smoothingFactor = 0.05; 
 
+  private resetStates(): void {
+    this.stateL = [0, 0, 0, 0];
+    this.stateR = [0, 0, 0, 0];
+    this.prevL = 0;
+    this.prevR = 0;
+  }
+
   process(inputs: Float32Array[][], outputs: Float32Array[][], parameters: Record<string, Float32Array>) {
     const input = inputs[0];
     const output = outputs[0];
-    if (!input || input.length === 0) return true;
+    if (!input || input.length === 0 || !output) return true;
+    const n = Math.min(input[0]?.length ?? 0, output[0]?.length ?? 0);
+    if (!Number.isFinite(n) || n <= 0) return true;
 
-    // Targets for smoothing
-    const targetBitDepth = parameters.bitDepth[0];
-    const targetDrive = parameters.drive[0];
-    const targetCutoff = parameters.filterCutoff[0];
-    const resonance = parameters.filterResonance[0];
+    // Targets for smoothing (host may omit automation — default, don't throw).
+    const targetBitDepth = parameters.bitDepth?.[0] ?? 16;
+    const targetDrive = parameters.drive?.[0] ?? 0;
+    const targetCutoff = parameters.filterCutoff?.[0] ?? 20000;
+    const resonance = parameters.filterResonance?.[0] ?? 0.1;
 
     // OVERSAMPLING CONSTANTS
     const osRate = sampleRate * 2;
-    const r = resonance * 4.0;
+    // Clamp feedback: r up to 4.0 previously latched Infinity/NaN forever.
+    const r = Math.min(3.0, Math.max(0, resonance * 4.0));
 
-    for (let i = 0; i < 128; i++) {
+    for (let i = 0; i < n; i++) {
       // 1. Parameter Smoothing (per-sample)
       this.smoothCutoff += (targetCutoff - this.smoothCutoff) * this.smoothingFactor;
       this.smoothDrive += (targetDrive - this.smoothDrive) * this.smoothingFactor;
@@ -103,11 +113,21 @@ class GangstaProcessor extends GBaseProcessor {
             // D. 24dB LADDER FILTER (At high rate)
             // Stability is much higher at 2x rate
             let y = x - r * lpState[3];
-            
+            if (!Number.isFinite(y)) { this.resetStates(); return true; }
+
             lpState[0] = lpState[0] + f * (y - lpState[0]);
             lpState[1] = lpState[1] + f * (lpState[0] - lpState[1]);
             lpState[2] = lpState[2] + f * (lpState[1] - lpState[2]);
             lpState[3] = lpState[3] + f * (lpState[2] - lpState[3]);
+            if (!Number.isFinite(lpState[0] + lpState[1] + lpState[2] + lpState[3])) {
+                this.resetStates();
+                return true;
+            }
+            // Saturate state so extremes can't accumulate into silence.
+            for (let k = 0; k < 4; k++) {
+                if (lpState[k] > 4) lpState[k] = 4;
+                else if (lpState[k] < -4) lpState[k] = -4;
+            }
 
             outSum += lpState[3];
         }

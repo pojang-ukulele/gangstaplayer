@@ -41,11 +41,11 @@ contextBridge.exposeInMainWorld('sonetra', {
     ipcRenderer.invoke('sonetra:precompute-transition', track1Path, track2Path),
   // Listen for restart/status events from main process.
   // Returns an unsubscribe function so callers don't leak listeners.
-  onRestartStatus: (callback: (status: any) => void) => {
-    const handler = (_event: unknown, status: any) => callback(status);
-    ipcRenderer.on('sonetra:restart-status', handler as any);
+  onRestartStatus: (callback: (status: unknown) => void) => {
+    const handler = (_event: Electron.IpcRendererEvent, status: unknown) => callback(status);
+    ipcRenderer.on('sonetra:restart-status', handler);
     return () => {
-      ipcRenderer.removeListener('sonetra:restart-status', handler as any);
+      ipcRenderer.removeListener('sonetra:restart-status', handler);
     };
   }
 });

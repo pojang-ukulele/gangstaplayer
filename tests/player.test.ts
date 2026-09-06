@@ -42,6 +42,7 @@ const mockSettings = {
 jest.mock('../js/settings', () => ({
     settings: mockSettings,
     updateSettings: jest.fn(),
+    isAiEnabled: jest.fn(() => mockSettings.autoMix.enableAI),
 }));
 
 // --- Mock audio engine ---
@@ -130,9 +131,10 @@ jest.mock('../js/logger', () => ({
     logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
 }));
 
-// --- Mock normalizeToArrayBuffer (passthrough) ---
+// --- Mock normalizeToArrayBuffer (passthrough) + signature gate (accept) ---
 jest.mock('../js/utils', () => ({
     normalizeToArrayBuffer: jest.fn((x: any) => x instanceof ArrayBuffer ? x.slice(0) : x),
+    validateAudioSignature: jest.fn(() => null),
 }));
 
 // --- Mock document (for updateControlsLock etc.) ---

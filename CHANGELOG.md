@@ -2,6 +2,17 @@
 
 ## [Unreleased] — "Paranoid Audit Follow-ups"
 
+### ➕ 2026-09-06 batch (verified: `tsc --noEmit` clean, Jest 81/81 with `--coverage=false`)
+
+- **MIDI resurrected**: `enableMIDI()` is now requested on first click (was imported, never called — the whole subsystem was inert). Selected controller persists via `ug_settings`; settings load re-syncs it into the MIDI module. CC moves dispatch `change` so they persist; velocity uses a 5 ms ramp (no clicks); malformed messages validated/dropped.
+- **Session rollback is real**: `loadSession` failure restores the playlist/selection/modes instead of `void rollback`. Pad loop points now save/restore in sessions and crash snapshots (were silently dropped).
+- **Sonetra retry/circuit fixed**: 5xx markers now throw inside the backoff loop so they actually retry; the breaker counts one logical operation, not per-attempt (a single flaky call no longer DoSes AI for 60 s). Renderer checks `getCachedTransition` before `precomputeTransition`; `onRestartStatus` subscribed (crash/fail → error toast, started/restarted → success toast).
+- **Deck-clobber fixed**: `loadTrack` decode-verifies on a detached copy before swapping `src` and reuses that decode for BPM (no double decode). Crossfade refuses from a stopped/empty deck.
+- **Search non-destructive**: filter stashes the real queue and restores on clear; remove/reorder/move blocked with a toast while filtered. Removed the `db:get-all-tracks` 1/s throttle that returned fake `[]` (read as a wiped library).
+- **Main thread unblocked**: `fs:read-file` uses async stat/read (was `readFileSync` on up to 100 MB). `validatePath` no longer rejects legit `..` segments; recordings-dir check is case-insensitive only on win32/darwin.
+- **Recorder/pads**: capture tap disconnects on stop (reconnects on start); WAV compile copies subarray views before transfer; `stopAllPads()` chokes all loops on blur/hide; duplicate sampler logs merged.
+- **Robustness/perf**: worker URL resolved lazily with fallback; hung-worker recycle threshold 3→2; LED FFT snapshot gated to the 100 ms window; `scrollTo` clamped; confirm queue guards missing buttons; toast 1 s dedup; `updateSettings` deep-merges `autoMix`; worklet bundles pinned to `iife`; `SonetraAPI.onRestartStatus` type fixed; dead `unref` hack removed.
+
 Second audit pass (critical → low) with fixes verified via `tsc --noEmit` and the full Jest suite (77/77).
 
 ### 🚨 Critical

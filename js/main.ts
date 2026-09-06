@@ -4,7 +4,7 @@ import { resumeAudioContext, masterGain, audioCtx, bufferToWave, initWorklets, e
 import { enableMIDI, initMIDI } from './midi';
 import {
     initSampler, createPadGrid, setupPadKeyboardHandlers, getPadGrid,
-    startPad, stopPad, loadSampleFromPath, toggleSync,
+    startPad, stopPad, stopAllPads, loadSampleFromPath, toggleSync,
     padBuffers, activeVoices, padVolumes, padSyncState, padBPMs,
     padLoopStart, padLoopEnd,
     renderWaveform
@@ -17,7 +17,7 @@ import {
 } from './player';
 import { detectBPMWorker } from './worker-client';
 import { initPlaylist, setupPlaylistHandlers, renderPlaylist, setBlendingIndex, handlePlaylistNavigation } from './playlist';
-import { initSettings, setupSettingsHandlers, loadSettings } from './settings';
+import { initSettings } from './settings';
 import { initVisuals, playStartupSound } from './visuals';
 import { engine } from './audio-engine';
 import { state } from './state';
@@ -27,6 +27,7 @@ import { HighFidelityRecorder } from './recorder-client';
 
 import { saveSession, loadSession, purgeLegacySessionKey } from './session';
 import { initCrashRecovery, checkAndRestore } from './crash-recovery';
+import { NUM_PADS } from './constants';
 
 import './types';
 
@@ -56,7 +57,7 @@ function setupContextMenus() {
     const padCtxDivider = document.getElementById('padCtxDivider');
 
     if (padGrid && padContextMenu) {
-        for (let i = 0; i < 16; i++) {
+        for (let i = 0; i < NUM_PADS; i++) {
             const padWrapper = padGrid.children[i];
             const pad = padWrapper?.querySelector('.pad') as HTMLElement;
             if (pad) {
@@ -268,12 +269,16 @@ function setupContextMenus() {
 
 function setupGlobalKeyboardShortcuts() {
     document.addEventListener('keydown', (e) => {
-        // Ignore if user is typing in an input
         const target = e.target as HTMLElement;
-        if (target.tagName === 'INPUT' && (target as HTMLInputElement).type === 'text') return;
+        const tag = target?.tagName ?? '';
+        const inputType = (target as HTMLInputElement)?.type ?? '';
 
-        // ESC: Close topmost modal or context menu
+        // ESC: cancel learn modes first, then modal, then context menu.
         if (e.key === 'Escape') {
+            if (state.isLearningKey || state.isLearningMidi) {
+                state.update({ isLearningKey: false, keyLearnTargetPad: null, isLearningMidi: false, midiLearnTarget: null });
+                return;
+            }
             e.preventDefault();
             // Try modals first
             const activeModal = document.querySelector('.modal.active');
@@ -292,6 +297,18 @@ function setupGlobalKeyboardShortcuts() {
             return;
         }
 
+        // Learn modes steal the next key — transport must not fire underneath.
+        if (state.isLearningKey || state.isLearningMidi) return;
+
+        // Ignore typing/editing contexts: text inputs, textareas, selects,
+        // contenteditable, and range sliders (arrows adjust the slider natively).
+        if (tag === 'TEXTAREA' || tag === 'SELECT') return;
+        if (target?.isContentEditable) return;
+        if (tag === 'INPUT' && (inputType === 'text' || inputType === 'search' || inputType === 'number')) return;
+        if (tag === 'INPUT' && inputType === 'range' && (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'ArrowUp' || e.key === 'ArrowDown')) return;
+        // Focused buttons: Space clicks natively — don't also toggle transport.
+        if (tag === 'BUTTON' && e.code === 'Space') return;
+
         // Transport — blocked during AutoMix blending
         if (e.code === 'Space') {
             e.preventDefault();
@@ -301,6 +318,7 @@ function setupGlobalKeyboardShortcuts() {
                 if (!playerAudio.paused) pauseTrack(); else playTrack();
             }
         } else if (e.code === 'Enter') {
+            if (tag === 'INPUT' || tag === 'BUTTON' || tag === 'SELECT' || tag === 'TEXTAREA') return;
             e.preventDefault();
             stopPlayback();
         } else if (e.code === 'ArrowLeft' || e.code === 'ArrowRight') {
@@ -426,22 +444,45 @@ async function initApp() {
 
     initMIDI({ startPad, stopPad, activeVoices, padVolumes });
 
+    // Sonetra status was previously forwarded by main but never subscribed —
+    // surface crashes/restarts instead of dropping the signal.
+    try {
+        window.sonetra?.onRestartStatus?.((status: unknown) => {
+            try {
+                const s = status as { event?: string; message?: string };
+                logger.info(`[Sonetra] status: ${s?.event ?? 'unknown'} ${s?.message ?? ''}`);
+                if (s?.event === 'crashed' || s?.event === 'failed') toast.error(`AI MIXER ${String(s.event).toUpperCase()}`);
+                else if (s?.event === 'restarted' || s?.event === 'started') toast.success('AI MIXER ONLINE');
+            } catch { /* ignore */ }
+        });
+    } catch { /* Sonetra bridge unavailable — non-fatal */ }
+
     initSettings({ setAutoMixEnabled });
 
     // Initialize UI components
     // NOTE: createPadGrid() is already called inside initSampler() — do NOT call it again here
     initVisuals();
     
-    // Setup handlers
+    // Setup handlers (initSettings already ran setupSettingsHandlers+loadSettings —
+    // calling them again double-wires every settings control and modal).
     setupPadKeyboardHandlers();
     setupPlayerHandlers();
-    setupSettingsHandlers();
-    loadSettings();
 
     // Reclaim blob URLs on teardown
     window.addEventListener('beforeunload', disposePlayerUrls);
     window.addEventListener('beforeunload', () => {
         try { hiFiRecorder?.dispose(); } catch { /* ignore */ }
+    });
+
+    // Looped pad voices never end on their own — a missed keyup/mouseleave
+    // (alt-tab, focus loss) would drone forever. Choke all pads on blur.
+    window.addEventListener('blur', () => {
+        try { stopAllPads(); } catch { /* ignore */ }
+    });
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+            try { stopAllPads(); } catch { /* ignore */ }
+        }
     });
 
     // Context menus, keyboard shortcuts, and master recording
@@ -610,28 +651,35 @@ async function initApp() {
     // confirmModal and double-restore/clear snapshots.
 
     // === GURU CRASH PROTECTION (RENDERER) ===
-    window.onerror = (message, source, lineno, colno, error) => {
-        logger.error(`[Renderer Crash] ${message} at ${source}:${lineno}:${colno}`);
+    // addEventListener (not assignment) so earlier handlers aren't clobbered.
+    window.addEventListener('error', (event) => {
+        const { message, filename, lineno, colno, error } = event;
+        logger.error(`[Renderer Crash] ${message} at ${filename}:${lineno}:${colno}`);
+        // Pass a plain snapshot — the live ReactiveStore holds Maps/Sets of
+        // functions that throw DataCloneError over IPC.
+        let appState: unknown = null;
+        try { appState = state.getSnapshot(); } catch { appState = null; }
         logger.generateCrashReport({
             type: 'RENDERER_ERROR',
             message,
-            source,
+            source: filename,
             lineno,
             colno,
-            stack: error?.stack,
-            appState: state
+            stack: (error as Error | undefined)?.stack,
+            appState
         });
-        return false;
-    };
+    });
 
-    window.onunhandledrejection = (event) => {
+    window.addEventListener('unhandledrejection', (event) => {
         logger.error(`[Renderer Rejection] ${event.reason}`);
+        let appState: unknown = null;
+        try { appState = state.getSnapshot(); } catch { appState = null; }
         logger.generateCrashReport({
             type: 'RENDERER_REJECTION',
-            reason: event.reason,
-            appState: state
+            reason: String(event.reason)?.slice(0, 2000),
+            appState
         });
-    };
+    });
 }
 
 function applyPlatformStyles() {
@@ -650,4 +698,7 @@ if (document.readyState === 'loading') {
     initApp();
 }
 
-document.body.addEventListener('click', () => { resumeAudioContext(); enableMIDI(); }, { once: true });
+document.body.addEventListener('click', () => {
+    void resumeAudioContext().catch(() => undefined);
+    try { enableMIDI(); } catch { /* MIDI unavailable — non-fatal */ }
+}, { once: true });

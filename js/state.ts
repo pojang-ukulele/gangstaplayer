@@ -87,22 +87,27 @@ class ReactiveStore implements AppStateData {
     };
 
     // === READ-ONLY GETTERS (implement AppStateData interface) ===
+    // Collection getters return copies — callers previously mutated the live
+    // arrays/maps without update(), corrupting state with no notification.
     get isPlaying(): boolean { return this._data.isPlaying; }
     get currentTrackIndex(): number { return this._data.currentTrackIndex; }
     get playbackMode(): PlaybackMode { return this._data.playbackMode; }
     get loopMode(): LoopMode { return this._data.loopMode; }
     get masterBPM(): number { return this._data.masterBPM; }
-    get playlist(): Track[] { return this._data.playlist; }
-    get selectedIndices(): number[] { return this._data.selectedIndices; }
+    get playlist(): Track[] { return [...this._data.playlist]; }
+    get selectedIndices(): number[] { return [...this._data.selectedIndices]; }
     get isAutoMixEnabled(): boolean { return this._data.isAutoMixEnabled; }
     get isCrossfadeInProgress(): boolean { return this._data.isCrossfadeInProgress; }
     get blendingIndex(): number { return this._data.blendingIndex; }
     get isMidiActive(): boolean { return this._data.isMidiActive; }
-    get padMidiMap(): Record<number, number> { return this._data.padMidiMap; }
-    get padKeyMap(): string[] { return this._data.padKeyMap; }
-    get controlMidiMap(): Record<number, string> { return this._data.controlMidiMap; }
+    get padMidiMap(): Record<number, number> { return { ...this._data.padMidiMap }; }
+    get padKeyMap(): string[] { return [...this._data.padKeyMap]; }
+    get controlMidiMap(): Record<number, string> { return { ...this._data.controlMidiMap }; }
     get isLearningMidi(): boolean { return this._data.isLearningMidi; }
-    get midiLearnTarget(): { type: 'pad' | 'control', id: number | string } | null { return this._data.midiLearnTarget; }
+    get midiLearnTarget(): { type: 'pad' | 'control', id: number | string } | null {
+        const t = this._data.midiLearnTarget;
+        return t ? { ...t } : null;
+    }
     get isLearningKey(): boolean { return this._data.isLearningKey; }
     get keyLearnTargetPad(): number | null { return this._data.keyLearnTargetPad; }
 
@@ -138,14 +143,23 @@ class ReactiveStore implements AppStateData {
      */
     update(patch: Partial<AppStateData>): void {
         const changedKeys: Array<keyof AppStateData> = [];
-        
+
         for (const [key, value] of Object.entries(patch)) {
             const k = key as keyof AppStateData;
-            
-            // Reference equality check with shallow comparison for arrays
-            const isDifferent = Array.isArray(value)
-                ? !shallowEqual((this._data as any)[k], value)
-                : (this._data as any)[k] !== value;
+
+            // Runtime validation for enums/numbers — invalid writes previously
+            // flowed straight into player logic.
+            if (k === 'loopMode' && value !== 'off' && value !== 'one' && value !== 'all') continue;
+            if (k === 'playbackMode' && value !== 'continuous' && value !== 'single') continue;
+            if (k === 'currentTrackIndex' && (typeof value !== 'number' || !Number.isInteger(value as number))) continue;
+            if ((k === 'masterBPM' || k === 'blendingIndex') && (typeof value !== 'number' || !Number.isFinite(value as number))) continue;
+
+            // Shallow comparison for arrays AND plain objects (pad maps, learn
+            // targets) — previously identical-content objects spuriously notified.
+            const cur = (this._data as any)[k];
+            const isDifferent = (Array.isArray(value) || (value !== null && typeof value === 'object'))
+                ? !shallowEqual(cur, value)
+                : cur !== value;
 
             if (isDifferent) {
                 (this._data as any)[k] = value;
@@ -154,17 +168,45 @@ class ReactiveStore implements AppStateData {
         }
 
         if (changedKeys.length > 0) {
-            // Notify specific listeners
+            // Notify specific listeners — one throwing subscriber must not kill the rest.
             changedKeys.forEach(key => {
                 const keyListeners = this.listeners.get(key);
                 if (keyListeners) {
-                    keyListeners.forEach(fn => fn((this._data as any)[key], this));
+                    keyListeners.forEach(fn => {
+                        try { fn((this._data as any)[key], this.getSnapshot()); }
+                        catch (e) { console.error(`[State] listener for ${String(key)} threw`, e); }
+                    });
                 }
             });
 
             // Notify global listeners
-            this.globalListeners.forEach(fn => fn(this));
+            this.globalListeners.forEach(fn => {
+                try { fn(this.getSnapshot()); } catch (e) { console.error('[State] global listener threw', e); }
+            });
         }
+    }
+
+    /** Plain cloneable snapshot (no Maps/Sets/functions) for IPC/crash reports. */
+    getSnapshot(): AppStateData {
+        return {
+            ...this._data,
+            playlist: [...this._data.playlist],
+            selectedIndices: [...this._data.selectedIndices],
+            padMidiMap: { ...this._data.padMidiMap },
+            padKeyMap: [...this._data.padKeyMap],
+            controlMidiMap: { ...this._data.controlMidiMap },
+            midiLearnTarget: this._data.midiLearnTarget ? { ...this._data.midiLearnTarget } : null,
+        };
+    }
+
+    /** Immutable element replace — in-place track.bpm mutation is invisible to update(). */
+    replaceTrack(id: string, patch: Partial<Track>): boolean {
+        const idx = this._data.playlist.findIndex(t => t.id === id);
+        if (idx < 0) return false;
+        const next = [...this._data.playlist];
+        next[idx] = { ...next[idx], ...patch };
+        this.update({ playlist: next } as Partial<AppStateData>);
+        return true;
     }
 }
 

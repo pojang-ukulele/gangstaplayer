@@ -70,6 +70,9 @@ export class VirtualScroller<T> {
     public updateItems(newItems: T[]) {
         this.items = newItems;
         this.overflowEl.style.height = `${this.items.length * this.itemHeight}px`;
+        // Clamp scrollTop: a shorter list previously left the viewport blank.
+        const maxTop = Math.max(0, this.items.length * this.itemHeight - this.container.clientHeight);
+        if (this.container.scrollTop > maxTop) this.container.scrollTop = maxTop;
         this.refresh(true);
     }
 
@@ -88,11 +91,23 @@ export class VirtualScroller<T> {
                 // Update in place if forced (e.g. selection state changed).
                 // Re-assert geometry: reused rows keep stale top/height after
                 // reorder/resize if the callback doesn't set them.
-                this.renderItem(this.items[idx], idx, el);
-                el.style.position = 'absolute';
-                el.style.top = `${idx * this.itemHeight}px`;
-                el.style.width = '100%';
-                el.style.height = `${this.itemHeight}px`;
+                // If the callback returns a NEW node (contract violation),
+                // replace instead of orphaning the new node + leaking the old.
+                const out = this.renderItem(this.items[idx], idx, el);
+                const node = out ?? el;
+                if (node !== el) {
+                    node.style.position = 'absolute';
+                    node.style.top = `${idx * this.itemHeight}px`;
+                    node.style.width = '100%';
+                    node.style.height = `${this.itemHeight}px`;
+                    el.replaceWith(node);
+                    this.visibleItems.set(idx, node);
+                } else {
+                    el.style.position = 'absolute';
+                    el.style.top = `${idx * this.itemHeight}px`;
+                    el.style.width = '100%';
+                    el.style.height = `${this.itemHeight}px`;
+                }
             }
         }
 
@@ -111,7 +126,9 @@ export class VirtualScroller<T> {
     }
 
     public scrollTo(index: number) {
-        this.container.scrollTop = index * this.itemHeight;
+        if (!Number.isFinite(index)) return;
+        const clamped = Math.max(0, Math.min(this.items.length - 1, Math.floor(index)));
+        this.container.scrollTop = clamped * this.itemHeight;
     }
 
     /** Destroy the scroller — cleans up listeners and DOM. */

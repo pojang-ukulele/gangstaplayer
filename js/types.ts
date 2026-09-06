@@ -38,7 +38,7 @@ export interface SonetraAPI {
     analyzeTrack(trackPath: string): Promise<any>;
     getCachedTransition(track1Path: string, track2Path: string): Promise<{ success: boolean; audioBuffer?: any; error?: string }>;
     precomputeTransition(track1Path: string, track2Path: string): Promise<{ success: boolean; cached?: boolean; error?: string }>;
-    onRestartStatus(callback: (isRunning: boolean) => void): () => void;
+    onRestartStatus(callback: (status: unknown) => void): () => void;
 }
 
 export interface DatabaseAPI {
@@ -49,6 +49,8 @@ export interface DatabaseAPI {
 }
 
 // === Global Window Augmentation ===
+// Bridges are guaranteed in Electron; renderer guards with `?.`/try-catch at
+// call sites that also run in browser/test boots (see js/main.ts initApp).
 declare global {
     interface Window {
         electronAPI: ElectronAPI;

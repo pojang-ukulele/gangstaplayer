@@ -1,13 +1,12 @@
 // === PLAYER MODULE ===
 import { audioCtx, resumeAudioContext, masterGain, ensureAudio } from './audio';
-import { settings } from './settings';
+import { settings, isAiEnabled } from './settings';
 import { state, Track, PlaybackMode, LoopMode } from './state';
 import { detectBPMWorker } from './worker-client';
 import { toast } from './toast';
 import { engine } from './audio-engine';
 import { logger } from './logger';
-import { normalizeToArrayBuffer } from './utils';
-import { showConfirm } from './modals';
+import { normalizeToArrayBuffer, validateAudioSignature } from './utils';
 import {
     BLOB_REVOKE_DELAY_MS,
     BLOB_REVOKE_CROSSFADE_MS,
@@ -16,6 +15,7 @@ import {
     CROSSFADE_LP_SWEEP_HZ,
     CROSSFADE_HP_SWEEP_HZ,
     SLIDER_SNAP_THRESHOLD,
+    MAX_FILE_SIZE_BYTES,
 } from './constants';
 import './types';
 
@@ -62,6 +62,15 @@ async function getSafeUrl(filePath: string, isMain: boolean): Promise<string> {
             return "";
         }
         const arrayBuffer = normalizeToArrayBuffer(rawData);
+        if (arrayBuffer.byteLength === 0 || arrayBuffer.byteLength > MAX_FILE_SIZE_BYTES) {
+            logger.warn(`[SafeURL] Rejected bad size (${arrayBuffer.byteLength}): ${filePath}`);
+            return "";
+        }
+        const sigErr = validateAudioSignature(arrayBuffer);
+        if (sigErr) {
+            logger.warn(`[SafeURL] Rejected non-audio file: ${filePath} (${sigErr})`);
+            return "";
+        }
         const blob = new Blob([arrayBuffer], { type: 'audio/mpeg' });
         return trackBlobUrl(URL.createObjectURL(blob), isMain);
     } catch (e) {
@@ -207,11 +216,42 @@ export async function loadTrack(index: number): Promise<void> {
         hideSpinnerIfCurrent(loadId);
         return;
     }
+    if (sharedBuffer.byteLength === 0 || sharedBuffer.byteLength > MAX_FILE_SIZE_BYTES) {
+        toast.error("TRACK TOO LARGE OR EMPTY — KEPT PREVIOUS TRACK");
+        hideSpinnerIfCurrent(loadId);
+        return;
+    }
+    const sigErr = validateAudioSignature(sharedBuffer);
+    if (sigErr) {
+        toast.error("INVALID AUDIO FILE — KEPT PREVIOUS TRACK");
+        logger.warn(`[Player] Rejected non-audio: ${track.path} (${sigErr})`);
+        hideSpinnerIfCurrent(loadId);
+        return;
+    }
+    // Show spinner during decode verification (src is not swapped until the
+    // file proves decodable — previously a corrupt file clobbered the deck).
+    if (trackSpinner) trackSpinner.classList.add('active');
+
+    // Verify decodability BEFORE touching the live deck. Uses a detached copy
+    // so sharedBuffer stays intact for the playback blob.
+    let verifiedBuffer: AudioBuffer | null = null;
+    try {
+        if (ensureAudio() && audioCtx && sharedBuffer) {
+            const verifyCopy = sharedBuffer.slice(0);
+            verifiedBuffer = await audioCtx.decodeAudioData(verifyCopy);
+        }
+    } catch (decErr) {
+        logger.warn(`[Player] Decode verification failed for ${track.path}`, decErr);
+        toast.error("TRACK UNDECODABLE — KEPT PREVIOUS TRACK");
+        hideSpinnerIfCurrent(loadId);
+        return;
+    }
+    if (loadId !== _loadTrackId) { hideSpinnerIfCurrent(loadId); return; }
     const blobCopy = sharedBuffer.slice(0);
     const safeUrl = trackBlobUrl(URL.createObjectURL(new Blob([blobCopy], { type: 'audio/mpeg' })), true);
     engine.main.load(safeUrl);
     engine.main.audio.playbackRate = tempoSlider ? parseFloat(tempoSlider.value) : 1;
-    
+
     const hasBpm = track.bpm !== null && track.bpm !== undefined && track.bpm > 0;
     state.update({ masterBPM: hasBpm ? (track.bpm as number) : 0 });
 
@@ -219,17 +259,14 @@ export async function loadTrack(index: number): Promise<void> {
         trackTitle.innerText = hasBpm ? `${track.name} [${track.bpm}bpm]` : track.name;
     }
 
-    // Show spinner during async load (decoding + BPM analysis)
-    if (trackSpinner) trackSpinner.classList.add('active');
-
-    // Single-pass high-performance decoding (reuses the shared buffer)
+    // Reuse the verified decode for BPM (no second decode pass)
+    const preDecoded: AudioBuffer | null = verifiedBuffer;
+    verifiedBuffer = null;
+    sharedBuffer = null;
     (async () => {
         try {
-            if (!sharedBuffer) { hideSpinnerIfCurrent(loadId); return; }
-            if (!ensureAudio() || !audioCtx) { hideSpinnerIfCurrent(loadId); return; }
-            // Use native decoder (reliable)
-            const audioBuffer = await audioCtx.decodeAudioData(sharedBuffer);
-            sharedBuffer = null;
+            const audioBuffer = preDecoded;
+            if (!audioBuffer) { hideSpinnerIfCurrent(loadId); return; }
             if (_loadTrackId !== loadId) {
                 hideSpinnerIfCurrent(loadId);
                 return; // cancelled
@@ -276,6 +313,27 @@ export async function loadTrack(index: number): Promise<void> {
 let crossfadeTimer: ReturnType<typeof setTimeout> | null = null;
 let crossfadeGen = 0;
 
+/** Abort any armed blend so delete/stop can't be resurrected by a stale timer. */
+export function abortCrossfade(): void {
+    crossfadeGen++;
+    if (crossfadeTimer) { clearTimeout(crossfadeTimer); crossfadeTimer = null; }
+    try { engine.crossfade.audio.pause(); } catch { /* ignore */ }
+    // Reclaim the incoming blob URL — removeSelectedTracks clears src but the
+    // tracked URL otherwise leaks until the next load.
+    if (crossfadeBlobUrl) {
+        revokeLater(crossfadeBlobUrl);
+        crossfadeBlobUrl = "";
+    }
+    try {
+        engine.main.reset();
+        engine.crossfade.reset();
+    } catch { /* ignore */ }
+    state.update({ isCrossfadeInProgress: false });
+    updateControlsLock(false);
+    if (setBlendingIndexFn) setBlendingIndexFn(-1);
+    if (autoMixBtn) autoMixBtn.classList.remove('blending');
+}
+
 function updateControlsLock(locked: boolean): void {
     const nextBtn = document.getElementById('nextBtn');
     const prevBtn = document.getElementById('prevBtn');
@@ -298,6 +356,18 @@ function updateControlsLock(locked: boolean): void {
 export async function startCrossfade(targetIndex: number | null = null, customDuration: number | null = null): Promise<void> {
     const playlist = state.playlist;
     if (state.isCrossfadeInProgress || !playlist.length) return;
+    // Never blend from silence — a stopped/empty deck produces a fade from nothing.
+    try {
+        const src = engine.main.audio?.src || '';
+        if (!src || engine.main.audio.readyState === 0) {
+            logger.warn('[AutoMix] Crossfade refused: deck has no loaded source');
+            return;
+        }
+    } catch { return; }
+    if (targetIndex !== null && (!Number.isInteger(targetIndex) || targetIndex < 0 || targetIndex >= playlist.length)) {
+        logger.warn(`[AutoMix] Rejected OOB crossfade target ${targetIndex}`);
+        return;
+    }
     
     if (!ensureAudio() || !audioCtx) { // Check if audioCtx is available before resuming
         toast.error("Audio not available for crossfade. Please refresh the page.");
@@ -339,12 +409,22 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
     // background for future mixes; live AI-stem playback is NOT implemented
     // (checkbox previously implied it was). Guard indices — currentTrackIndex
     // can be -1 on an empty/fresh playlist.
-    if (settings.autoMix.enableAI && window.sonetra) {
+    const aiOn = typeof isAiEnabled === 'function' ? isAiEnabled() : settings.autoMix.enableAI;
+    if (aiOn && window.sonetra) {
         const cur = playlist[state.currentTrackIndex];
         const nxt = playlist[nextIdx];
         if (cur && nxt) {
-            window.sonetra.precomputeTransition(cur.path, nxt.path)
-                .then((r) => logger.info(`[AutoMix] Sonetra transition cache: ${r.success ? (r.cached ? 'hit' : 'generated') : r.error}`))
+            // Check cache first so getCachedTransition is not dead code and we
+            // avoid duplicate 100MB uploads when the transition already exists.
+            window.sonetra.getCachedTransition(cur.path, nxt.path)
+                .then((cached) => {
+                    if (cached && (cached as any).success) {
+                        logger.info('[AutoMix] Sonetra transition cache: hit');
+                        return;
+                    }
+                    return window.sonetra.precomputeTransition(cur.path, nxt.path)
+                        .then((r) => logger.info(`[AutoMix] Sonetra transition cache: ${r.success ? (r.cached ? 'hit' : 'generated') : r.error}`));
+                })
                 .catch(() => { /* offline / server down — non-fatal */ });
         }
     }
@@ -383,6 +463,8 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
         main.lowEQ.gain.cancelScheduledValues(now);
         main.lowEQ.gain.setValueAtTime(0, now);
         main.lowEQ.gain.linearRampToValueAtTime(CROSSFADE_RAMP_LOW_DB, now + duration * 0.8);
+        main.midEQ.gain.cancelScheduledValues(now);
+        main.midEQ.gain.setValueAtTime(main.midEQ.gain.value, now);
         main.midEQ.gain.linearRampToValueAtTime(CROSSFADE_RAMP_MID_DB, now + duration);
     }
     if (settings.autoMix.filterSweep) {
@@ -398,7 +480,9 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
     if (settings.autoMix.eqCrossfade) {
         cross.lowEQ.gain.cancelScheduledValues(now);
         cross.lowEQ.gain.setValueAtTime(CROSSFADE_RAMP_LOW_DB, now);
-        cross.lowEQ.gain.linearRampToValueAtTime(0, now + duration * 0.8); 
+        cross.lowEQ.gain.linearRampToValueAtTime(0, now + duration * 0.8);
+        cross.midEQ.gain.cancelScheduledValues(now);
+        cross.midEQ.gain.setValueAtTime(cross.midEQ.gain.value, now);
         cross.midEQ.gain.linearRampToValueAtTime(0, now + duration);
     }
     if (settings.autoMix.hpfSweep) {
@@ -420,39 +504,51 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
 }
 
 function finishCrossfade(nextIndex: number): void {
+    // Stale timer (aborted by stop/delete) must never resurrect audio.
+    if (!state.isCrossfadeInProgress) return;
+    if (!Number.isInteger(nextIndex) || nextIndex < 0 || nextIndex >= state.playlist.length) {
+        abortCrossfade();
+        return;
+    }
     if (!engine.crossfade.audio.src) {
         state.update({ isCrossfadeInProgress: false });
         updateControlsLock(false);
         if (setBlendingIndexFn) setBlendingIndexFn(-1);
         if (autoMixBtn) autoMixBtn.classList.remove('blending');
-        loadTrack(nextIndex).then(playTrack); 
+        loadTrack(nextIndex).then(playTrack).catch(() => undefined);
         return;
     }
-    
+
     // PROMOTE channel
     engine.swapChannels();
-    
+
     // Swap tracked blob URLs safely
-    const oldMainUrl = mainBlobUrl; 
+    const oldMainUrl = mainBlobUrl;
     mainBlobUrl = crossfadeBlobUrl;
-    crossfadeBlobUrl = ""; 
-    
+    crossfadeBlobUrl = "";
+
     // Nuking the old main only after it's definitely stopped and a new one is playing.
     if (oldMainUrl) revokeLater(oldMainUrl, BLOB_REVOKE_CROSSFADE_MS);
 
     state.update({ currentTrackIndex: nextIndex, isCrossfadeInProgress: false });
     updateControlsLock(false);
-    
+
     if (setBlendingIndexFn) setBlendingIndexFn(-1);
     if (autoMixBtn) autoMixBtn.classList.remove('blending');
-    
-    
+
+
     if (renderPlaylistFn) renderPlaylistFn();
     if (trackTitle && state.playlist.length > nextIndex) {
          const t = state.playlist[nextIndex];
          const txt = (t.bpm && t.bpm > 0) ? `[${t.bpm} BPM]` : "[BPM: --]";
          trackTitle.innerText = `${t.name} ${txt}`;
      }
+    // Incoming channel's loadedmetadata was ignored mid-blend (not main yet) —
+    // refresh total time from the promoted element.
+    try {
+        const d = engine.main.audio.duration;
+        if (totalTimeDisplay && Number.isFinite(d) && d > 0) totalTimeDisplay.innerText = formatTime(d);
+    } catch { /* ignore */ }
 }
 
 export function playTrack(): void {
@@ -476,6 +572,8 @@ export function pauseTrack(): void {
 
 export function stopPlayback(): void {
     // Abort any pending blend first so finishCrossfade can't resurrect audio.
+    // Also invalidate in-flight loadTrack decodes that would swap title/BPM under a stopped UI.
+    _loadTrackId++;
     crossfadeGen++;
     if (crossfadeTimer) { clearTimeout(crossfadeTimer); crossfadeTimer = null; }
     engine.main.audio.pause();
@@ -509,6 +607,8 @@ export function setupPlayerHandlers(): void {
     // guards on element identity so only the CURRENT main channel acts.
     for (const channel of [engine.main, engine.crossfade]) {
         wireChannelHandlers(channel.audio);
+        // AudioContext rebuilds recreate the <audio> element — rewire it.
+        channel.onReplaced = (newAudio) => wireChannelHandlers(newAudio);
     }
     setupTransportHandlers();
 }
@@ -527,7 +627,7 @@ function wireChannelHandlers(el: HTMLAudioElement): void {
             if (timeDisplay) timeDisplay.innerText = formatTime(el.currentTime);
             if (state.isAutoMixEnabled && !state.isCrossfadeInProgress && el.duration > settings.autoMix.trackDuration * 2) {
                 if (el.currentTime >= el.duration - settings.autoMix.trackDuration) {
-                    startCrossfade();
+                    void startCrossfade().catch(() => undefined);
                 }
             }
         }
@@ -535,10 +635,27 @@ function wireChannelHandlers(el: HTMLAudioElement): void {
 
     el.addEventListener('ended', () => {
         if (!isCurrentMain()) return;
+        if (state.isCrossfadeInProgress) return;
+        if (state.isAutoMixEnabled) {
+            // Short tracks never reach the timeupdate crossfade threshold
+            // (duration <= 2*trackDuration). Advance instead of stalling dead.
+            if (state.loopMode === 'one') {
+                el.currentTime = 0;
+                el.play().catch(() => undefined);
+                return;
+            }
+            let nextIndex = state.currentTrackIndex + 1;
+            if (nextIndex >= state.playlist.length) {
+                if (state.loopMode === 'all') nextIndex = 0;
+                else { stopPlayback(); return; }
+            }
+            loadTrack(nextIndex).then(() => playTrack());
+            return;
+        }
         if (!state.isAutoMixEnabled && !state.isCrossfadeInProgress) {
             if (state.loopMode === 'one') {
                 el.currentTime = 0;
-                el.play();
+                el.play().catch(() => undefined);
                 return;
             }
 
@@ -573,12 +690,18 @@ function setupTransportHandlers(): void {
             }
         };
         progressBar.onchange = (e: Event) => {
+            isDraggingProgress = false;
             if (state.isCrossfadeInProgress) return;
             const target = e.target as HTMLInputElement;
-            if (engine.main.audio.duration) {
-                engine.main.audio.currentTime = (parseFloat(target.value) / 100) * engine.main.audio.duration;
-            }
-            isDraggingProgress = false;
+            try {
+                const d = engine.main.audio.duration;
+                const ratio = parseFloat(target.value) / 100;
+                if (!Number.isFinite(d) || d <= 0 || !Number.isFinite(ratio)) return;
+                if (engine.main.audio.readyState === 0 || !engine.main.audio.src) return;
+                const seekable = engine.main.audio.seekable;
+                if (seekable && seekable.length === 0) return;
+                engine.main.audio.currentTime = Math.min(Math.max(0, ratio * d), d);
+            } catch { /* seeking during load/after delete must not throw */ }
         };
     }
 
@@ -611,8 +734,14 @@ function setupTransportHandlers(): void {
         slider.oninput = (e: Event) => {
             const target = e.target as HTMLInputElement;
             let val = parseFloat(target.value);
+            if (!Number.isFinite(val)) return;
+            val = Math.min(1.5, Math.max(0.5, val));
             if (Math.abs(val - 1.0) < SLIDER_SNAP_THRESHOLD) { val = 1.0; slider.value = "1.0"; }
-            engine.main.audio.playbackRate = val;
+            try { engine.main.audio.playbackRate = val; } catch { /* ignore */ }
+            // Keep the incoming deck in sync mid-blend — previously only main moved.
+            try {
+                if (state.isCrossfadeInProgress) engine.crossfade.audio.playbackRate = val;
+            } catch { /* ignore */ }
             if (tempoVal) {
                 const displayBpm = state.masterBPM > 0 ? Math.round(state.masterBPM * val) : "---";
                 tempoVal.innerText = `SPEED: ${Math.round(val * 100)}% (BPM: ${displayBpm})`;

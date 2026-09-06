@@ -2,7 +2,7 @@ import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron';
 import * as path from 'path';
 import * as fs from 'fs';
 
-import sonetraBridge from './sonetra-bridge';
+import sonetraBridge, { addAllowedAudioDir } from './sonetra-bridge';
 import { getDbManager } from './db-manager';
 import { logManager, LogLevel } from './log-manager';
 import { MAX_FILE_SIZE_BYTES, VALID_AUDIO_EXTENSIONS } from './js/constants';
@@ -48,6 +48,9 @@ function validatePath(p: string): string | null {
   if (!p || typeof p !== 'string') return null;
   if (p.includes('\0')) return null;
   if (p.length > 32760) return null;
+  // Dot-segments are collapsed by normalize/resolve — legitimacy is decided
+  // by the allowlist + extension gates below, not by rejecting ".." outright
+  // (which broke legit libraries containing ".." segments).
   const normalized = path.normalize(p);
   if (!path.isAbsolute(normalized)) return null;
   // path.resolve collapses trailing separators / dot segments so the
@@ -70,11 +73,35 @@ function isSavePathAllowed(p: string): boolean {
   const ext = path.extname(p).replace('.', '').toLowerCase();
   if (!SAVE_ALLOWED_EXTS.has(ext)) return false;
   if (SAVE_BLOCKED_BASENAMES.has(path.basename(p).toLowerCase())) return false;
-  if (dialogReturnedPaths.has(p)) return true;
+  // Block ADS streams and UNC paths that confuse allowlist checks.
+  if (p.includes(':') && !/^[a-zA-Z]:[\\/]/.test(p)) return false;
+  if (p.startsWith('\\\\')) return false;
+  if (dialogReturnedPaths.has(p)) {
+    // Resolve symlinks: a dialog path swapped for a symlink to gangsta.db/logs must not pass.
+    try {
+      const real = fs.realpathSync.native(p);
+      if (real !== p) {
+        if (SAVE_BLOCKED_BASENAMES.has(path.basename(real).toLowerCase())) return false;
+        // Resolved target must itself be allowlisted (dialog set or recordings dir).
+        if (!dialogReturnedPaths.has(real)) {
+          const userDataPath = app.getPath('userData');
+          const recDir = path.resolve(path.join(userDataPath, 'recordings'));
+          const relReal = path.relative(recDir, real);
+          const inside = relReal !== '' && !relReal.startsWith('..') && !path.isAbsolute(relReal);
+          if (!inside) return false;
+        }
+      }
+    } catch { /* dangling path — fall through to lexical check */ }
+    return true;
+  }
   const userDataPath = app.getPath('userData');
-  const recDir = path.join(userDataPath, 'recordings');
-  const rel = path.relative(recDir, p);
-  if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) return true;
+  const recDir = path.resolve(path.join(userDataPath, 'recordings'));
+  const resolved = path.resolve(p);
+  const rel = path.relative(recDir, resolved);
+  // Case-insensitive only where the FS is (Windows/macOS); Linux stays exact.
+  const insensitive = process.platform === 'win32' || process.platform === 'darwin';
+  const relCmp = insensitive ? rel.toLowerCase() : rel;
+  if (rel && !relCmp.startsWith('..') && !path.isAbsolute(rel)) return true;
   return false;
 }
 
@@ -124,18 +151,19 @@ function registerIpcHandlers(): void {
     else win.maximize();
   });
   ipcMain.on('app:close', () => { getMainWindow()?.close(); });
-  ipcMain.on('app:set-fullscreen', (_event, flag) => { getMainWindow()?.setFullScreen(flag); });
+  ipcMain.on('app:set-fullscreen', (_event, flag) => { getMainWindow()?.setFullScreen(flag === true); });
   ipcMain.on('app:ready-to-show', () => { getMainWindow()?.show(); });
 
   ipcMain.handle('app:open-external', async (_event, relativePath) => {
-    // Whitelist: only the bundled README may be opened externally
-    if (typeof relativePath !== 'string' || path.basename(relativePath) !== 'README.md') {
+    // Whitelist: only the exact bundled README may be opened externally.
+    // Reject any traversal, separators, or UNC — basename check alone is bypassable.
+    if (typeof relativePath !== 'string' || relativePath !== 'README.md') {
       logToDisk('ERROR', `Security: Blocked openExternal for ${relativePath}`);
       return;
     }
-    const fullPath = app.isPackaged
-      ? path.join(process.resourcesPath, relativePath)
-      : path.join(app.getAppPath(), relativePath);
+    const baseDir = app.isPackaged ? process.resourcesPath : app.getAppPath();
+    const fullPath = path.resolve(baseDir, 'README.md');
+    if (path.relative(path.resolve(baseDir), fullPath) !== 'README.md') return;
     if (!fs.existsSync(fullPath)) return;
     if (process.platform === 'win32') {
       try {
@@ -191,6 +219,7 @@ function registerIpcHandlers(): void {
       filters: [{ name: 'JSON Kit File', extensions: ['json'] }]
     });
     if (canceled || !filePaths || !filePaths.length) return null;
+    try { addAllowedAudioDir(path.dirname(filePaths[0])); } catch { /* ignore */ }
     return filePaths[0];
   });
 
@@ -209,6 +238,18 @@ function registerIpcHandlers(): void {
   });
 
   // Secure File System Handlers
+  // Simple per-channel rate limiter to blunt IPC spam DoS.
+  const lastCall = new Map<string, number>();
+  const rateLimited = (key: string, minMs: number): boolean => {
+    const now = Date.now();
+    const prev = lastCall.get(key) ?? 0;
+    if (now - prev < minMs) return true;
+    lastCall.set(key, now);
+    return false;
+  };
+  const inFlightPrecompute = new Set<string>();
+  const normalizeCacheKey = (a: string, b: string): string =>
+    `${path.resolve(String(a ?? '')).toLowerCase()}||${path.resolve(String(b ?? '')).toLowerCase()}`;
   ipcMain.handle('fs:save-file', async (_event, pathStr: string, data: Uint8Array) => {
     const validated = validatePath(pathStr);
     if (!validated) {
@@ -219,13 +260,27 @@ function registerIpcHandlers(): void {
       logToDisk('ERROR', `Security: Blocked write to non-sandboxed path ${validated}`);
       return false;
     }
-    if (!data || !(data instanceof Uint8Array) || data.byteLength > MAX_FILE_SIZE_BYTES) {
-      logToDisk('ERROR', `Security: Blocked write with invalid or oversized payload (${data?.byteLength ?? 'n/a'} bytes)`);
+    if (!data || !(data instanceof Uint8Array) || data.byteLength === 0 || data.byteLength > MAX_FILE_SIZE_BYTES) {
+      logToDisk('ERROR', `Security: Blocked write with invalid, empty or oversized payload (${(data as any)?.byteLength ?? 'n/a'} bytes)`);
       return false;
     }
     try {
-      fs.writeFileSync(validated, data);
-      dialogReturnedPaths.delete(validated);
+      // Resolve symlinks at write time — a symlink swapped in after the dialog
+      // must not redirect the write to gangsta.db / logs.
+      try {
+        const real = fs.realpathSync.native(validated);
+        if (real !== validated && !isSavePathAllowed(real)) {
+          logToDisk('ERROR', `Security: Blocked symlink write ${validated} -> ${real}`);
+          return false;
+        }
+        if (SAVE_BLOCKED_BASENAMES.has(path.basename(real).toLowerCase())) {
+          logToDisk('ERROR', `Security: Blocked write to internal file via symlink ${real}`);
+          return false;
+        }
+      } catch { /* target may not exist yet — lexical check already passed */ }
+      await fs.promises.writeFile(validated, data);
+      // Dialog-approved paths stay writable for the session (cleared on
+      // window close). Deleting after one write broke Save→Save-again flows.
       return true;
     } catch (err) {
       logToDisk('ERROR', `Security: Write failed for ${validated}: ${err}`);
@@ -244,11 +299,26 @@ function registerIpcHandlers(): void {
       return null;
     }
     try {
-      if (!fs.existsSync(validated)) {
+      // Resolve symlinks/junctions — a symlink pointing outside the expected
+      // tree must not bypass validation.
+      let realPath: string;
+      try {
+        realPath = fs.realpathSync.native(validated);
+      } catch {
+        realPath = fs.realpathSync(validated);
+      }
+      if (realPath !== validated && !isReadPathAllowed(realPath)) {
+        logToDisk('ERROR', `Security: Blocked symlink read ${validated} -> ${realPath}`);
+        return null;
+      }
+      const checkPath = realPath || validated;
+      let stat: fs.Stats;
+      try {
+        stat = await fs.promises.stat(checkPath);
+      } catch {
         logToDisk('ERROR', `Security: Blocked read of non-existent path ${validated}`);
         return null;
       }
-      const stat = fs.statSync(validated);
       if (!stat.isFile()) {
         logToDisk('ERROR', `Security: Blocked read of non-file path ${validated}`);
         return null;
@@ -257,7 +327,7 @@ function registerIpcHandlers(): void {
         logToDisk('ERROR', `Security: Blocked read of oversized file ${validated}`);
         return null;
       }
-      const buffer = fs.readFileSync(validated);
+      const buffer = await fs.promises.readFile(checkPath);
       return buffer;
     } catch (err) {
       logToDisk('ERROR', `Security: Read failed for ${validated}: ${err}`);
@@ -274,14 +344,22 @@ function registerIpcHandlers(): void {
     return recPath;
   });
 
-  ipcMain.handle('fs:save-recording', async (_event, buffer: ArrayBuffer, filename: string) => {
+  ipcMain.handle('fs:save-recording', async (_event, buffer: unknown, filename: string) => {
     try {
+      if (rateLimited('fs:save-recording', 1000)) return null;
       if (typeof filename !== 'string' || !filename) return null;
-      const safe = path.basename(filename).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 128);
+      // Preserve the .wav suffix: sanitize the stem, then re-append.
+      const base = path.basename(filename).replace(/[^a-zA-Z0-9._-]/g, '_');
+      const stem = base.toLowerCase().endsWith('.wav') ? base.slice(0, -4) : base;
+      const safe = `${stem.slice(0, 120)}.wav`;
       if (!safe.toLowerCase().endsWith('.wav')) return null;
-      const view = buffer instanceof ArrayBuffer ? new Uint8Array(buffer)
-        : (buffer as unknown as { byteLength?: number });
-      const len = (view as Uint8Array).byteLength ?? (view as { byteLength?: number }).byteLength ?? 0;
+      // Strict type check — duck-typed {byteLength} objects previously passed.
+      let bytes: Uint8Array | null = null;
+      if (buffer instanceof ArrayBuffer) bytes = new Uint8Array(buffer);
+      else if (buffer instanceof Uint8Array) bytes = buffer;
+      else if (ArrayBuffer.isView(buffer)) bytes = new Uint8Array((buffer as ArrayBufferView).buffer);
+      else return null;
+      const len = bytes.byteLength;
       if (!len || len > MAX_FILE_SIZE_BYTES) {
         logToDisk('ERROR', `Security: Blocked recording save with bad size (${len})`);
         return null;
@@ -289,9 +367,21 @@ function registerIpcHandlers(): void {
       const userDataPath = app.getPath('userData');
       const recDir = path.join(userDataPath, 'recordings');
       if (!fs.existsSync(recDir)) fs.mkdirSync(recDir, { recursive: true });
-      const recPath = path.join(recDir, safe);
-      fs.writeFileSync(recPath, Buffer.from(buffer as ArrayBuffer));
-      return recPath;
+      // O_EXCL + unique suffix: never silently overwrite, never fill disk via spam.
+      let recPath = path.join(recDir, safe);
+      for (let i = 1; i < 1000; i++) {
+        try {
+          const fh = await fs.promises.open(recPath, 'wx');
+          await fh.writeFile(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength));
+          await fh.close();
+          return recPath;
+        } catch (e: any) {
+          if (e?.code !== 'EEXIST') throw e;
+          const stemNoExt = safe.slice(0, -4);
+          recPath = path.join(recDir, `${stemNoExt}_${Date.now()}_${i}.wav`);
+        }
+      }
+      return null;
     } catch (err) {
       logToDisk('ERROR', `Failed to save recording: ${err}`);
       return null;
@@ -300,7 +390,12 @@ function registerIpcHandlers(): void {
 
   // Persistent Logging Handlers
   ipcMain.handle('fs:append-log', async (_event, level: string, message: string) => {
-    logManager.log(level as LogLevel, 'RENDERER', message);
+    const allowed: ReadonlySet<string> = new Set(['INFO', 'WARN', 'ERROR', 'DEBUG']);
+    const lvl = allowed.has(String(level)) ? (level as LogLevel) : 'INFO';
+    let msg = String(message ?? '');
+    // Strip control chars/newlines to block log forgery + ANSI injection; cap length.
+    msg = msg.replace(/[\r\n\x00-\x1F\x7F]+/g, ' ').replace(/\x1b\[[0-9;]*m/g, '').slice(0, 2000);
+    logManager.log(lvl, 'RENDERER', msg);
     return true;
   });
 
@@ -309,6 +404,17 @@ function registerIpcHandlers(): void {
   });
 
   ipcMain.handle('app:generate-crash-report', async (_event, stateSnapshot) => {
+    if (rateLimited('app:generate-crash-report', 5000)) return null;
+    // Bound snapshot size — unbounded renderer payloads previously OOMed/blocked main.
+    try {
+      const serialized = JSON.stringify(stateSnapshot ?? {});
+      if (serialized.length > 256 * 1024) {
+        logToDisk('ERROR', 'Security: Blocked oversized crash snapshot');
+        return null;
+      }
+    } catch {
+      return null;
+    }
     return await logManager.generatePostMortem(stateSnapshot);
   });
 
@@ -321,6 +427,7 @@ function registerIpcHandlers(): void {
       filters: [{ name: 'Audio Files', extensions: [...VALID_AUDIO_EXTENSIONS] }]
     });
     if (canceled || !filePaths || !filePaths.length) return null;
+    try { addAllowedAudioDir(path.dirname(filePaths[0])); } catch { /* ignore */ }
     return filePaths[0];
   });
 
@@ -345,34 +452,59 @@ function registerIpcHandlers(): void {
   });
 
   ipcMain.handle('sonetra:create-transition', async (_event, track1Path: string, track2Path: string, style: string) => {
-    return await sonetraBridge.createTransition(track1Path, track2Path, style || 'smooth');
+    if (typeof track1Path !== 'string' || typeof track2Path !== 'string') return { success: false, error: 'Bad paths' };
+    if (track1Path.length > 32760 || track2Path.length > 32760) return { success: false, error: 'Path too long' };
+    const s = typeof style === 'string' ? style.slice(0, 32) : 'smooth';
+    return await sonetraBridge.createTransition(track1Path, track2Path, s || 'smooth');
   });
 
   ipcMain.handle('sonetra:analyze-track', async (_event, trackPath: string) => {
+    if (typeof trackPath !== 'string' || !trackPath || trackPath.length > 32760) {
+      return { success: false, error: 'Bad path' };
+    }
     return await sonetraBridge.analyzeTrack(trackPath);
   });
 
   ipcMain.handle('sonetra:get-cached-transition', async (_event, track1Path: string, track2Path: string) => {
-    const cacheKey = `${track1Path}||${track2Path}`;
+    if (typeof track1Path !== 'string' || typeof track2Path !== 'string') {
+      return { success: false, error: 'Bad paths' };
+    }
+    const cacheKey = normalizeCacheKey(track1Path, track2Path);
     const cached = transitionCache.get(cacheKey);
     if (cached) {
+      // Cap IPC clone size — 200MB Buffer clones freeze the renderer.
+      if (cached.bytes > 50 * 1024 * 1024) {
+        return { success: false, error: 'Cached transition too large for IPC' };
+      }
       return { success: true, audioBuffer: cached.buffer };
     }
     return { success: false, error: 'No cached transition found' };
   });
 
   ipcMain.handle('sonetra:precompute-transition', async (_event, track1Path: string, track2Path: string) => {
-    const cacheKey = `${track1Path}||${track2Path}`;
+    if (typeof track1Path !== 'string' || typeof track2Path !== 'string') {
+      return { success: false, error: 'Bad paths' };
+    }
+    const cacheKey = normalizeCacheKey(track1Path, track2Path);
     if (transitionCache.has(cacheKey)) {
       return { success: true, cached: true };
     }
-
-    const result = await sonetraBridge.createTransition(track1Path, track2Path, 'smooth');
-    if (result.success && result.audioBuffer) {
-      addToCache(cacheKey, result.audioBuffer);
-      return { success: true, cached: false };
+    // Dedupe concurrent precomputes for the same key — previously N parallel
+    // invokes all missed and fired N duplicate 100MB uploads.
+    if (inFlightPrecompute.has(cacheKey)) {
+      return { success: false, error: 'Precompute already in flight' };
     }
-    return result;
+    inFlightPrecompute.add(cacheKey);
+    try {
+      const result = await sonetraBridge.createTransition(track1Path, track2Path, 'smooth');
+      if (result.success && result.audioBuffer) {
+        addToCache(cacheKey, result.audioBuffer);
+        return { success: true, cached: false };
+      }
+      return result;
+    } finally {
+      inFlightPrecompute.delete(cacheKey);
+    }
   });
 
   // Forward bridge status events to the renderer
@@ -387,6 +519,7 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle('db:upsert-track', async (_event, track) => {
     try {
+      if (!track || typeof track !== 'object') return null;
       const db = getDbManager();
       if (!db) return null;
       return db.upsertTrack(track);
@@ -398,6 +531,7 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle('db:get-track', async (_event, trackPath) => {
     try {
+      if (typeof trackPath !== 'string' || !trackPath || trackPath.length > 32760) return null;
       const db = getDbManager();
       if (!db) return null;
       return db.getTrackByPath(trackPath);
@@ -409,9 +543,10 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle('db:search-tracks', async (_event, query) => {
     try {
+      const q = String(query ?? '').slice(0, 256);
       const db = getDbManager();
       if (!db) return [];
-      return db.searchTracks(query);
+      return db.searchTracks(q);
     } catch (e) {
       logToDisk('ERROR', `DB search failed: ${e}`);
       return [];
@@ -464,6 +599,7 @@ function createWindow() {
     } catch (e) {
       logToDisk('ERROR', `DB close failed: ${e}`);
     }
+    try { logManager.close(); } catch { /* ignore */ }
     // Fire-and-forget: 'close' must not be async — awaiting here lets the
     // window die mid-cleanup with a dirty WAL and orphaned python.
     void sonetraBridge.stopServer().catch(() => undefined);
@@ -473,6 +609,7 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  if (!gotLock) return;
   registerIpcHandlers();
   createWindow();
 });
@@ -487,7 +624,11 @@ app.on('activate', () => {
 
 // GURU CRASH PROTECTION — registered once; report is written before exit.
 process.on('uncaughtException', (error) => {
-  logToDisk('ERROR', `UNCAUGHT EXCEPTION: ${error.stack || error}`);
+  try {
+    logToDisk('ERROR', `UNCAUGHT EXCEPTION: ${(error as Error)?.stack || error}`);
+  } catch { /* ignore */ }
+  try { getDbManager()?.close(); } catch { /* ignore */ }
+  try { logManager.close(); } catch { /* ignore */ }
   logManager.generatePostMortem({ type: 'CRASH_UNCAUGHT_EXCEPTION' })
     .then((report) => console.error(`GURU ERROR: Crash report generated at ${report}`))
     .catch(() => console.error('GURU ERROR: Failed to write crash report'))

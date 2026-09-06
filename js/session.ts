@@ -10,7 +10,8 @@
 
 import './types';
 import { state, Track, LoopMode, PlaybackMode } from './state';
-import { settings, saveSettings, applySettingsToUI } from './settings';
+import { settings, saveSettings, applySettingsToUI, updateAutoMix } from './settings';
+import { NUM_PADS } from './constants';
 import { toast } from './toast';
 import { logger } from './logger';
 import {
@@ -21,6 +22,8 @@ import {
     loadSampleFromPath,
     padBuffers,
     padWaveforms,
+    padLoopStart,
+    padLoopEnd,
 } from './sampler';
 
 // ==================== SESSION INTEGRITY ====================
@@ -71,6 +74,8 @@ interface SessionPad {
     vol: number;
     bpm?: number;
     sync?: boolean;
+    loopStart?: number;
+    loopEnd?: number;
 }
 
 interface SessionData {
@@ -122,16 +127,20 @@ export async function saveSession(): Promise<void> {
             return;
         }
 
-        // Collect pad data
+        // Collect pad data (incl. loop points — previously dropped on every save)
         const pads: SessionPad[] = [];
-        for (let i = 0; i < 16; i++) {
+        for (let i = 0; i < NUM_PADS; i++) {
             if (padPaths[i]) {
+                const ls = padLoopStart[i];
+                const le = padLoopEnd[i];
                 pads.push({
                     index: i,
                     path: padPaths[i],
                     vol: padVolumes[i] ?? 0.75,
                     bpm: padBPMs[i] || undefined,
                     sync: padSyncState[i] || undefined,
+                    loopStart: (typeof ls === 'number' && Number.isFinite(ls) && ls >= 0) ? ls : undefined,
+                    loopEnd: (typeof le === 'number' && Number.isFinite(le) && le > 0) ? le : undefined,
                 });
             }
         }
@@ -187,6 +196,26 @@ export async function saveSession(): Promise<void> {
 // === Load ===
 
 export async function loadSession(): Promise<void> {
+    let rollback: {
+        playlist: Track[];
+        selectedIndices: number[];
+        currentTrackIndex: number;
+        loopMode: LoopMode;
+        playbackMode: PlaybackMode;
+    } | null = null;
+    const restoreRollback = () => {
+        if (!rollback) return;
+        try {
+            state.update({
+                playlist: rollback.playlist,
+                selectedIndices: rollback.selectedIndices,
+                currentTrackIndex: rollback.currentTrackIndex,
+                isPlaying: false,
+                loopMode: rollback.loopMode,
+                playbackMode: rollback.playbackMode,
+            });
+        } catch { /* best-effort */ }
+    };
     try {
         let filePath: string | undefined;
 
@@ -230,7 +259,15 @@ export async function loadSession(): Promise<void> {
             logger.warn(`[Session] Version mismatch: expected ${SESSION_VERSION}, got ${session.version}`);
         }
 
-        // 1. Clear existing state
+        // 1. Snapshot current state first — a failed kit restore must not
+        // destroy the working kit with no rollback.
+        rollback = {
+            playlist: [...state.playlist],
+            selectedIndices: [...state.selectedIndices],
+            currentTrackIndex: state.currentTrackIndex,
+            loopMode: state.loopMode,
+            playbackMode: state.playbackMode,
+        };
         state.update({
             playlist: [],
             selectedIndices: [],
@@ -252,17 +289,19 @@ export async function loadSession(): Promise<void> {
 
         // 3. Load kit
         if (session.kit?.pads && Array.isArray(session.kit.pads)) {
-            // Clear existing pads
-            for (let i = 0; i < 16; i++) {
+            // Clear existing pads (incl. loop points — stale loops must not survive)
+            for (let i = 0; i < NUM_PADS; i++) {
                 padBuffers[i] = undefined!;
                 padPaths[i] = '';
                 padWaveforms[i] = undefined!;
                 padBPMs[i] = 0;
                 padSyncState[i] = false;
+                padLoopStart[i] = -1;
+                padLoopEnd[i] = -1;
             }
 
             // Sequential loads: 16 parallel decodeAudioData of arbitrary files OOMs.
-            for (const p of session.kit.pads.slice(0, 16)) {
+            for (const p of session.kit.pads.slice(0, NUM_PADS)) {
                 const idx = Number((p as SessionPad)?.index);
                 const ppath = typeof (p as SessionPad)?.path === 'string' ? (p as SessionPad).path.slice(0, 32760) : '';
                 if (!ppath || !Number.isInteger(idx) || idx < 0 || idx > 15) continue;
@@ -273,6 +312,10 @@ export async function loadSession(): Promise<void> {
                     const bpm = (p as SessionPad).bpm;
                     if (typeof bpm === 'number' && Number.isFinite(bpm)) padBPMs[idx] = Math.min(300, Math.max(0, bpm));
                     if (typeof (p as SessionPad).sync === 'boolean') padSyncState[idx] = (p as SessionPad).sync as boolean;
+                    const ls = (p as SessionPad).loopStart;
+                    const le = (p as SessionPad).loopEnd;
+                    if (typeof ls === 'number' && Number.isFinite(ls) && ls >= 0) padLoopStart[idx] = ls;
+                    if (typeof le === 'number' && Number.isFinite(le) && le > 0) padLoopEnd[idx] = le;
 
                     // Update the volume slider UI
                     const grid = document.getElementById('padGrid');
@@ -288,14 +331,16 @@ export async function loadSession(): Promise<void> {
         // restored values immediately after load.
         if (session.settings?.autoMix) {
             const { eqCrossfade, filterSweep, hpfSweep, bpmSync, trackDuration, btnDuration } = session.settings.autoMix;
-            settings.autoMix.eqCrossfade = eqCrossfade ?? true;
-            settings.autoMix.filterSweep = filterSweep ?? true;
-            settings.autoMix.hpfSweep = hpfSweep ?? true;
-            settings.autoMix.bpmSync = bpmSync ?? false;
-            settings.autoMix.trackDuration = clampNum(trackDuration, 0.5, 60, 10);
-            settings.autoMix.btnDuration = clampNum(btnDuration, 0.5, 30, 4);
+            const bool = (v: unknown, fb: boolean): boolean => typeof v === 'boolean' ? v : fb;
+            updateAutoMix({
+                eqCrossfade: bool(eqCrossfade, true),
+                filterSweep: bool(filterSweep, true),
+                hpfSweep: bool(hpfSweep, true),
+                bpmSync: bool(bpmSync, false),
+                trackDuration: clampNum(trackDuration, 0.5, 60, 10),
+                btnDuration: clampNum(btnDuration, 0.5, 30, 4),
+            });
             applySettingsToUI();
-            saveSettings();
         }
 
         // 5. Restore UI
@@ -314,21 +359,32 @@ export async function loadSession(): Promise<void> {
                 tempo.dispatchEvent(new Event('input'));
             }
 
-            if (session.ui.loopMode) {
-                state.update({ loopMode: session.ui.loopMode });
+            const VALID_LOOP = new Set(['off', 'one', 'all']);
+            const VALID_PLAY = new Set(['continuous', 'single']);
+            if (typeof session.ui.loopMode === 'string' && VALID_LOOP.has(session.ui.loopMode)) {
+                state.update({ loopMode: session.ui.loopMode as 'off' | 'one' | 'all' });
             }
-            if (session.ui.playbackMode) {
-                state.update({ playbackMode: session.ui.playbackMode });
+            if (typeof session.ui.playbackMode === 'string' && VALID_PLAY.has(session.ui.playbackMode)) {
+                state.update({ playbackMode: session.ui.playbackMode as 'continuous' | 'single' });
             }
-            if (session.ui.isAutoMixEnabled !== undefined) {
+            if (typeof session.ui.isAutoMixEnabled === 'boolean') {
                 state.update({ isAutoMixEnabled: session.ui.isAutoMixEnabled });
             }
         }
 
+        try {
+            const { renderPlaylist } = await import('./playlist');
+            renderPlaylist();
+        } catch { /* playlist UI refresh is best-effort */ }
         toast.success("SESSION LOADED");
         logger.info(`[Session] Loaded from ${filePath}`);
     } catch (err) {
-        logger.error('[Session] Load failed', err);
-        toast.error("SESSION LOAD FAILED");
+        logger.error('[Session] Load failed — rolling back', err);
+        try { restoreRollback(); } catch { /* ignore */ }
+        try {
+            const { renderPlaylist } = await import('./playlist');
+            renderPlaylist();
+        } catch { /* ignore */ }
+        toast.error("SESSION LOAD FAILED — PREVIOUS STATE RESTORED");
     }
 }

@@ -50,7 +50,13 @@ export const settings: Readonly<Settings> = _settings;
  * This is the ONLY way to mutate settings that guarantees persistence.
  */
 export function updateSettings(patch: Partial<Settings>): void {
-    Object.assign(_settings, patch);
+    if (patch.autoMix && typeof patch.autoMix === 'object') {
+        const { autoMix, ...rest } = patch;
+        Object.assign(_settings, rest);
+        Object.assign(_settings.autoMix, autoMix);
+    } else {
+        Object.assign(_settings, patch);
+    }
     saveSettings(); // persist immediately
 }
 
@@ -96,15 +102,61 @@ export function loadSettings(): void {
     try {
         const saved = localStorage.getItem('ug_settings');
         if (saved) {
-            const s = JSON.parse(saved);
-            Object.assign(_settings, s);
+            let s: any = null;
+            try {
+                s = JSON.parse(saved);
+            } catch {
+                // Corrupt settings previously errored every boot forever — purge once.
+                try { localStorage.removeItem('ug_settings'); } catch { /* ignore */ }
+                logger.error('Load Settings Error: corrupt JSON purged');
+                return;
+            }
+            if (s && typeof s === 'object') {
+                if (typeof s.fullScreen === 'boolean') _settings.fullScreen = s.fullScreen;
+                if (typeof s.inputDevice === 'string') _settings.inputDevice = s.inputDevice.slice(0, 256);
+                if (typeof s.outputDevice === 'string') _settings.outputDevice = s.outputDevice.slice(0, 256);
+                if (typeof s.midiDevice === 'string') _settings.midiDevice = s.midiDevice.slice(0, 256);
+                if (s.autoMix && typeof s.autoMix === 'object') {
+                    const am = s.autoMix;
+                    if (typeof am.eqCrossfade === 'boolean') _settings.autoMix.eqCrossfade = am.eqCrossfade;
+                    if (typeof am.filterSweep === 'boolean') _settings.autoMix.filterSweep = am.filterSweep;
+                    if (typeof am.hpfSweep === 'boolean') _settings.autoMix.hpfSweep = am.hpfSweep;
+                    if (typeof am.bpmSync === 'boolean') _settings.autoMix.bpmSync = am.bpmSync;
+                    if (typeof am.enableAI === 'boolean') _settings.autoMix.enableAI = am.enableAI;
+                    if (Number.isFinite(Number(am.trackDuration))) _settings.autoMix.trackDuration = Math.min(60, Math.max(0.5, Number(am.trackDuration)));
+                    if (Number.isFinite(Number(am.btnDuration))) _settings.autoMix.btnDuration = Math.min(30, Math.max(0.5, Number(am.btnDuration)));
+                }
+            }
             applySettingsToUI();
-            // Apply Full Screen on load
+            // Apply Full Screen + persisted output route on load (output was
+            // previously reflected in the <select> but never actuated).
             if (bridge && bridge.setFullScreen) bridge.setFullScreen(settings.fullScreen);
+            try { applyOutputDevice(settings.outputDevice); } catch { /* no device yet */ }
+            try {
+                void import('./midi').then((m) => {
+                    try { if (settings.midiDevice) m.setSelectedMidiDevice(settings.midiDevice); } catch { /* ignore */ }
+                }).catch(() => undefined);
+            } catch { /* MIDI sync best-effort */ }
         }
-    } catch(e) { 
-        logger.error("Load Settings Error", e); 
+    } catch(e) {
+        logger.error("Load Settings Error", e);
     }
+}
+
+/** Persisted AutoMix mutation that actually saves (shallow Readonly was bypassable). */
+export function updateAutoMix(patch: Partial<typeof _settings.autoMix>): void {
+    const clean: Partial<typeof _settings.autoMix> = {};
+    for (const [k, v] of Object.entries(patch)) {
+        if (['eqCrossfade', 'filterSweep', 'hpfSweep', 'bpmSync', 'enableAI'].includes(k)) {
+            if (typeof v === 'boolean') (clean as any)[k] = v;
+        } else if (k === 'trackDuration' && Number.isFinite(Number(v))) {
+            clean.trackDuration = Math.min(60, Math.max(0.5, Number(v)));
+        } else if (k === 'btnDuration' && Number.isFinite(Number(v))) {
+            clean.btnDuration = Math.min(30, Math.max(0.5, Number(v)));
+        }
+    }
+    Object.assign(_settings.autoMix, clean);
+    saveSettings();
 }
 
 export function applySettingsToUI(): void {
@@ -125,27 +177,40 @@ export function applySettingsToUI(): void {
 
     updateSliderUI('sliderTrackFade', 'valTrackFade', settings.autoMix.trackDuration);
     updateSliderUI('sliderBtnFade', 'valBtnFade', settings.autoMix.btnDuration);
+
+    try {
+        void import('./midi').then((m) => {
+            try { m.setSelectedMidiDevice(settings.midiDevice || 'all'); } catch { /* ignore */ }
+        }).catch(() => undefined);
+    } catch { /* ignore */ }
 }
 
 export function saveSettings(): void {
-    const fullScreenToggle = document.getElementById('fullScreenToggle') as HTMLInputElement;
-    const mixOptEQCrossfade = document.getElementById('mixOptEQCrossfade') as HTMLInputElement;
-    const mixOptFilterSweep = document.getElementById('mixOptFilterSweep') as HTMLInputElement;
-    const mixOptHPFSweep = document.getElementById('mixOptHPFSweep') as HTMLInputElement;
-    const mixOptBPMSync = document.getElementById('mixOptBPMSync') as HTMLInputElement;
-    const mixOptEnableAI = document.getElementById('mixOptEnableAI') as HTMLInputElement;
+    try {
+        const fullScreenToggle = document.getElementById('fullScreenToggle') as HTMLInputElement;
+        const mixOptEQCrossfade = document.getElementById('mixOptEQCrossfade') as HTMLInputElement;
+        const mixOptFilterSweep = document.getElementById('mixOptFilterSweep') as HTMLInputElement;
+        const mixOptHPFSweep = document.getElementById('mixOptHPFSweep') as HTMLInputElement;
+        const mixOptBPMSync = document.getElementById('mixOptBPMSync') as HTMLInputElement;
+        const mixOptEnableAI = document.getElementById('mixOptEnableAI') as HTMLInputElement;
 
-    _settings.fullScreen = fullScreenToggle ? fullScreenToggle.checked : _settings.fullScreen;
-    if (mixOptEQCrossfade) _settings.autoMix.eqCrossfade = mixOptEQCrossfade.checked;
-    if (mixOptFilterSweep) _settings.autoMix.filterSweep = mixOptFilterSweep.checked;
-    if (mixOptHPFSweep) _settings.autoMix.hpfSweep = mixOptHPFSweep.checked;
-    if (mixOptBPMSync) _settings.autoMix.bpmSync = mixOptBPMSync.checked;
-    if (mixOptEnableAI) _settings.autoMix.enableAI = mixOptEnableAI.checked;
+        // DOM-read-then-overwrite: only touch fields whose controls exist so a
+        // missing modal can't clobber persisted values with stale state.
+        if (fullScreenToggle) _settings.fullScreen = fullScreenToggle.checked;
+        if (mixOptEQCrossfade) _settings.autoMix.eqCrossfade = mixOptEQCrossfade.checked;
+        if (mixOptFilterSweep) _settings.autoMix.filterSweep = mixOptFilterSweep.checked;
+        if (mixOptHPFSweep) _settings.autoMix.hpfSweep = mixOptHPFSweep.checked;
+        if (mixOptBPMSync) _settings.autoMix.bpmSync = mixOptBPMSync.checked;
+        if (mixOptEnableAI) _settings.autoMix.enableAI = mixOptEnableAI.checked;
 
-    localStorage.setItem('ug_settings', JSON.stringify(_settings));
-    
-    // Actuate Full Screen
-    if (bridge && bridge.setFullScreen) bridge.setFullScreen(_settings.fullScreen);
+        localStorage.setItem('ug_settings', JSON.stringify(_settings));
+
+        // Actuate Full Screen
+        if (bridge && bridge.setFullScreen) bridge.setFullScreen(_settings.fullScreen);
+    } catch (e) {
+        // Quota/private-mode failures previously threw out of every settings write.
+        logger.error('Save Settings Error', e);
+    }
 }
 
 export function isAiEnabled(): boolean {
@@ -182,11 +247,11 @@ export function setupSettingsHandlers(): void {
         applyOutputDevice(outputSelect.value);
     });
 
-    // Auto-save on any change
+    // Auto-save on any change (via updateSettings so persistence is unified)
     const inputs = ['fullScreenToggle', 'mixOptEQCrossfade', 'mixOptFilterSweep', 'mixOptHPFSweep', 'mixOptBPMSync', 'mixOptEnableAI'];
     inputs.forEach(id => {
         const el = document.getElementById(id);
-        if (el) el.addEventListener('change', saveSettings);
+        if (el) el.addEventListener('change', () => updateSettings({}));
     });
 
     setupDurationSlider('sliderTrackFade', 'valTrackFade', true);
@@ -310,9 +375,12 @@ function setupDurationSlider(sliderId: string, labelId: string, isTrackFade: boo
     slider.addEventListener('input', (e) => {
         const target = e.target as HTMLInputElement;
         const val = parseFloat(target.value);
-        label.innerText = val.toFixed(1) + 's';
-        if (isTrackFade) _settings.autoMix.trackDuration = val;
-        else _settings.autoMix.btnDuration = val;
+        if (!Number.isFinite(val)) return; // NaN previously persisted as null
+        const lo = 0.5, hi = isTrackFade ? 60 : 30;
+        const clamped = Math.min(hi, Math.max(lo, val));
+        label.innerText = clamped.toFixed(1) + 's';
+        if (isTrackFade) _settings.autoMix.trackDuration = clamped;
+        else _settings.autoMix.btnDuration = clamped;
         saveSettings();
     });
 }
@@ -366,7 +434,8 @@ async function refreshAudioDevices(): Promise<void> {
 }
 
 /**
- * Best-effort output routing via setSinkId on the deck audio elements.
+ * Best-effort output routing via setSinkId on the deck audio elements +
+ * AudioContext.setSinkId for sampler/worklet paths (which ignore element sinks).
  * Chromium supports it; failures are non-fatal.
  */
 async function applyOutputDevice(deviceId: string): Promise<void> {
@@ -378,6 +447,15 @@ async function applyOutputDevice(deviceId: string): Promise<void> {
                 await audio.setSinkId(deviceId === 'default' ? '' : deviceId);
             }
         }
+        try {
+            const { audioCtx, ensureAudio } = await import('./audio');
+            if (ensureAudio() && audioCtx) {
+                const ctxWithSink = audioCtx as AudioContext & { setSinkId?: (id: string) => Promise<void> };
+                if (typeof ctxWithSink.setSinkId === 'function') {
+                    await ctxWithSink.setSinkId(deviceId === 'default' ? '' : deviceId);
+                }
+            }
+        } catch { /* context sink unsupported — deck routing still applies */ }
         logger.info(`[Settings] Output device applied: ${deviceId}`);
     } catch (e) {
         logger.warn(`[Settings] Could not apply output device: ${e}`);

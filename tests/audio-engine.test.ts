@@ -224,6 +224,7 @@ describe('AudioEngine', () => {
 
     test('initWorklets stops early when worklet is ready', async () => {
         (engine.main as any)._isWorkletConnected = false;
+        (engine.crossfade as any)._isWorkletConnected = true;
         let callCount = 0;
         jest.spyOn(engine.main, 'initWorklet').mockImplementation(function (this: any) {
             callCount++;

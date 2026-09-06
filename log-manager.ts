@@ -13,8 +13,17 @@ class LogManager {
     private logFilePath: string;
     private flushTimer: ReturnType<typeof setInterval> | null = null;
 
+    private readonly MAX_LOG_FILE_BYTES = 10 * 1024 * 1024;
+    private readonly VALID_LEVELS: ReadonlySet<string> = new Set(['INFO', 'WARN', 'ERROR', 'DEBUG']);
+
     constructor() {
-        const userDataPath = app.getPath('userData');
+        let userDataPath: string;
+        try {
+            userDataPath = app.isReady() ? app.getPath('userData') : path.join(os.tmpdir(), 'gangsta-player');
+        } catch {
+            userDataPath = path.join(os.tmpdir(), 'gangsta-player');
+        }
+        try { fs.mkdirSync(userDataPath, { recursive: true }); } catch { /* ignore */ }
         this.logFilePath = path.join(userDataPath, 'gangsta_log.txt');
         // Buffered entries must reach disk even without a crash — otherwise
         // the log file stays empty in normal operation.
@@ -24,8 +33,11 @@ class LogManager {
     }
 
     public log(level: LogLevel, source: 'MAIN' | 'RENDERER', message: string) {
+        if (!this.VALID_LEVELS.has(level as string)) level = 'INFO';
+        if (source !== 'MAIN' && source !== 'RENDERER') source = 'MAIN';
+        let msg = String(message ?? '').replace(/[\r\n\x00-\x1F\x7F]+/g, ' ').replace(/\x1b\[[0-9;]*m/g, '').slice(0, 2000);
         const timestamp = new Date().toISOString();
-        const entry = `[${timestamp}] [${source}] [${level}] ${message}\n`;
+        const entry = `[${timestamp}] [${source}] [${level}] ${msg}\n`;
 
         // Add to ring buffer
         this.addToBuffer(entry);
@@ -61,6 +73,14 @@ class LogManager {
 
     private flushEntryToDisk(entry: string) {
         try {
+            // Rotation: unbounded gangsta_log.txt was a renderer-spammable disk-fill.
+            try {
+                const st = fs.statSync(this.logFilePath);
+                if (st.size > this.MAX_LOG_FILE_BYTES) {
+                    const backup = `${this.logFilePath}.1`;
+                    try { fs.renameSync(this.logFilePath, backup); } catch { /* ignore */ }
+                }
+            } catch { /* file may not exist yet */ }
             fs.appendFileSync(this.logFilePath, entry);
         } catch (e) {
             console.error('Failed to flush log entry to disk', e);
@@ -91,8 +111,29 @@ class LogManager {
      */
     public async generatePostMortem(stateSnapshot: any = {}): Promise<string> {
         const userDataPath = app.getPath('userData');
-        const reportId = Date.now();
+        // Unique filename — same-ms parallel calls previously collided/overwrote.
+        const reportId = `${Date.now()}_${process.pid}_${Math.floor(Math.random() * 1e6)}`;
         const reportPath = path.join(userDataPath, `crash_report_${reportId}.json`);
+        // Prune old reports: unbounded crash_report_*.json was a disk-fill vector.
+        try {
+            const files = fs.readdirSync(userDataPath)
+                .filter(f => f.startsWith('crash_report_') && f.endsWith('.json'))
+                .map(f => ({ f, t: fs.statSync(path.join(userDataPath, f)).mtimeMs }))
+                .sort((a, b) => b.t - a.t);
+            for (const old of files.slice(10)) {
+                try { fs.unlinkSync(path.join(userDataPath, old.f)); } catch { /* ignore */ }
+            }
+        } catch { /* ignore */ }
+
+        let snapshotJson = '{}';
+        try {
+            const s = JSON.stringify(stateSnapshot ?? {});
+            snapshotJson = s.length > 256 * 1024 ? s.slice(0, 256 * 1024) + '...[truncated]' : s;
+        } catch {
+            snapshotJson = '{"error":"snapshot not serializable"}';
+        }
+        let cpus: os.CpuInfo[] = [];
+        try { cpus = os.cpus(); } catch { cpus = []; }
 
         const systemSpecs = {
             os: {
@@ -102,8 +143,8 @@ class LogManager {
                 uptime: os.uptime(),
             },
             cpu: {
-                model: os.cpus()[0].model,
-                cores: os.cpus().length,
+                model: cpus.length > 0 ? cpus[0].model : 'unknown',
+                cores: cpus.length,
             },
             memory: {
                 totalGB: (os.totalmem() / 1024 / 1024 / 1024).toFixed(2),
@@ -119,8 +160,8 @@ class LogManager {
         const report = {
             timestamp: new Date().toISOString(),
             systemSpecs,
-            appState: stateSnapshot,
-            logs: this.getBufferContents()
+            appState: snapshotJson,
+            logs: this.getBufferContents().slice(-512 * 1024)
         };
 
         fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));

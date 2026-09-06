@@ -13,16 +13,15 @@ import { logger } from './logger';
 // which silently killed snapshot collection and restore entirely.
 import {
     padBuffers, padPaths, padVolumes, padBPMs, padSyncState,
+    padLoopStart, padLoopEnd,
     loadSampleFromPath
 } from './sampler';
-import { openModal, closeModal } from './modals';
+import { openModal, closeModal, showConfirm } from './modals';
+import { AUTO_SAVE_INTERVAL_MS, MIN_SAVE_INTERVAL_MS, MAX_SNAPSHOTS, NUM_PADS } from './constants';
 
 // === Constants ===
 
 const STORAGE_KEY = 'ug_crash_snapshot';
-const AUTO_SAVE_INTERVAL_MS = 30_000; // Save every 30s
-const MIN_SAVE_INTERVAL_MS = 10_000;  // Don't save more often than this
-const MAX_SNAPSHOTS = 3;
 const SNAPSHOT_VERSION = 1;
 
 // === Types ===
@@ -32,6 +31,8 @@ interface SnapshotPad {
     vol: number;
     bpm: number;
     sync: boolean;
+    loopStart?: number;
+    loopEnd?: number;
 }
 
 interface CrashSnapshot {
@@ -64,11 +65,20 @@ function getSnapshotKey(index = 0): string {
     return index === 0 ? STORAGE_KEY : `${STORAGE_KEY}_${index}`;
 }
 
-function saveToStorage(key: string, data: CrashSnapshot): void {
+function saveToStorage(key: string, data: CrashSnapshot): boolean {
     try {
-        localStorage.setItem(key, JSON.stringify(data));
+        const json = JSON.stringify(data);
+        // localStorage quota is ~5MB — a huge playlist would throw and must
+        // not masquerade as saved.
+        if (json.length > 4_000_000) {
+            logger.warn('[CrashRecovery] Snapshot too large, skipping save');
+            return false;
+        }
+        localStorage.setItem(key, json);
+        return true;
     } catch (e) {
         logger.warn('[CrashRecovery] localStorage write failed (quota?)', e);
+        return false;
     }
 }
 
@@ -95,13 +105,17 @@ function removeFromStorage(key: string): void {
 
 function collectSnapshot(reason?: string): CrashSnapshot {
     const pads: Record<number, SnapshotPad> = {};
-    for (let i = 0; i < 16; i++) {
+    for (let i = 0; i < NUM_PADS; i++) {
         if (padBuffers[i] || padPaths[i]) {
+            const ls = padLoopStart[i];
+            const le = padLoopEnd[i];
             pads[i] = {
                 path: padPaths[i] || '',
                 vol: padVolumes[i] ?? 0.75,
                 bpm: padBPMs[i] || 0,
                 sync: padSyncState[i] || false,
+                loopStart: (typeof ls === 'number' && Number.isFinite(ls) && ls >= 0) ? ls : undefined,
+                loopEnd: (typeof le === 'number' && Number.isFinite(le) && le > 0) ? le : undefined,
             };
         }
     }
@@ -130,12 +144,13 @@ function collectSnapshot(reason?: string): CrashSnapshot {
 
 // === Save Snapshot ===
 
+let _restoring = false;
+
 function saveSnapshot(reason?: string): void {
     const now = Date.now();
-    if (now - _lastSaveTime < MIN_SAVE_INTERVAL_MS) return;
-
-    _lastSaveTime = now;
-    _hasUnsavedChanges = false;
+    // beforeunload must bypass the throttle — otherwise a crash within 10s of
+    // the last save loses up to ~40s of work.
+    if (reason !== 'beforeunload' && now - _lastSaveTime < MIN_SAVE_INTERVAL_MS) return;
 
     const snapshot = collectSnapshot(reason);
 
@@ -143,10 +158,17 @@ function saveSnapshot(reason?: string): void {
     // overwriting, otherwise _2 becomes a duplicate of _1's predecessor.
     const prev1 = loadFromStorage(getSnapshotKey(1));
     const prev0 = loadFromStorage(STORAGE_KEY);
-    if (prev1) saveToStorage(getSnapshotKey(2), prev1);
-    if (prev0) saveToStorage(getSnapshotKey(1), prev0);
+    let ok = true;
+    if (prev1) ok = saveToStorage(getSnapshotKey(2), prev1) && ok;
+    if (prev0) ok = saveToStorage(getSnapshotKey(1), prev0) && ok;
 
-    saveToStorage(STORAGE_KEY, snapshot);
+    ok = saveToStorage(STORAGE_KEY, snapshot) && ok;
+    // Only clear the dirty flag when the write actually landed — otherwise a
+    // quota failure masquerades as saved and the data is lost.
+    if (ok) {
+        _lastSaveTime = now;
+        _hasUnsavedChanges = false;
+    }
     logger.debug(`[CrashRecovery] Snapshot saved (${reason || 'periodic'})`);
 }
 
@@ -175,34 +197,65 @@ export async function restoreSnapshot(): Promise<boolean> {
         return false;
     }
 
+    _restoring = true;
     try {
-        // 1. Restore playlist
+        // 1. Restore playlist (validated + bounded like session restore —
+        // untrusted localStorage must not OOM the renderer).
         if (Array.isArray(snapshot.playlist)) {
+            const clean = snapshot.playlist
+                .filter((t): t is Track => !!t && typeof (t as Track).id === 'string' && typeof (t as Track).name === 'string' && typeof (t as Track).path === 'string')
+                .slice(0, 2000)
+                .map(t => ({
+                    id: String(t.id).slice(0, 128),
+                    name: String(t.name).slice(0, 512),
+                    path: String(t.path).slice(0, 32760),
+                    duration: typeof t.duration === 'number' && Number.isFinite(t.duration) ? Math.min(86400, Math.max(0, t.duration)) : 0,
+                    bpm: t.bpm === undefined ? undefined : (Number.isFinite(Number(t.bpm)) ? Math.min(300, Math.max(0, Number(t.bpm))) : 0),
+                }));
+            const cur = typeof snapshot.currentTrackIndex === 'number' ? snapshot.currentTrackIndex : -1;
             state.update({
-                playlist: snapshot.playlist,
-                currentTrackIndex: snapshot.currentTrackIndex ?? -1,
-                masterBPM: snapshot.masterBPM || 0,
+                playlist: clean,
+                currentTrackIndex: cur >= 0 && cur < clean.length ? cur : -1,
+                masterBPM: typeof snapshot.masterBPM === 'number' && Number.isFinite(snapshot.masterBPM) ? snapshot.masterBPM : 0,
             });
         }
 
-        // 2. Restore UI state
+        // 2. Restore UI state (clamped + allowlisted — corrupt localStorage
+        // previously poisoned gain/tempo and injected invalid enums).
         if (snapshot.ui) {
+            const clamp = (v: unknown, lo: number, hi: number): number | null => {
+                const n = typeof v === 'number' ? v : parseFloat(String(v));
+                if (!Number.isFinite(n)) return null;
+                return Math.min(hi, Math.max(lo, n));
+            };
             const volSlider = document.getElementById('masterVol') as HTMLInputElement;
             if (volSlider && snapshot.ui.masterVolume !== undefined) {
-                volSlider.value = snapshot.ui.masterVolume.toString();
-                volSlider.dispatchEvent(new Event('input'));
+                const mv = clamp(snapshot.ui.masterVolume, 0, 1);
+                if (mv !== null) {
+                    volSlider.value = mv.toString();
+                    volSlider.dispatchEvent(new Event('input'));
+                }
             }
 
             const tempo = document.getElementById('tempoSlider') as HTMLInputElement;
             if (tempo && snapshot.ui.tempoValue !== undefined) {
-                tempo.value = snapshot.ui.tempoValue.toString();
-                tempo.dispatchEvent(new Event('input'));
+                const tv = clamp(snapshot.ui.tempoValue, 0.5, 1.5);
+                if (tv !== null) {
+                    tempo.value = tv.toString();
+                    tempo.dispatchEvent(new Event('input'));
+                }
             }
 
             const updates: Record<string, any> = {};
-            if (snapshot.ui.loopMode) updates.loopMode = snapshot.ui.loopMode;
-            if (snapshot.ui.playbackMode) updates.playbackMode = snapshot.ui.playbackMode;
-            if (snapshot.ui.isAutoMixEnabled !== undefined) updates.isAutoMixEnabled = snapshot.ui.isAutoMixEnabled;
+            if (snapshot.ui.loopMode === 'off' || snapshot.ui.loopMode === 'one' || snapshot.ui.loopMode === 'all') {
+                updates.loopMode = snapshot.ui.loopMode;
+            }
+            if (snapshot.ui.playbackMode === 'continuous' || snapshot.ui.playbackMode === 'single') {
+                updates.playbackMode = snapshot.ui.playbackMode;
+            }
+            if (typeof snapshot.ui.isAutoMixEnabled === 'boolean') {
+                updates.isAutoMixEnabled = snapshot.ui.isAutoMixEnabled;
+            }
             if (Object.keys(updates).length > 0) state.update(updates);
         }
 
@@ -220,6 +273,8 @@ export async function restoreSnapshot(): Promise<boolean> {
                     padVolumes[idx] = (typeof p.vol === 'number' && Number.isFinite(p.vol)) ? Math.min(1, Math.max(0, p.vol)) : 0.75;
                     padBPMs[idx] = p.bpm || 0;
                     padSyncState[idx] = p.sync || false;
+                    if (typeof p.loopStart === 'number' && Number.isFinite(p.loopStart) && p.loopStart >= 0) padLoopStart[idx] = p.loopStart;
+                    if (typeof p.loopEnd === 'number' && Number.isFinite(p.loopEnd) && p.loopEnd > 0) padLoopEnd[idx] = p.loopEnd;
                 } catch (err: unknown) {
                     logger.warn(`[CrashRecovery] Pad ${idx} reload failed: ${(err as Error)?.message || err}`);
                     continue;
@@ -242,22 +297,28 @@ export async function restoreSnapshot(): Promise<boolean> {
         // Clear snapshots after successful restore
         clearSnapshots();
 
+        const ts = typeof snapshot.timestamp === 'number' && Number.isFinite(snapshot.timestamp)
+            ? new Date(snapshot.timestamp).toLocaleString()
+            : 'unknown time';
         toast.success("CRASH SESSION RESTORED");
-        logger.info(`[CrashRecovery] Restored snapshot from ${new Date(snapshot.timestamp).toLocaleString()}`);
+        logger.info(`[CrashRecovery] Restored snapshot from ${ts}`);
         return true;
     } catch (e) {
         logger.error('[CrashRecovery] Restore failed', e);
         toast.error("RESTORE FAILED");
         return false;
+    } finally {
+        _restoring = false;
     }
 }
 
 // === Initialization ===
 
 export function initCrashRecovery(): void {
-    // Subscribe to state changes for auto-save
+    // Subscribe to state changes for auto-save (suppressed during restore so
+    // the restore itself doesn't re-dirty and resurrect cleared snapshots).
     state.subscribeAll(() => {
-        _hasUnsavedChanges = true;
+        if (!_restoring) _hasUnsavedChanges = true;
     });
 
     // Listen for custom data-change events from sampler/playlist
@@ -303,37 +364,25 @@ export function checkAndRestore(): Promise<boolean> {
 
         logger.info(`[CrashRecovery] Found snapshot from ${new Date(snapshot.timestamp).toLocaleString()} (${ageStr})`);
 
-        const modal = document.getElementById('confirmModal');
-        if (!modal) {
+        if (!document.getElementById('confirmModal')) {
             resolve(false);
             return;
         }
 
-        const titleEl = document.getElementById('confirmTitle');
-        const msgEl = document.getElementById('confirmMessage');
-        const yesBtn = document.getElementById('confirmYes');
-        const noBtn = document.getElementById('confirmNo');
-
-        if (titleEl) titleEl.innerText = 'CRASH RECOVERY';
-        if (msgEl) msgEl.innerText = `We detected an unsaved session from ${ageStr}.\nRestore it?`;
         _restorePromptOpen = true;
         const done = (v: boolean) => { _restorePromptOpen = false; resolve(v); };
-        if (yesBtn) {
-            yesBtn.onclick = async () => {
-                closeModal(modal);
-                const ok = await restoreSnapshot();
-                done(ok);
-            };
-        }
-        if (noBtn) {
-            noBtn.onclick = () => {
-                closeModal(modal);
+        // Queued confirm — concurrent showConfirm callers no longer clobber it.
+        showConfirm(
+            'CRASH RECOVERY',
+            `We detected an unsaved session from ${ageStr}.\nRestore it?`,
+            () => {
+                restoreSnapshot().then(done);
+            },
+            () => {
                 clearSnapshots();
                 toast.info("Crash session discarded.");
                 done(false);
-            };
-        }
-        // Via the shared modal API so ESC/close behaves like every other modal
-        openModal(modal);
+            }
+        );
     });
 }

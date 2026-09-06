@@ -17,16 +17,33 @@ interface PendingRequest {
     reject: (err: Error) => void;
 }
 
-const WORKER_URL = 'js/workers/audio-worker.js';
+function workerUrl(): string {
+    try {
+        const base = typeof document !== 'undefined' && document.baseURI ? document.baseURI : undefined;
+        if (base) return new URL('js/workers/audio-worker.js', base).toString();
+    } catch { /* fall through */ }
+    return 'js/workers/audio-worker.js';
+}
 
 let worker: Worker | null = null;
 const pendingRequests = new Map<number, PendingRequest>();
 let requestId = 0;
+let consecutiveTimeouts = 0;
+const MAX_CONSECUTIVE_TIMEOUTS = 2;
 
 function spawnWorker(): Worker {
-    const w = new Worker(WORKER_URL);
+    // Resolve lazily (not at import time) so packaged file:// baseURIs and
+    // late <base> changes don't freeze a broken URL forever.
+    const url = workerUrl();
+    let w: Worker;
+    try {
+        w = new Worker(url);
+    } catch (e) {
+        if (url !== 'js/workers/audio-worker.js') w = new Worker('js/workers/audio-worker.js');
+        else throw e;
+    }
 
-    w.onmessage = (e: MessageEvent) => {
+    w!.onmessage = (e: MessageEvent) => {
         const { type, bpm, blob, id } = e.data || {};
         const request = pendingRequests.get(id);
         if (!request) return;
@@ -40,7 +57,7 @@ function spawnWorker(): Worker {
         }
     };
 
-    w.onerror = (err) => {
+    w!.onerror = (err) => {
         console.error('[WorkerClient] Audio worker error:', err.message, err.filename, err.lineno);
         failAllPending(new Error(`Audio worker crashed: ${err.message || 'unknown error'}`));
         // Mark dead so the next request spawns a fresh worker instead of
@@ -48,11 +65,11 @@ function spawnWorker(): Worker {
         if (worker === w) worker = null;
     };
 
-    w.onmessageerror = (err) => {
+    w!.onmessageerror = (err) => {
         console.error('[WorkerClient] Audio worker message error:', err);
     };
 
-    return w;
+    return w!;
 }
 
 function failAllPending(err: Error): void {
@@ -78,10 +95,20 @@ function post(kind: RequestKind, buildMessage: (id: number) => { type: string; p
         const timer = setTimeout(() => {
             if (pendingRequests.has(id)) {
                 pendingRequests.delete(id);
+                consecutiveTimeouts++;
+                // Hung worker: terminate AND fail every other queued request —
+                // previously only the timed-out call rejected while the rest
+                // waited on a dead worker until their own 30s timeout.
+                if (consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS && worker) {
+                    try { worker.terminate(); } catch { /* ignore */ }
+                    worker = null;
+                    consecutiveTimeouts = 0;
+                    failAllPending(new Error('Audio worker terminated after repeated timeouts'));
+                }
                 reject(new Error(`Audio worker timed out (${kind})`));
             }
         }, timeoutMs);
-        const wrappedResolve = (v: any) => { clearTimeout(timer); resolve(v); };
+        const wrappedResolve = (v: any) => { clearTimeout(timer); consecutiveTimeouts = 0; resolve(v); };
         const wrappedReject = (e: Error) => { clearTimeout(timer); reject(e); };
         pendingRequests.set(id, { kind, resolve: wrappedResolve, reject: wrappedReject });
         try {
@@ -99,13 +126,25 @@ function post(kind: RequestKind, buildMessage: (id: number) => { type: string; p
  * Detect BPM of an audio buffer using a worker.
  * Rejects (never hangs) if the worker is unavailable or crashes.
  */
+function isAudioBufferLike(v: unknown): v is AudioBuffer {
+    return !!v && typeof (v as AudioBuffer).getChannelData === 'function'
+        && typeof (v as AudioBuffer).sampleRate === 'number'
+        && typeof (v as AudioBuffer).numberOfChannels === 'number';
+}
+
 export function detectBPMWorker(audioBuffer: AudioBuffer, options?: { threshold?: number; minStepSeconds?: number }): Promise<number> {
-    const data = new Float32Array(audioBuffer.getChannelData(0));
+    if (!isAudioBufferLike(audioBuffer)) return Promise.reject(new Error('Invalid AudioBuffer'));
+    // Cap analysis to the first ~90s mono — full-length DJ mixes previously
+    // copied ~600MB into the worker and always timed out.
+    const sr = audioBuffer.sampleRate;
+    const full = audioBuffer.getChannelData(0);
+    const maxLen = Math.min(full.length, Math.floor(sr * 90));
+    const data = new Float32Array(full.subarray(0, maxLen));
     return post('BPM', (id) => ({
         type: 'DETECT_BPM',
         payload: {
             data,
-            sampleRate: audioBuffer.sampleRate,
+            sampleRate: sr,
             threshold: options?.threshold ?? BPM_DETECTION_THRESHOLD,
             minStepSeconds: options?.minStepSeconds ?? BPM_MIN_STEP_SECONDS
         },
@@ -119,7 +158,7 @@ export function bufferToWaveWorker(audioBuffer: AudioBuffer | { numberOfChannels
     let bufferPayload: { numberOfChannels: number; sampleRate: number; channels: Float32Array[] };
     const transferables: ArrayBufferLike[] = [];
 
-    if (audioBuffer instanceof AudioBuffer) {
+    if (isAudioBufferLike(audioBuffer)) {
         const channels: Float32Array[] = [];
         for (let i = 0; i < audioBuffer.numberOfChannels; i++) {
             const data = new Float32Array(audioBuffer.getChannelData(i));

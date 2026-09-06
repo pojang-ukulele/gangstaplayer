@@ -10,8 +10,11 @@
     "start": "node scripts/build.js && electron app-build",
     "build:prod": "node scripts/build.js --prod",
     "typecheck": "tsc --noEmit",
+    "pre-dist": "node scripts/build.js --prod",
     "dist": "electron-builder",
-    "test": "jest",
+    "test": "jest --selectProjects unit 2>nul || jest --testPathIgnorePatterns smoke",
+    "test:unit": "jest --testPathIgnorePatterns smoke --coverage",
+    "test:smoke": "jest tests/smoke.test.js --coverage=false",
     "audit": "npm audit --audit-level=high",
     "audit:fix": "npm audit fix",
     "setup:sonetra": "pip install -r sonetra-requirements.txt",
@@ -41,6 +44,7 @@
   "build": {
     "appId": "com.gangsta.playerpro3",
     "productName": "Gangsta Player Pro 3",
+    "asar": true,
     "directories": {
       "app": "app-build",
       "output": "dist"
@@ -70,7 +74,18 @@
       "shortcutName": "Gangsta Player Pro 3"
     },
 "files": [
-    "**/*"
+    "main.js",
+    "preload.js",
+    "sonetra-bridge.js",
+    "index.html",
+    "styles.css",
+    "icon.png",
+    "package.json",
+    "README.md",
+    "sonetra-requirements.txt",
+    "assets/**/*",
+    "js/**/*",
+    "!**/*.map"
   ],
   "extraResources": [
     {

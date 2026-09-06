@@ -14,10 +14,21 @@ function isArrayBuffer(value: any): boolean {
     return Object.prototype.toString.call(value) === '[object ArrayBuffer]';
 }
 
+function isSharedArrayBuffer(value: any): boolean {
+    return Object.prototype.toString.call(value) === '[object SharedArrayBuffer]';
+}
+
 export function normalizeToArrayBuffer(data: any): ArrayBuffer {
     // Fast path: already an ArrayBuffer
     if (isArrayBuffer(data)) {
         return data.slice(0);
+    }
+    // SharedArrayBuffer cannot be passed to decodeAudioData — copy it.
+    if (isSharedArrayBuffer(data)) {
+        const view = new Uint8Array(data);
+        const copy = new Uint8Array(view.byteLength);
+        copy.set(view);
+        return copy.buffer;
     }
     // Fast path: TypedArray (Uint8Array, Buffer, etc.) or has .buffer (e.g. DataView)
     if (data && typeof data === 'object') {
@@ -81,6 +92,11 @@ export function validateAudioSignature(
     }
 
     const view = new DataView(buffer);
+    // MP3 frame sync is 11 bits: 0xFF followed by top-3-bits set. Exact-byte
+    // checks (FB/F3/...) miss valid MPEG variants and free-format frames.
+    if (buffer.byteLength >= 2 && view.getUint8(0) === 0xFF && (view.getUint8(1) & 0xE0) === 0xE0) {
+        return null;
+    }
     const matches: string[] = [];
 
     // Check each known audio signature

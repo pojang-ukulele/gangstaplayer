@@ -60,7 +60,8 @@ export function ensureAudio(): boolean {
 }
 
 export function isAudioAvailable(): boolean {
-    return !!(audioCtx && audioCtx.state !== 'closed' && !_failed) || ensureAudio();
+    // No side effects: probing must not construct a suspended pre-gesture context.
+    return !!(audioCtx && audioCtx.state !== 'closed' && !_failed && masterGain && analyser);
 }
 
 /**
@@ -93,6 +94,16 @@ let workletCtx: AudioContext | null = null;
 /**
  * Initialize AudioWorklets with singleton protection
  */
+function workletUrl(file: string): string {
+    try {
+        // Packaged layout is app-build/index.html + app-build/js/... — resolve
+        // against the document base so dev and prod agree.
+        return new URL(`js/workers/${file}`, document.baseURI).toString();
+    } catch {
+        return `js/workers/${file}`;
+    }
+}
+
 export async function initWorklets(): Promise<void> {
     if (!ensureAudio() || !audioCtx) {
         console.warn("Cannot init worklets: AudioContext not available.");
@@ -101,8 +112,8 @@ export async function initWorklets(): Promise<void> {
     // Re-register if the context was rebuilt after a close.
     if (isWorkletRegistered && workletCtx === audioCtx) return;
     try {
-        await audioCtx.audioWorklet.addModule('js/workers/gangsta-processor.js');
-        await audioCtx.audioWorklet.addModule('js/workers/recorder-processor.js');
+        await audioCtx.audioWorklet.addModule(workletUrl('gangsta-processor.js'));
+        await audioCtx.audioWorklet.addModule(workletUrl('recorder-processor.js'));
         isWorkletRegistered = true;
         workletCtx = audioCtx;
         console.log('[Audio] Worklets Registered');

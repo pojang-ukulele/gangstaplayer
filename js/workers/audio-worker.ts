@@ -69,6 +69,11 @@ function detectBPM(data: Float32Array, sampleRate: number, threshold = 0.1, minS
     }
     
     if (peaks.length < 2) return 0;
+    // Density guard: peaks on nearly every minStep window mean a crushed/loud
+    // master, not beats — previously every loud track reported ~100 BPM.
+    const durationSec = data.length / sampleRate;
+    const maxPlausiblePeaks = durationSec / minStepSeconds;
+    if (peaks.length > maxPlausiblePeaks * 0.9) return 0;
     
     const intervals: number[] = [];
     for (let i = 1; i < peaks.length; i++) {
@@ -86,11 +91,23 @@ function detectBPM(data: Float32Array, sampleRate: number, threshold = 0.1, minS
 }
 
 function bufferToWave(abuffer: AudioBufferTransfer, len: number): Blob {
-    const numOfChan = abuffer.numberOfChannels;
-    const totalLength = len * numOfChan * 2 + 44;
+    const numOfChan = Math.floor(Number(abuffer.numberOfChannels));
+    const sampleRate = Number(abuffer.sampleRate);
+    const safeLen = Math.floor(Number(len));
+    if (!Number.isInteger(numOfChan) || numOfChan < 1 || numOfChan > 32) {
+        throw new Error('Invalid channel count');
+    }
+    if (!Number.isFinite(sampleRate) || sampleRate < 3000 || sampleRate > 192000) {
+        throw new Error('Invalid sample rate');
+    }
+    if (!Number.isInteger(safeLen) || safeLen <= 0 || safeLen > 268435456) {
+        throw new Error('Invalid length');
+    }
+    const totalLength = safeLen * numOfChan * 2 + 44;
     const buffer = new ArrayBuffer(totalLength);
     const view = new DataView(buffer);
     const channels = abuffer.channels;
+    len = safeLen;
     let i: number;
     let sample: number;
     let offset = 0;

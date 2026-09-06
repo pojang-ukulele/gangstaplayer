@@ -7,11 +7,14 @@ export class HighFidelityRecorder {
     private chunks: Float32Array[][] = [];
     private stopAckHandler: ((event: MessageEvent) => void) | null = null;
     private accepting = false;
+    private connected = false;
 
     constructor(private sourceNode: AudioNode) {}
 
     async init(): Promise<void> {
         if (!ensureAudio() || !audioCtx) throw new Error('Audio not ready');
+        // Second init previously orphaned the old worklet (double capture + CPU).
+        this.dispose();
         try {
             this.node = new AudioWorkletNode(audioCtx, 'recorder-processor');
             this.node.port.onmessage = (event) => {
@@ -22,6 +25,7 @@ export class HighFidelityRecorder {
                 }
             };
             this.sourceNode.connect(this.node);
+            this.connected = true;
             logger.info('[Recorder] High-Fidelity Recorder initialized');
         } catch (e) {
             logger.error('[Recorder] Initialization failed', e);
@@ -31,6 +35,10 @@ export class HighFidelityRecorder {
 
     start(): void {
         if (!this.node) return;
+        // Reconnect if a previous stop disconnected the tap to save CPU.
+        if (!this.connected) {
+            try { this.sourceNode.connect(this.node); this.connected = true; } catch { /* ignore */ }
+        }
         this.chunks = [];
         this.accepting = true;
         this.node.port.postMessage({ type: 'START' });
@@ -66,16 +74,29 @@ export class HighFidelityRecorder {
 
         logger.info(`[Recorder] Recording stopped. Captured ${this.chunks.length} blocks.`);
 
-        // Freeze intake before snapshot so late DATA can't pollute next take.
+        // Freeze intake BEFORE snapshot — DATA racing the STOPPED ack previously
+        // landed in the next take's chunks.
         this.accepting = false;
         const captured = this.chunks;
         this.chunks = [];
+
+        // Disconnect the tap while idle — a permanently connected worklet
+        // processes every quantum forever after the first take.
+        try {
+            if (this.node && this.connected) {
+                this.sourceNode.disconnect(this.node);
+                this.connected = false;
+            }
+        } catch { /* already disconnected */ }
 
         return await this.compileWav(captured);
     }
 
     private async compileWav(chunks: Float32Array[][]): Promise<Blob> {
         if (chunks.length === 0) throw new Error('No data recorded');
+        // Cap takes (~30min stereo @48kHz ≈ 660MB PCM) — longer takes OOMed before WAV compile.
+        const MAX_BLOCKS = 30 * 60 * (48000 / 128) * 1.2;
+        if (chunks.length > MAX_BLOCKS) throw new Error('Recording too long (30min cap)');
 
         const numChannels = chunks[0].length;
         if (!numChannels) throw new Error('No data recorded');
@@ -94,11 +115,15 @@ export class HighFidelityRecorder {
             for (const block of chunks) {
                 const src = block?.[channel];
                 if (!src || src.length === 0) continue;
-                if (off + src.length > totalLength) break;
-                channelData.set(src, off);
-                off += src.length;
+                if (off >= totalLength) break;
+                const room = totalLength - off;
+                const take = src.length > room ? src.subarray(0, room) : src;
+                channelData.set(take, off);
+                off += take.length;
             }
-            channels.push(channelData.subarray(0, off));
+            // Fresh copy: transferring a subarray view would transfer (and
+            // neuter) the entire backing store, not just the view window.
+            channels.push(channelData.slice(0, off));
         }
         const finalLen = channels[0]?.length ?? 0;
         if (finalLen <= 0) throw new Error('No data recorded');
@@ -117,6 +142,7 @@ export class HighFidelityRecorder {
 
     dispose(): void {
         this.accepting = false;
+        this.connected = false;
         if (this.node) {
             try { this.sourceNode.disconnect(this.node); } catch { /* ignore */ }
             this.node.disconnect();

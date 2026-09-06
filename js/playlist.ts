@@ -4,6 +4,9 @@ import { state, Track } from './state';
 import { VirtualScroller } from './reactive/ui';
 import { normalizeToArrayBuffer, validateAudioSignature } from './utils';
 import { engine } from './audio-engine';
+import { abortCrossfade } from './player';
+import { toast } from './toast';
+import { MAX_FILE_SIZE_BYTES } from './constants';
 import './types';
 
 interface PlaylistDeps {
@@ -25,6 +28,8 @@ let contextMenu: HTMLElement | null = null;
 let loadTrackFn: ((index: number) => Promise<void>) | null = null;
 let playTrackFn: (() => void) | null = null;
 let vScroller: VirtualScroller<Track> | null = null;
+let _dbLoadGen = 0;
+let _isFiltering = false;
 const ITEM_HEIGHT = 26; // Pixels — compact single-line row
 
 export function initPlaylist(deps: PlaylistDeps): void {
@@ -40,34 +45,68 @@ export function initPlaylist(deps: PlaylistDeps): void {
     // resolves later and clobbers the restored playlist.
     const db = window.database;
     if (db && !deps.skipDbLoad) {
+        const loadGen = ++_dbLoadGen;
         db.getAllTracks().then((tracks: Track[]) => {
+            if (loadGen !== _dbLoadGen) return; // superseded by newer load/filter
+            // Don't clobber tracks the user added while the DB read was in flight.
+            if (state.playlist.length > 0) return;
             if (tracks && tracks.length > 0) {
                 // Selection indices were computed against the pre-load list
                 state.update({ playlist: tracks, selectedIndices: [] });
                 anchorIndex = -1;
                 pivotIndex = -1;
             }
-        });
+        }).catch(() => { /* DB failure must not break the playlist UI */ });
     }
+
+    let fullPlaylistBackup: Track[] | null = null;
+    const setFiltering = (v: boolean) => { _isFiltering = v; };
 
     if (searchInput) {
         let searchGen = 0;
         searchInput.addEventListener('input', async () => {
             const myGen = ++searchGen;
+            _dbLoadGen = myGen; // invalidate any in-flight initial DB load
             const query = searchInput.value;
-            // Keep the playing track stable across filter swaps: remap by id.
-            const curId = state.playlist[state.currentTrackIndex]?.id;
-            const results = (db && query.length > 0)
-                ? await db.searchTracks(query)
-                : (db ? await db.getAllTracks() : state.playlist);
-            if (myGen !== searchGen) return; // stale keystroke, drop
-            const list = Array.isArray(results) ? results : [];
-            const newCur = curId ? list.findIndex(t => t?.id === curId) : -1;
-            state.update({
-                playlist: list,
-                selectedIndices: [],
-                ...(newCur !== state.currentTrackIndex ? { currentTrackIndex: newCur } : {}),
-            });
+            try {
+                if (query.length > 0) {
+                    // Stash the real queue once — filtering must never destroy it.
+                    if (fullPlaylistBackup === null) fullPlaylistBackup = [...state.playlist];
+                    setFiltering(true);
+                    const results = db ? await db.searchTracks(query.slice(0, 256)) : state.playlist;
+                    if (myGen !== searchGen) return; // stale keystroke, drop
+                    const list = Array.isArray(results) ? results : [];
+                    const curId = fullPlaylistBackup[state.currentTrackIndex]?.id
+                        ?? state.playlist[state.currentTrackIndex]?.id;
+                    const newCur = curId ? list.findIndex(t => t?.id === curId) : -1;
+                    state.update({
+                        playlist: list,
+                        selectedIndices: [],
+                        ...(newCur !== state.currentTrackIndex ? { currentTrackIndex: newCur } : {}),
+                    });
+                } else {
+                    if (myGen !== searchGen) return;
+                    // Restore the stashed queue; fall back to DB only if no stash.
+                    if (fullPlaylistBackup !== null) {
+                        const restored = fullPlaylistBackup;
+                        fullPlaylistBackup = null;
+                        setFiltering(false);
+                        const curId = state.playlist[state.currentTrackIndex]?.id;
+                        const newCur = curId ? restored.findIndex(t => t?.id === curId) : state.currentTrackIndex;
+                        state.update({
+                            playlist: restored,
+                            selectedIndices: [],
+                            ...(newCur !== state.currentTrackIndex && newCur >= -1 ? { currentTrackIndex: newCur } : {}),
+                        });
+                    } else if (db) {
+                        const all = await db.getAllTracks();
+                        if (myGen !== searchGen) return;
+                        state.update({ playlist: Array.isArray(all) ? all : [], selectedIndices: [] });
+                    }
+                }
+            } catch {
+                return; // DB error must not wipe the visible list
+            }
             anchorIndex = -1;
             pivotIndex = -1;
         });
@@ -103,8 +142,37 @@ export function setBlendingIndex(index: number): void {
 }
 
 /**
- * Background worker to analyze BPM for a track
+ * Background worker to analyze BPM for a track.
+ * Serialized through a bounded queue (max 2 concurrent decodes) — bulk
+ * imports previously spawned N parallel decodeAudioData calls and OOM'd.
  */
+const _analysisQueue: Track[] = [];
+let _analysisActive = 0;
+const MAX_CONCURRENT_ANALYSIS = 2;
+
+function enqueueAnalysis(track: Track): void {
+    // Bounded queue — bulk imports previously queued N unbounded decodes.
+    if (_analysisQueue.length >= 256) return;
+    _analysisQueue.push(track);
+    pumpAnalysisQueue();
+}
+
+export function clearAnalysisQueue(): void {
+    _analysisQueue.length = 0;
+}
+
+function pumpAnalysisQueue(): void {
+    while (_analysisActive < MAX_CONCURRENT_ANALYSIS && _analysisQueue.length > 0) {
+        const next = _analysisQueue.shift();
+        if (!next) break;
+        _analysisActive++;
+        analyzeTrackInBackground(next).finally(() => {
+            _analysisActive--;
+            pumpAnalysisQueue();
+        });
+    }
+}
+
 async function analyzeTrackInBackground(track: Track): Promise<void> {
     try {
         const db = window.database;
@@ -129,14 +197,23 @@ async function analyzeTrackInBackground(track: Track): Promise<void> {
 
 
         const arrayBuffer = normalizeToArrayBuffer(rawData);
+        if (arrayBuffer.byteLength === 0 || arrayBuffer.byteLength > MAX_FILE_SIZE_BYTES) {
+            return; // oversized drops previously OOMed the renderer
+        }
+        // Drop doomed work: track deleted/cleared while queued.
+        if (!state.playlist.some(t => t.id === track.id)) return;
 
         // Same validation policy as the sampler — reject non-audio early
         // instead of feeding garbage to the decoder.
         const validationError = validateAudioSignature(arrayBuffer, track.name);
         if (validationError) {
             console.warn(`[Playlist] Analysis skipped for ${track.name}: ${validationError}`);
-            track.bpm = 0;
-            state.update({ playlist: [...state.playlist] });
+            const failIdx = state.playlist.findIndex(t => t.id === track.id);
+            if (failIdx >= 0) {
+                const failNext = [...state.playlist];
+                failNext[failIdx] = { ...failNext[failIdx], bpm: 0 };
+                state.update({ playlist: failNext });
+            }
             return;
         }
 
@@ -176,6 +253,7 @@ async function analyzeTrackInBackground(track: Track): Promise<void> {
 
 export function addTracksToPlaylist(files: File[]): void {
     const currentPlaylist = [...state.playlist];
+    const existingPaths = new Set(currentPlaylist.map(t => t.path));
     const startIdx = currentPlaylist.length;
     const uuid = (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function')
         ? () => crypto.randomUUID()
@@ -183,6 +261,8 @@ export function addTracksToPlaylist(files: File[]): void {
     files.forEach((file) => {
         const fullPath = window.electronAPI.getPathForFile(file);
         if (!fullPath) return; // non-file drop — don't create unplayable rows
+        if (existingPaths.has(fullPath)) return; // dedup: same path, same song
+        existingPaths.add(fullPath);
         const track: Track = {
             id: uuid(),
             name: file.name,
@@ -201,10 +281,10 @@ export function addTracksToPlaylist(files: File[]): void {
                 name: track.name,
                 duration: 0,
                 bpm: 0
-            });
+            }).catch(() => { /* indexing is best-effort */ });
         }
 
-        analyzeTrackInBackground(track);
+        enqueueAnalysis(track);
     });
 
     state.update({ playlist: currentPlaylist });
@@ -401,7 +481,15 @@ export function renderPlaylist(): void {
  * Updates selection indices to follow the moved item.
  */
 function reorderPlaylist(fromIndex: number, toIndex: number, insertAfter: boolean): void {
+    // Reordering under an armed finishCrossfade(nextIdx) promotes the wrong track.
+    if (state.isCrossfadeInProgress) return;
+    // Reordering a filtered view would corrupt the real queue — clear search first.
+    if (_isFiltering) {
+        try { toast.info('CLEAR SEARCH BEFORE REORDERING'); } catch { /* ignore */ }
+        return;
+    }
     const playlist = [...state.playlist];
+    if (!Number.isInteger(fromIndex) || !Number.isInteger(toIndex)) return;
     if (fromIndex < 0 || fromIndex >= playlist.length) return;
     if (toIndex < 0 || toIndex >= playlist.length) return;
     if (fromIndex === toIndex) return;
@@ -507,14 +595,29 @@ export function handlePlaylistNavigation(e: KeyboardEvent): void {
 
 export function removeSelectedTracks(): void {
     if (!state.selectedIndices.length) return;
-    
+    if (_isFiltering) {
+        try { toast.info('CLEAR SEARCH BEFORE REMOVING'); } catch { /* ignore */ }
+        return;
+    }
+    // Abort any armed blend FIRST — the pending finishCrossfade timer otherwise
+    // fires with a stale index and resurrects the deleted track.
+    try { abortCrossfade(); } catch { /* ignore */ }
+    clearAnalysisQueue();
+
     const currentPlaylist = [...state.playlist];
-    const currentSelected = [...state.selectedIndices];
+    // Filter stale/OOB selections (e.g. after a filter shrank the list) —
+    // previously undefined entries were spliced into the playlist.
+    const currentSelected = [...new Set(state.selectedIndices)]
+        .filter(idx => Number.isInteger(idx) && idx >= 0 && idx < currentPlaylist.length);
+    if (!currentSelected.length) {
+        state.update({ selectedIndices: [] });
+        return;
+    }
     const currentIndex = state.currentTrackIndex;
-    
+
     // Sort descending to remove safe
     currentSelected.sort((a, b) => b - a);
-    
+
     let playingTrackRemoved = false;
     currentSelected.forEach(idx => {
         if (idx === currentIndex) playingTrackRemoved = true;
@@ -527,10 +630,14 @@ export function removeSelectedTracks(): void {
     let newIndex = currentIndex;
     if (playingTrackRemoved) {
         newIndex = -1;
-        // Kill audible playback of the removed track
-        engine.main.audio.pause();
-        engine.main.audio.src = "";
-        state.update({ isPlaying: false, masterBPM: 0 });
+        // Kill audible playback of the removed track + abort any armed blend
+        // that would otherwise promote the deleted channel on timer fire.
+        try { engine.main.audio.pause(); } catch { /* ignore */ }
+        try { engine.main.audio.src = ""; } catch { /* ignore */ }
+        try { engine.crossfade.audio.pause(); } catch { /* ignore */ }
+        try { engine.crossfade.audio.src = ""; } catch { /* ignore */ }
+        try { setBlendingIndex(-1); } catch { /* ignore */ }
+        state.update({ isPlaying: false, masterBPM: 0, isCrossfadeInProgress: false });
     } else if (currentIndex >= 0) {
         const removedBefore = currentSelected.filter(idx => idx < currentIndex).length;
         newIndex = currentIndex - removedBefore;
@@ -621,6 +728,14 @@ export function setupPlaylistHandlers(): void {
     }
 
     document.addEventListener('mouseup', () => { draggedIndex = -1; isDragging = false; document.body.style.cursor = ''; });
+    // Cancelled drags (Esc, drop outside) previously left the highlight stuck.
+    document.addEventListener('dragend', () => {
+        draggedIndex = -1; isDragging = false; document.body.style.cursor = '';
+        if (playlistEl) playlistEl.classList.remove('drag-over');
+        if (playlistEl) playlistEl.querySelectorAll('.drop-above, .drop-below').forEach(el => {
+            el.classList.remove('drop-above', 'drop-below');
+        });
+    });
 
     // === CONTEXT MENU ACTION HANDLERS ===
     const ctxRemove = document.getElementById('ctxRemove');
@@ -634,14 +749,21 @@ export function setupPlaylistHandlers(): void {
 
     if (ctxMoveUp) ctxMoveUp.addEventListener('click', () => {
         if (!state.selectedIndices.length) return;
+        if (state.isCrossfadeInProgress) return;
+        if (_isFiltering) { try { toast.info('CLEAR SEARCH BEFORE MOVING'); } catch { /* ignore */ } return; }
         const list = [...state.playlist];
-        const sel = new Set(state.selectedIndices);
+        // Drop stale/OOB selections — previously wrote undefined into the list.
+        const sel = new Set(
+            [...state.selectedIndices].filter(idx => Number.isInteger(idx) && idx >= 0 && idx < list.length)
+        );
+        if (!sel.size) { state.update({ selectedIndices: [] }); return; }
         const sorted = [...sel].sort((a, b) => a - b);
         if (sorted[0] <= 0) return;
         // Ascending; skip swap when predecessor is also selected so
         // contiguous blocks move together instead of reversing.
         for (const idx of sorted) {
             if (sel.has(idx - 1)) continue;
+            if (list[idx - 1] === undefined || list[idx] === undefined) continue;
             [list[idx - 1], list[idx]] = [list[idx], list[idx - 1]];
             sel.delete(idx); sel.add(idx - 1);
         }
@@ -656,13 +778,19 @@ export function setupPlaylistHandlers(): void {
 
     if (ctxMoveDown) ctxMoveDown.addEventListener('click', () => {
         if (!state.selectedIndices.length) return;
+        if (state.isCrossfadeInProgress) return;
+        if (_isFiltering) { try { toast.info('CLEAR SEARCH BEFORE MOVING'); } catch { /* ignore */ } return; }
         const list = [...state.playlist];
-        const sel = new Set(state.selectedIndices);
+        const sel = new Set(
+            [...state.selectedIndices].filter(idx => Number.isInteger(idx) && idx >= 0 && idx < list.length)
+        );
+        if (!sel.size) { state.update({ selectedIndices: [] }); return; }
         const sorted = [...sel].sort((a, b) => b - a);
         if (sorted[0] >= list.length - 1) return;
         // Descending; skip swap when successor is also selected (block move).
         for (const idx of sorted) {
             if (sel.has(idx + 1)) continue;
+            if (list[idx + 1] === undefined || list[idx] === undefined) continue;
             [list[idx + 1], list[idx]] = [list[idx], list[idx + 1]];
             sel.delete(idx); sel.add(idx + 1);
         }
@@ -680,11 +808,11 @@ export function setupPlaylistHandlers(): void {
              const idxStr = contextMenu.dataset.ctxIndex;
              if (idxStr) {
                  const idx = parseInt(idxStr);
-                 if (!isNaN(idx)) {
+                 if (!isNaN(idx) && idx >= 0 && idx < state.playlist.length) {
                      if (loadTrackFn) {
                          loadTrackFn(idx).then(() => {
                              if (playTrackFn) playTrackFn();
-                         });
+                         }).catch(() => undefined);
                      }
                  }
              }

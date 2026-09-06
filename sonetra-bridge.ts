@@ -46,39 +46,50 @@ function isSafeAudioPath(filePath: string): { safe: boolean; resolved?: string; 
         return { safe: false, error: 'Path must be a non-empty string' };
     }
 
-    // Block null byte injection
+    // Block null byte injection + explicit traversal segments (resolve() collapses them).
     if (filePath.includes('\0')) {
         return { safe: false, error: 'Path contains illegal characters' };
+    }
+    if (/(^|[\\/])\.\.([\\/]|$)/.test(filePath)) {
+        return { safe: false, error: 'Path traversal detected' };
     }
 
     try {
         const resolved = path.resolve(filePath);
 
-        // Block path traversal (after resolve, '..' components are eliminated)
-        // But verify no parent-dir reference made it through
-        if (resolved.includes('..\\') || resolved.includes('../') || resolved.startsWith('..')) {
-            return { safe: false, error: 'Path traversal detected' };
-        }
-
-        // Check resolved path is within an allowed directory
-        const isAllowed = ALLOWED_AUDIO_DIRS.some(allowed => {
-            if (!allowed) return false;
-            // Normalize both paths for comparison
-            const normalizedDir = path.normalize(allowed).toLowerCase();
-            const normalizedFile = resolved.toLowerCase();
-            return normalizedFile.startsWith(normalizedDir);
-        });
+        // Check resolved path is within an allowed directory (separator-boundary match).
+        const insideDir = (dir: string): boolean => {
+            const d = path.resolve(dir).toLowerCase();
+            const f = resolved.toLowerCase();
+            return f === d || f.startsWith(d + path.sep);
+        };
+        const isAllowed = ALLOWED_AUDIO_DIRS.some(allowed => allowed && insideDir(allowed));
 
         // Also allow __dirname/recordings for development
-        const devDir = path.normalize(path.join(__dirname, '..', 'recordings')).toLowerCase();
-        const isInDevDir = resolved.toLowerCase().startsWith(devDir);
+        const devDir = path.join(__dirname, '..', 'recordings');
+        const isInDevDir = insideDir(devDir);
 
         if (isAllowed || isInDevDir) {
-            // Verify file exists and has an audio extension (basic sanity check)
-            if (!fs.existsSync(resolved)) {
-                return { safe: false, error: 'File does not exist' };
+            // Whitelist branch must enforce the same guarantees as fallback:
+            // real file, audio extension, bounded size, symlink target stays inside.
+            let real = resolved;
+            try { real = fs.realpathSync.native(resolved); } catch { /* use resolved */ }
+            if (!insideDir(path.dirname(real)) && real.toLowerCase() !== resolved.toLowerCase()) {
+                // Symlink escapes the allowed tree — fall through to strict fallback checks.
+            } else {
+                const ext = path.extname(real).replace('.', '').toLowerCase();
+                if (!AUDIO_EXTENSIONS.has(ext)) {
+                    return { safe: false, error: `Non-audio file type rejected (.${ext})` };
+                }
+                try {
+                    const st = fs.statSync(real);
+                    if (!st.isFile()) return { safe: false, error: 'Not a file' };
+                    if (st.size > 100 * 1024 * 1024) return { safe: false, error: 'File too large' };
+                } catch {
+                    return { safe: false, error: 'File does not exist' };
+                }
+                return { safe: true, resolved: real };
             }
-            return { safe: true, resolved };
         }
 
         // FALLBACK: Paths that arrive here come from native file dialogs or
@@ -108,11 +119,22 @@ function isSafeAudioPath(filePath: string): { safe: boolean; resolved?: string; 
 }
 
 // Allow directory list to be extended at runtime (e.g., from config)
-function addAllowedAudioDir(dir: string): void {
-    const normalized = path.normalize(dir);
-    if (fs.existsSync(normalized) && !ALLOWED_AUDIO_DIRS.includes(normalized)) {
-        ALLOWED_AUDIO_DIRS.push(normalized);
-    }
+export function addAllowedAudioDir(dir: string): void {
+    if (typeof dir !== 'string' || !dir || dir.length > 32760) return;
+    if (dir.includes('\0')) return;
+    let resolved: string;
+    try { resolved = path.resolve(path.normalize(dir)); } catch { return; }
+    try {
+        const st = fs.statSync(resolved);
+        if (!st.isDirectory()) return;
+    } catch { return; }
+    // Refuse system roots and cap list size — one dialog pick must not whitelist System32.
+    const lower = resolved.toLowerCase();
+    const blocked = ['c:\\windows', 'c:\\windows\\system32', 'c:\\program files', '/etc', '/sys', '/proc'];
+    if (blocked.some(b => lower === b || lower.startsWith(b + path.sep))) return;
+    if (ALLOWED_AUDIO_DIRS.length >= 64) return;
+    if (ALLOWED_AUDIO_DIRS.some(d => path.resolve(d).toLowerCase() === lower)) return;
+    ALLOWED_AUDIO_DIRS.push(resolved);
 }
 
 /** Callback signature for restart/status events */
@@ -138,6 +160,8 @@ class SonetraBridge {
     private _healthPollTimer: ReturnType<typeof setInterval> | null = null;
     private readonly _healthPollIntervalMs = 30_000; // Check health every 30s
     private _statusCallbacks: SonetraStatusCallback[] = [];
+    private _lastStartAttemptMs = 0;
+    private readonly _startCooldownMs = 10_000;
 
     constructor() {
         this.config = this._loadConfig();
@@ -177,40 +201,13 @@ class SonetraBridge {
             await execFileAsync(pythonCmd, ['-c', 'import uvicorn; import fastapi'], 10_000);
             return { ok: true }; // Already installed
         } catch {
-            // Not installed — check for requirements file
-        }
-
-        // Look for requirements in priority order
-        const reqPaths = [
-            path.join(__dirname, 'sonetra-requirements.txt'),
-            path.join(this.sonetraPath || '', 'requirements.txt'),
-            path.join(this._getResourcesPath(), 'sonetra-requirements.txt'),
-        ];
-
-        let reqPath: string | null = null;
-        for (const p of reqPaths) {
-            if (fs.existsSync(p)) { reqPath = p; break; }
-        }
-
-        if (!reqPath) {
+            // Not installed — do NOT auto-install. Renderer-triggered pip install
+            // is a supply-chain RCE vector (network fetch + setup.py exec as user).
+            // Require explicit manual install via setup script.
             return {
                 ok: false,
                 error: 'Python packages (uvicorn, fastapi) are not installed. ' +
-                      'Run: pip install -r sonetra-requirements.txt'
-            };
-        }
-
-        console.log(`[Sonetra] Installing Python dependencies from ${reqPath}...`);
-        try {
-            // Async — a 2-minute pip install must NOT freeze the main process event loop
-            await execFileAsync(pythonCmd, ['-m', 'pip', 'install', '-r', reqPath], 120_000);
-            console.log('[Sonetra] Dependencies installed successfully');
-            return { ok: true };
-        } catch (err: any) {
-            return {
-                ok: false,
-                error: `Failed to install Python dependencies: ${err.message}. ` +
-                      `Try manually: ${pythonCmd} -m pip install -r "${reqPath}"`
+                      'Run: npm run setup:sonetra (or setup:sonetra:win on Windows)'
             };
         }
     }
@@ -219,7 +216,20 @@ class SonetraBridge {
         try {
             const configPath = path.join(__dirname, 'config.json');
             if (fs.existsSync(configPath)) {
-                return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+                const raw = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+                if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+                const out: any = {};
+                // Schema-validate: only known string fields, bounded length, no null bytes.
+                for (const key of ['pythonPath', 'sonetraPath']) {
+                    const v = (raw as any)[key];
+                    if (typeof v === 'string' && v && v.length <= 32760 && !v.includes('\0')) {
+                        out[key] = v;
+                    }
+                }
+                if (typeof (raw as any).port === 'number' && Number.isFinite((raw as any).port)) {
+                    out.port = Math.max(1024, Math.min(65535, Math.floor((raw as any).port)));
+                }
+                return out;
             }
         } catch (e) {
             console.error('[Sonetra] Failed to load config.json', e);
@@ -231,8 +241,16 @@ class SonetraBridge {
      * Find the Sonetra directory path
      */
     _findSonetraPath(): string | null {
-        if (this.config.sonetraPath && fs.existsSync(this.config.sonetraPath)) {
-            return this.config.sonetraPath;
+        if (typeof this.config.sonetraPath === 'string' && this.config.sonetraPath) {
+            try {
+                const resolved = path.resolve(this.config.sonetraPath);
+                // Trust only dirs that actually contain the API entry — prevents
+                // cwd/DLL hijack via a planted config path.
+                if (fs.existsSync(path.join(resolved, 'src', 'api', 'main.py')) ||
+                    fs.existsSync(path.join(resolved, 'src', 'api', 'main_lite.py'))) {
+                    return resolved;
+                }
+            } catch { /* fall through */ }
         }
 
         const possiblePaths = [
@@ -256,6 +274,13 @@ class SonetraBridge {
             console.log('[Sonetra] Server already running');
             return { success: true, message: 'Server already running' };
         }
+        // Cooldown: renderer-triggerable start (incl. pip install) must not
+        // be spammable into a fork/pip-install DoS loop.
+        const now = Date.now();
+        if (now - this._lastStartAttemptMs < this._startCooldownMs) {
+            return { success: false, error: 'Server start rate-limited — try again shortly' };
+        }
+        this._lastStartAttemptMs = now;
         // Re-entry guard: during the 3–8 s health-check window isRunning is
         // still false; without this a second caller spawns a duplicate uvicorn.
         if ((this as any)._starting) {
@@ -325,19 +350,29 @@ class SonetraBridge {
             console.log(`[Sonetra] Working directory: ${srcPath}`);
 
             try {
+                // Minimal env: never inherit secrets into the child; truncate child
+                // output to blunt log-spam/ANSI forgery from a compromised server.
+                const cleanEnv: NodeJS.ProcessEnv = {
+                    PATH: process.env.PATH,
+                    SYSTEMROOT: process.env.SYSTEMROOT,
+                    TEMP: process.env.TEMP,
+                    TMP: process.env.TMP,
+                    PYTHONUNBUFFERED: '1',
+                    PYTHONNOUSERSITE: '1',
+                };
                 this.serverProcess = spawn(pythonCmd, args, {
                     cwd: srcPath,
                     shell: false,
                     stdio: ['pipe', 'pipe', 'pipe'],
-                    env: { ...process.env, PYTHONUNBUFFERED: '1' }
+                    env: cleanEnv
                 });
 
                 this.serverProcess.stdout?.on('data', (data) => {
-                    console.log(`[Sonetra] ${data.toString().trim()}`);
+                    console.log(`[Sonetra] ${String(data).slice(0, 2000).trim()}`);
                 });
 
                 this.serverProcess.stderr?.on('data', (data) => {
-                    const msg = data.toString().trim();
+                    const msg = String(data).slice(0, 2000).trim();
                     console.log(`[Sonetra ERR] ${msg}`);
                     // Uvicorn logs to stderr, check for startup message
                     if (msg.includes('Application startup complete') || msg.includes('Uvicorn running')) {
@@ -373,8 +408,12 @@ class SonetraBridge {
                     }
                 });
 
-                // Wait a bit and check if server is responsive
-                setTimeout(async () => {
+                // Wait a bit and check if server is responsive (cancellable timers).
+                const t1 = setTimeout(async () => {
+                    if (!this.serverProcess) {
+                        resolve({ success: false, error: 'Server stopped during startup' });
+                        return;
+                    }
                     const healthy = await this._checkHealth();
                     if (healthy) {
                         this.isRunning = true;
@@ -384,7 +423,7 @@ class SonetraBridge {
                         resolve({ success: true, port: this.serverPort });
                     } else {
                         // Give it more time
-                        setTimeout(async () => {
+                        const t2 = setTimeout(async () => {
                             const healthy2 = await this._checkHealth();
                             this.isRunning = healthy2;
                             if (healthy2) {
@@ -394,18 +433,19 @@ class SonetraBridge {
                             } else {
                                 this._fireStatus('failed', { message: 'Server did not respond in time' });
                             }
-                            resolve(healthy2 
+                            resolve(healthy2
                                 ? { success: true, port: this.serverPort }
-                                : { 
-                                    success: false, 
+                                : {
+                                    success: false,
                                     error: `Sonetra server failed to start. This usually means Python dependencies are missing. ` +
-                                           `Ensure Python 3.9+ is installed, then run: ` +
-                                           `${pythonCmd} -m pip install -r sonetra-requirements.txt`
+                                           `Ensure Python 3.9+ is installed, then run npm run setup:sonetra`
                                 }
                             );
                         }, 5000);
+                        (t2 as any)?.unref?.();
                     }
                 }, 3000);
+                (t1 as any)?.unref?.();
 
             } catch (err: any) {
                 console.error('[Sonetra] Spawn error:', err);
@@ -516,10 +556,16 @@ class SonetraBridge {
     private _resolvePythonCmd(): string {
         let pythonCmd = '';
 
-        if (this.config.pythonPath && fs.existsSync(this.config.pythonPath)) {
-            pythonCmd = this.config.pythonPath;
-            console.log(`[Sonetra] Using config Python: ${pythonCmd}`);
-            return pythonCmd;
+        if (typeof this.config.pythonPath === 'string' && this.config.pythonPath) {
+            try {
+                const resolved = path.resolve(this.config.pythonPath);
+                // Validate it is an actual file (not a dir / planted shim path).
+                if (fs.existsSync(resolved) && fs.statSync(resolved).isFile()) {
+                    pythonCmd = resolved;
+                    console.log(`[Sonetra] Using config Python: ${pythonCmd}`);
+                    return pythonCmd;
+                }
+            } catch { /* fall through to bundled/system */ }
         }
 
         const venvPythonPaths = [
@@ -602,24 +648,36 @@ class SonetraBridge {
     async stopServer(): Promise<{ success: boolean }> {
         if (this.serverProcess) {
             console.log('[Sonetra] Stopping server...');
-            
+            const proc = this.serverProcess;
+            this._stopHealthPolling();
+            this._restartCount = 0;
+            // Await termination so fast restart can't double-spawn on port 8765.
+            const exited = new Promise<void>((resolve) => {
+                const to = setTimeout(resolve, 5000);
+                (to as any)?.unref?.();
+                try {
+                    proc.once('close', () => { clearTimeout(to); resolve(); });
+                    proc.once('exit', () => { clearTimeout(to); resolve(); });
+                } catch { clearTimeout(to); resolve(); }
+            });
             if (process.platform === 'win32') {
-                const proc = this.serverProcess;
                 if (proc?.pid) {
-                    const killer = spawn('taskkill', ['/pid', String(proc.pid), '/f', '/t']);
-                    killer.on('error', (e) => {
-                        console.warn('[Sonetra] taskkill failed:', e.message);
-                        try { proc.kill(); } catch { /* already dead */ }
+                    await new Promise<void>((resolve) => {
+                        const killer = spawn('taskkill', ['/pid', String(proc.pid), '/f', '/t']);
+                        killer.on('error', () => { try { proc.kill(); } catch { /* dead */ } resolve(); });
+                        killer.on('close', () => resolve());
+                        setTimeout(resolve, 4000).unref?.();
                     });
                 }
             } else {
-                this.serverProcess.kill('SIGTERM');
+                try { proc.kill('SIGTERM'); } catch { /* already dead */ }
+                await Promise.race([exited, new Promise<void>((r) => setTimeout(r, 3000).unref?.() ?? r())]);
+                // Escalate: SIGTERM-immune child must not linger as a port zombie.
+                try { if (proc.exitCode === null) proc.kill('SIGKILL'); } catch { /* ignore */ }
             }
-            
+            await Promise.race([exited, new Promise<void>((r) => setTimeout(r, 2000).unref?.() ?? r())]);
             this.serverProcess = null;
             this.isRunning = false;
-            this._stopHealthPolling();
-            this._restartCount = 0;
         }
         return { success: true };
     }
@@ -658,7 +716,11 @@ class SonetraBridge {
                 }
 
                 const result = await operation();
-                // Success! Reset failure count
+                // A 5xx marker is a retryable failure, not a success.
+                if ((result as any)?.__retry) {
+                    throw new Error(`Server error: ${(result as any).status}`);
+                }
+                // Success! Reset failure count (one logical operation == one count)
                 if (this._failureCount > 0) {
                     console.log(`[Sonetra] Circuit reset after successful request`);
                     this._failureCount = 0;
@@ -667,15 +729,17 @@ class SonetraBridge {
                 return result;
             } catch (err) {
                 lastError = err as Error;
-                this._failureCount++;
                 console.warn(`[Sonetra] Request failed (attempt ${attempt + 1}/${maxRetries + 1}): ${lastError.message}`);
-
-                if (this._failureCount >= this._maxFailures) {
-                    this._circuitOpenUntil = Date.now() + this._circuitOpenMs;
-                    console.error(`[Sonetra] Circuit breaker OPEN for ${this._circuitOpenMs / 1000}s after ${this._failureCount} failures`);
-                    throw new Error(`Circuit breaker open after ${this._maxFailures} consecutive failures`);
-                }
+                if (attempt >= maxRetries) break;
             }
+        }
+
+        // Count one logical operation as one failure for the circuit breaker.
+        this._failureCount++;
+        if (this._failureCount >= this._maxFailures) {
+            this._circuitOpenUntil = Date.now() + this._circuitOpenMs;
+            console.error(`[Sonetra] Circuit breaker OPEN for ${this._circuitOpenMs / 1000}s after ${this._failureCount} failures`);
+            throw new Error(`Circuit breaker open after ${this._maxFailures} consecutive failures`);
         }
 
         throw lastError || new Error('Operation failed with unknown error');
@@ -707,12 +771,17 @@ class SonetraBridge {
 
         // Execute HTTP request with circuit breaker + exponential backoff
         try {
-            return await this._executeWithBackoff(() => {
-                return new Promise((resolve) => {
+            const raw = await this._executeWithBackoff(() => {
+                return new Promise((resolve, reject) => {
                     try {
                         const formData = new FormData();
-                        formData.append('file1', fs.createReadStream(path1.resolved!));
-                        formData.append('file2', fs.createReadStream(path2.resolved!));
+                        const s1 = fs.createReadStream(path1.resolved!);
+                        const s2 = fs.createReadStream(path2.resolved!);
+                        // Deleted-file race must fail fast, not hang to the 60s timeout.
+                        s1.on('error', (err) => { try { s1.destroy(); } catch { /* ignore */ } reject(err); });
+                        s2.on('error', (err) => { try { s2.destroy(); } catch { /* ignore */ } reject(err); });
+                        formData.append('file1', s1);
+                        formData.append('file2', s2);
 
                         const requestOptions = {
                             hostname: this.serverHost,
@@ -725,35 +794,57 @@ class SonetraBridge {
 
                         const req = http.request(requestOptions, (res) => {
                             const chunks: Buffer[] = [];
-                            res.on('data', (chunk) => chunks.push(chunk));
+                            let bytes = 0;
+                            const MAX_RESP_BYTES = 100 * 1024 * 1024;
+                            res.on('data', (chunk: Buffer) => {
+                                bytes += chunk.length;
+                                if (bytes > MAX_RESP_BYTES) {
+                                    req.destroy();
+                                    resolve({ success: false, error: 'Response too large' });
+                                    return;
+                                }
+                                chunks.push(chunk);
+                            });
                             res.on('end', () => {
                                 if (res.statusCode === 200) {
                                     const audioBuffer = Buffer.concat(chunks);
                                     resolve({ success: true, audioBuffer });
+                                } else if (res.statusCode !== undefined && res.statusCode !== null && res.statusCode >= 500) {
+                                    // 5xx must reject so _executeWithBackoff actually retries.
+                                    (resolve as any)({ __retry: true, status: res.statusCode });
                                 } else {
-                                    const errorBody = Buffer.concat(chunks).toString();
+                                    const errorBody = Buffer.concat(chunks).toString().slice(0, 2000);
                                     resolve({ success: false, error: `Server error: ${res.statusCode} - ${errorBody}` });
                                 }
                             });
                         });
+                        // Stream errors (e.g. file deleted mid-upload) must not hang to timeout.
+                        try {
+                            formData.on('error', (err) => {
+                                try { req.destroy(); } catch { /* ignore */ }
+                                resolve({ success: false, error: `Request failed: ${(err as Error).message}` });
+                            });
+                        } catch { /* ignore */ }
 
                         req.on('error', (err) => {
-                            resolve({ success: false, error: `Request failed: ${err.message}` });
+                            reject(err);
                         });
 
                         req.on('timeout', () => {
                             req.destroy();
-                            resolve({ success: false, error: 'Request timed out' });
+                            reject(new Error('Request timed out'));
                         });
 
                         formData.pipe(req);
 
                     } catch (err: any) {
-                        resolve({ success: false, error: `Failed to prepare request: ${err.message}` });
+                        reject(err);
                     }
                 });
             }, 2, 1500); // max 2 retries, start at 1.5s delay
-            
+            if ((raw as any)?.__retry) throw new Error(`Server error: ${(raw as any).status}`);
+            return raw as { success: boolean; audioBuffer?: Buffer; error?: string };
+
         } catch (err: any) {
             return { success: false, error: `Circuit breaker active: ${err.message}` };
         }
@@ -778,13 +869,23 @@ class SonetraBridge {
 
         return new Promise((resolve) => {
             const formData = new FormData();
-            
+
             try {
-                formData.append('file', fs.createReadStream(checkedPath.resolved!));
+                const rs = fs.createReadStream(checkedPath.resolved!);
+                rs.on('error', (err) => {
+                    try { rs.destroy(); } catch { /* ignore */ }
+                    resolve({ success: false, error: `Failed to read audio file: ${(err as Error).message}` });
+                });
+                formData.append('file', rs);
             } catch (err: any) {
                 resolve({ success: false, error: `Failed to read audio file: ${err.message}` });
                 return;
             }
+            try {
+                formData.on('error', (err) => {
+                    resolve({ success: false, error: `Request failed: ${(err as Error).message}` });
+                });
+            } catch { /* ignore */ }
 
             const requestOptions = {
                 hostname: this.serverHost,
@@ -797,12 +898,23 @@ class SonetraBridge {
 
             const req = http.request(requestOptions, (res) => {
                 const chunks: Buffer[] = [];
-                
-                res.on('data', (chunk) => chunks.push(chunk));
+                let bytes = 0;
+                const MAX_JSON_BYTES = 4 * 1024 * 1024;
+
+                res.on('data', (chunk: Buffer) => {
+                    bytes += chunk.length;
+                    if (bytes > MAX_JSON_BYTES) {
+                        req.destroy();
+                        resolve({ success: false, error: 'Response too large' });
+                        return;
+                    }
+                    chunks.push(chunk);
+                });
                 res.on('end', () => {
                     if (res.statusCode === 200) {
                         try {
-                            const analysis = JSON.parse(Buffer.concat(chunks).toString());
+                            const text = Buffer.concat(chunks).toString().slice(0, MAX_JSON_BYTES);
+                            const analysis = JSON.parse(text);
                             resolve({ success: true, analysis });
                         } catch (err) {
                             resolve({ success: false, error: 'Failed to parse response' });
@@ -833,7 +945,7 @@ class SonetraBridge {
         return {
             isRunning: this.isRunning,
             port: this.serverPort,
-            sonetraPath: this.sonetraPath,
+            hasSonetraPath: !!this.sonetraPath,
             restartCount: this._restartCount,
             maxRestartAttempts: this._maxRestartAttempts
         };

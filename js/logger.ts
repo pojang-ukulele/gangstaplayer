@@ -82,7 +82,8 @@ class GangstaLogger {
 
     debug(msg: string, meta?: unknown): void {
         if (meta !== undefined) console.debug(msg, meta);
-        this._log('DEBUG', msg);
+        const text = meta !== undefined ? `${msg} ${this._stringify(meta)}` : msg;
+        this._log('DEBUG', text);
     }
 
     async getLogPath(): Promise<string> {

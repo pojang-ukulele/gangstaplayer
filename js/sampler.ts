@@ -1,5 +1,5 @@
 // === SAMPLER MODULE ===
-import { DEFAULT_PAD_VOLUME, POOL_SIZE } from './constants';
+import { DEFAULT_PAD_VOLUME, MAX_FILE_SIZE_BYTES, NUM_PADS, POOL_SIZE } from './constants';
 import { state } from './state';
 import { audioCtx, masterGain, resumeAudioContext, ensureAudio } from './audio';
 import { engine } from './audio-engine';
@@ -32,18 +32,30 @@ export const padLoopEnd: Record<number, number> = {}; // loop end in seconds (-1
 const WAVEFORM_POINTS = 100; // Number of amplitude samples for preview
 
 // === Voice Pool: reuse GainNode objects to reduce GC pressure ===
+// Pool is bound to the owning AudioContext — foreign-context nodes throw on
+// connect(). The pool is dropped whenever the context is rebuilt.
 const _gainPool: GainNode[] = [];
 let _poolCreated = 0;
+let _poolCtx: AudioContext | null = null;
 
 function acquireGain(): GainNode | null {
+    if (!ensureAudio() || !audioCtx) return null;
+    if (_poolCtx && _poolCtx !== audioCtx) {
+        _gainPool.length = 0;
+    }
+    _poolCtx = audioCtx;
     const pooled = _gainPool.pop();
     if (pooled) return pooled;
-    if (!ensureAudio() || !audioCtx) return null;
     _poolCreated++;
     return audioCtx.createGain();
 }
 
 function releaseGain(gain: GainNode): void {
+    // Never pool a node from a dead context — it throws on connect().
+    // The pool context tracks the current AudioContext; foreign nodes are dropped.
+    if (_poolCtx && audioCtx && _poolCtx !== audioCtx) {
+        return;
+    }
     // Disconnect the gain node from its input and output
     try { gain.disconnect(); } catch (_) { /* already disconnected */ }
     // Cancel prior automation before reset, or the next voice inherits ramps.
@@ -78,11 +90,22 @@ export function initSampler(deps: SamplerDeps): void {
     // Subscribe to mapping changes
     state.subscribe('padKeyMap', () => {
         if (padGrid) {
-            for (let i = 0; i < 16; i++) updatePadVisuals(i);
+            for (let i = 0; i < NUM_PADS; i++) updatePadVisuals(i);
         }
     });
     
     createPadGrid();
+    // Re-render waveforms on resize (debounced) — maximized windows otherwise
+    // leave stretched/blank canvases until the next pad event.
+    let _resizeT: ReturnType<typeof setTimeout> | null = null;
+    window.addEventListener('resize', () => {
+        if (_resizeT) clearTimeout(_resizeT);
+        _resizeT = setTimeout(() => {
+            for (let i = 0; i < NUM_PADS; i++) {
+                try { renderWaveform(i); } catch { /* ignore */ }
+            }
+        }, 200);
+    });
 }
 
 export function getPadGrid(): HTMLElement | null { return padGrid; }
@@ -150,6 +173,7 @@ export function renderWaveform(index: number): void {
     const dpr = window.devicePixelRatio || 1;
     const w = pad.clientWidth;
     const h = pad.clientHeight;
+    if (w <= 0 || h <= 0) return;
     canvas.width = w * dpr;
     canvas.height = h * dpr;
     canvas.style.width = w + 'px';
@@ -248,12 +272,21 @@ function setPadLoading(index: number, loading: boolean): void {
     }
 }
 
+const _padLoadGen: number[] = new Array(16).fill(0);
+
 export async function loadSampleFile(file: File, index: number): Promise<void> {
     setPadLoading(index, true);
+    const gen = ++_padLoadGen[index];
     try {
         logger.info(`[Sampler] Loading file to pad ${index}: ${file.name}`);
+        if (file.size > MAX_FILE_SIZE_BYTES) {
+            logger.error(`[Sampler] Pad ${index} rejected: file too large (${file.size} bytes)`);
+            toast.error("FILE TOO LARGE (MAX 100MB)");
+            return;
+        }
         const arrayBuffer = await file.arrayBuffer();
-        
+        if (gen !== _padLoadGen[index]) return; // superseded by newer drop
+
         // Validate audio file signature
         const validationError = validateAudioSignature(arrayBuffer, file.name);
         if (validationError) {
@@ -261,27 +294,40 @@ export async function loadSampleFile(file: File, index: number): Promise<void> {
             toast.error("INVALID AUDIO FILE");
             return;
         }
-        
+
         // Use native decoder directly (no worker pool — most reliable for one-shot samples)
         if (!ensureAudio() || !audioCtx) { toast.error("AUDIO NOT READY"); return; }
-        const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
-        
+        let audioBuffer: AudioBuffer;
+        try {
+            audioBuffer = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
+        } catch (decErr) {
+            logger.error(`[Sampler] Pad ${index} decode failed`, decErr);
+            toast.error("SAMPLE UNDECODABLE");
+            return;
+        }
+        if (gen !== _padLoadGen[index]) return;
+
         padBuffers[index] = audioBuffer;
         padPaths[index] = file.name;
         padWaveforms[index] = computeWaveform(audioBuffer);
         logger.info(`[Sampler] Pad ${index}: Buffer set from file (${audioBuffer.duration.toFixed(2)}s)`);
         updatePadVisuals(index);
-        
+
+        // BPM failure must not masquerade as sample-load failure (buffer is playable).
         if (detectBPMFn) {
-            const bpm = await detectBPMFn(audioBuffer);
-            padBPMs[index] = bpm;
-            padBeatPositions[index] = computeBeatPositions(bpm, audioBuffer.duration);
-            logger.info(`[Sampler] Pad ${index} BPM: ${bpm}, beats: ${padBeatPositions[index].length}`);
+            try {
+                const bpm = await detectBPMFn(audioBuffer);
+                if (gen !== _padLoadGen[index]) return;
+                padBPMs[index] = bpm;
+                padBeatPositions[index] = computeBeatPositions(bpm, audioBuffer.duration);
+                logger.info(`[Sampler] Pad ${index} BPM: ${bpm}, beats: ${padBeatPositions[index].length}`);
+            } catch (bpmErr) {
+                logger.warn(`[Sampler] Pad ${index} BPM detection skipped`, bpmErr);
+            }
         }
         document.dispatchEvent(new CustomEvent('ug:dataChanged'));
-    } catch (e: any) { 
-        logger.error(`[Sampler] Pad ${index} load failed: ${e.message || e}`);
-        logger.error(`[Sampler] Pad ${index} file load FAILED:`, e);
+    } catch (e: any) {
+        logger.error(`[Sampler] Pad ${index} file load FAILED: ${e?.message || e}`, e);
         toast.error("SAMPLE LOAD FAILED");
     } finally {
         setPadLoading(index, false);
@@ -290,6 +336,7 @@ export async function loadSampleFile(file: File, index: number): Promise<void> {
 
 export async function loadSampleFromPath(path: string, index: number): Promise<void> {
     setPadLoading(index, true);
+    const gen = ++_padLoadGen[index];
     try {
         if (!fsBridgeRef) return;
         logger.info(`[Sampler] Loading path to pad ${index}: ${path}`);
@@ -300,34 +347,53 @@ export async function loadSampleFromPath(path: string, index: number): Promise<v
         }
         
         const arrayBuffer = normalizeToArrayBuffer(rawData);
-        
-        // Validate audio file signature
-        const validationError = validateAudioSignature(arrayBuffer, path.split(/[\\/]/).pop());
-        if (validationError) {
-            logger.error(`[Sampler] Pad ${index} path validation failed: ${validationError}`);
+        if (arrayBuffer.byteLength > MAX_FILE_SIZE_BYTES) {
+            logger.error(`[Sampler] Pad ${index} rejected: decoded size too large`);
+            toast.error("FILE TOO LARGE (MAX 100MB)");
             return;
         }
         
+        // Validate audio file signature (kit restores previously failed silently).
+        const validationError = validateAudioSignature(arrayBuffer, path.split(/[\\/]/).pop());
+        if (validationError) {
+            logger.error(`[Sampler] Pad ${index} path validation failed: ${validationError}`);
+            toast.error("INVALID AUDIO FILE IN KIT");
+            return;
+        }
+        if (gen !== _padLoadGen[index]) return;
+
         logger.info(`[Sampler] Pad ${index}: Got ${arrayBuffer.byteLength} bytes, decoding...`);
-        
+
         // Use native decoder directly
         if (!ensureAudio() || !audioCtx) return;
-        const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
- 
+        let audioBuffer: AudioBuffer;
+        try {
+            audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+        } catch (decErr) {
+            logger.error(`[Sampler] Pad ${index} path decode failed`, decErr);
+            toast.error("KIT SAMPLE UNDECODABLE");
+            return;
+        }
+        if (gen !== _padLoadGen[index]) return;
+
         padBuffers[index] = audioBuffer;
         padPaths[index] = path;
         padWaveforms[index] = computeWaveform(audioBuffer);
         logger.info(`[Sampler] Pad ${index}: Buffer set (${audioBuffer.duration.toFixed(2)}s, ${audioBuffer.sampleRate}Hz)`);
         updatePadVisuals(index);
         if (detectBPMFn) {
-            const bpm = await detectBPMFn(audioBuffer);
-            padBPMs[index] = bpm;
-            padBeatPositions[index] = computeBeatPositions(bpm, audioBuffer.duration);
+            try {
+                const bpm = await detectBPMFn(audioBuffer);
+                if (gen !== _padLoadGen[index]) return;
+                padBPMs[index] = bpm;
+                padBeatPositions[index] = computeBeatPositions(bpm, audioBuffer.duration);
+            } catch (bpmErr) {
+                logger.warn(`[Sampler] Pad ${index} BPM detection skipped`, bpmErr);
+            }
         }
         document.dispatchEvent(new CustomEvent('ug:dataChanged'));
-    } catch (e: any) { 
-        logger.error(`[Sampler] Pad ${index} path load failed: ${e.message || e}`);
-        logger.error(`[Sampler] Pad ${index} path load FAILED:`, e);
+    } catch (e: any) {
+        logger.error(`[Sampler] Pad ${index} path load FAILED: ${e?.message || e}`, e);
     } finally {
         setPadLoading(index, false);
     }
@@ -373,13 +439,14 @@ export function startPad(index: number): void {
         let startOffset = 0;
         
         if (padSyncState[index] && masterBPMRef.value > 0 && padBPMs[index] > 0) {
-            // Adjust playback rate to match master BPM
+            // Adjust playback rate to match master BPM (clamped like the deck).
             rate = (masterBPMRef.value / padBPMs[index]) * rate;
-            
+            rate = Math.min(1.5, Math.max(0.5, rate));
+
             // Beat-quantized start: snap to nearest beat in the master timeline
             const masterBPS = masterBPMRef.value / 60; // beats per second
             const padBeatDuration = 60 / padBPMs[index]; // one beat in the pad's native time
-            
+
             // Get current position in the master audio
             const playerAudio = engine.main.audio;
             if (playerAudio && playerAudio.currentTime > 0 && !isNaN(playerAudio.duration)) {
@@ -387,7 +454,12 @@ export function startPad(index: number): void {
                 // Start the pad at the same phase position within its beat cycle
                 startOffset = masterBeatPhase * padBeatDuration;
             }
+            // Clamp: short stabs shorter than one beat previously threw RangeError.
+            const dur = padBuffers[index]?.duration ?? 0;
+            if (!Number.isFinite(startOffset) || startOffset < 0) startOffset = 0;
+            if (dur > 0 && startOffset >= dur) startOffset = 0;
         }
+        if (!Number.isFinite(rate) || rate <= 0) rate = 1;
         source.playbackRate.value = rate;
         
         source.connect(gainNode);
@@ -423,6 +495,13 @@ export function startPad(index: number): void {
     updatePadVisuals(index);
 }
 
+/** Stop every looping pad voice (focus-loss safety — looped sources never end on their own). */
+export function stopAllPads(): void {
+    for (let i = 0; i < NUM_PADS; i++) {
+        try { stopPad(i); } catch { /* ignore */ }
+    }
+}
+
 export function stopPad(index: number): void {
     const currentVoice = activeVoices[index];
     if (currentVoice) {
@@ -449,10 +528,14 @@ export function createPadGrid(): void {
     if (!padGrid) return;
     if (padGrid.children.length > 0) return; // Guard: prevent duplicate grid on hot reload
     padGrid.innerHTML = '';
-    for (let i = 0; i < 16; i++) {
+    for (let i = 0; i < NUM_PADS; i++) {
         const wrapper = renderPad(i);
         padGrid.appendChild(wrapper);
     }
+}
+
+function escapeAttr(s: string): string {
+    return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 function renderPad(index: number, existing?: HTMLElement): HTMLElement {
@@ -461,14 +544,19 @@ function renderPad(index: number, existing?: HTMLElement): HTMLElement {
         wrapper.className = 'pad-wrapper';
         wrapper.style.position = 'relative';
         const currentKey = state.padKeyMap[index] || "?";
+        const safeKey = escapeAttr(currentKey);
         wrapper.innerHTML = `
-            <div class="pad" data-key="${currentKey}" role="button" aria-pressed="false" tabindex="0">
+            <div class="pad" data-key="${safeKey}" role="button" aria-pressed="false" tabindex="0">
                 <canvas class="pad-canvas"></canvas>
-                <span>${currentKey.toUpperCase()}</span>
+                <span></span>
                 <div class="rec-btn" title="Hold to Record"></div>
             </div>
             <input type="range" class="pad-slider" min="0" max="1" step="0.01">
         `;
+        try {
+            const label = wrapper.querySelector('.pad span');
+            if (label) label.textContent = currentKey.toUpperCase();
+        } catch { /* ignore */ }
 
         const pad = wrapper.querySelector('.pad') as HTMLElement;
         const recBtn = wrapper.querySelector('.rec-btn') as HTMLElement;
@@ -666,24 +754,60 @@ let activeRecorders: Record<number, MediaRecorder> = {};
 
 async function startRecording(index: number): Promise<void> {
     if (activeRecorders[index]) return;
-    
+    // Claim the slot synchronously — the async mic-permission gap previously
+    // let keyup fire first, stranding an unstoppable open mic stream.
+    const PENDING = '__pending__';
+    (activeRecorders as any)[index] = PENDING as any;
+
     let stream: MediaStream | null = null;
     try {
-        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        // Honor the selected input device instead of always using the default mic.
+        let audioConstraint: MediaTrackConstraints | boolean = true;
+        try {
+            const { settings } = await import('./settings');
+            const devId = settings.inputDevice;
+            if (devId && devId !== 'default') {
+                audioConstraint = { deviceId: { exact: devId } };
+            }
+        } catch { /* settings unavailable — default mic */ }
+        try {
+            stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraint });
+        } catch {
+            // Exact deviceId fails if the device vanished — fall back to default.
+            stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        }
+        // Keyup cancelled while permission was pending — release the mic immediately.
+        if ((activeRecorders as any)[`__cancel_${index}`]) {
+            delete (activeRecorders as any)[`__cancel_${index}`];
+            delete activeRecorders[index];
+            try { stream.getTracks().forEach(t => t.stop()); } catch { /* ignore */ }
+            return;
+        }
         const mediaRecorder = new MediaRecorder(stream);
         const chunks: Blob[] = [];
 
         mediaRecorder.ondataavailable = (e) => chunks.push(e.data);
         mediaRecorder.onstop = async () => {
-            const blob = new Blob(chunks, { type: 'audio/webm' }); 
+            const blob = new Blob(chunks, { type: 'audio/webm' });
             const arrayBuffer = await blob.arrayBuffer();
-             
+
              try {
                 if (!ensureAudio() || !audioCtx) { toast.error("AUDIO NOT READY"); return; }
                 const decodedBuffer = await audioCtx.decodeAudioData(arrayBuffer);
                 padBuffers[index] = decodedBuffer;
                 padPaths[index] = `REC_${Date.now()}`;
+                padWaveforms[index] = computeWaveform(decodedBuffer);
+                renderWaveform(index);
                 updatePadVisuals(index);
+                // Recorded pads previously kept stale waveform/BPM — SYNC stayed dead.
+                if (detectBPMFn) {
+                    try {
+                        const bpm = await detectBPMFn(decodedBuffer);
+                        padBPMs[index] = bpm;
+                        padBeatPositions[index] = computeBeatPositions(bpm, decodedBuffer.duration);
+                    } catch { /* BPM is best-effort */ }
+                }
+                document.dispatchEvent(new CustomEvent('ug:dataChanged'));
                 logger.debug(`[Sampler] Recording on pad ${index} successful`);
              } catch (e) {
                 logger.error(`[Sampler] Recording decode failed on pad ${index}`, e);
@@ -703,6 +827,7 @@ async function startRecording(index: number): Promise<void> {
         updateRecVisuals(index, true);
 
     } catch (e) {
+        delete activeRecorders[index];
         logger.error("[Sampler] Recording start failed", e);
         toast.error("COULD NOT START RECORDING");
         if (stream) stream.getTracks().forEach(t => t.stop());
@@ -710,10 +835,37 @@ async function startRecording(index: number): Promise<void> {
 }
 
 function stopRecording(index: number): void {
-    const recorder = activeRecorders[index];
+    const recorder: any = (activeRecorders as any)[index];
+    if (recorder === '__pending__') {
+        // Mic permission still in flight — keyup arrived first. Mark cancelled
+        // so startRecording aborts instead of stranding an open stream.
+        delete activeRecorders[index];
+        (activeRecorders as any)[`__cancel_${index}`] = true;
+        setTimeout(() => { delete (activeRecorders as any)[`__cancel_${index}`]; }, 15000);
+        return;
+    }
     if (recorder && recorder.state !== 'inactive') {
         recorder.stop();
     }
+}
+
+/** Abort all in-flight pad recordings and release mic streams (unload safety). */
+export function stopAllRecordings(): void {
+    for (const key of Object.keys(activeRecorders)) {
+        const idx = Number(key);
+        try {
+            const rec = activeRecorders[idx];
+            if (rec && rec.state !== 'inactive') {
+                try { rec.stop(); } catch { /* ignore */ }
+            } else {
+                delete activeRecorders[idx];
+            }
+        } catch { /* ignore */ }
+    }
+}
+
+if (typeof window !== 'undefined') {
+    window.addEventListener('beforeunload', stopAllRecordings);
 }
 
 function updateRecVisuals(index: number, isRecording: boolean): void {
@@ -738,7 +890,7 @@ async function saveKit(): Promise<void> {
         };
 
         let skippedRecordings = 0;
-        for (let i = 0; i < 16; i++) {
+        for (let i = 0; i < NUM_PADS; i++) {
             if (!padPaths[i]) continue;
             // Mic recordings have no backing file path ("REC_<ts>") — they
             // cannot be reloaded from a kit, so saving them writes broken refs.

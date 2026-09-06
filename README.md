@@ -15,7 +15,7 @@
 - **Click to Load:** Click an empty pad to open a file browser.
 - **Hold to Play:** Hold the mouse button (or keyboard key) on a loaded pad to play it — release to stop.
 - **Keyboard Mapped:** Play pads with your keyboard (`1-4`, `Q-R`, `A-F`, `Z-V`).
-- **MIDI Support:** Plug in your MIDI controller and start finger drumming instantly.
+- **MIDI Support:** Plug in your MIDI controller and start finger drumming instantly. MIDI access is requested on your first click; the selected controller persists across restarts. MIDI-mapped sliders persist, and malformed MIDI messages are dropped safely.
 - **Pad Recording:** Hold `CTRL + Pad Key` or click the small `[REC]` button to record directly from your mic.
 - **BPM Detection:** Each loaded pad auto-detects its BPM for sync.
 - **Right-Click Menu:**
@@ -32,6 +32,9 @@
 - **Master Chopper & Screwer:** Use the global tempo slider to slow that track down. **Real-time screw.**
 - **Magnetic Snap:** Slider snaps to 100% speed so you don't mess up the flow.
 - **Drag & Drop Reorder:** Select single or multiple tracks and drag them to move the whole block in real-time.
+- **Non-Destructive Search:** Filtering the playlist never destroys the real queue — it is stashed and restored when you clear the search. Remove/reorder/move are blocked while filtered (clear search first).
+- **Decode-Verified Loading:** Tracks are decoder-verified before they touch the deck — an undecodable file keeps the previous track instead of killing playback. Crossfades refuse to start from a stopped/empty deck.
+- **Loop Points Persist:** Pad loop points survive session save/load and crash recovery.
 
 ### 🎧 AI AUTO-MIX
 
@@ -42,12 +45,13 @@
 - **Auto-Cruise:** Just hit "MIX" and let it flow using proper crossfades.
 - **Fast Mix:** Hit Next/Prev buttons (`>|` or `|<`) for a fast 4-second DJ cut.
 - **Transport Lock:** Progress/seek/tempo/Next/Prev lock during crossfade blending for stability — STOP (and ENTER) always stays armed and aborts the blend.
-- **Sonetra AI (pre-warm only):** When enabled, blends trigger background AI-transition generation for future mixes; live AI-stem playback is not implemented.
+- **Sonetra AI (pre-warm only):** When enabled, blends trigger background AI-transition generation for future mixes; live AI-stem playback is not implemented. The cache is checked before generating (no duplicate uploads), 5xx errors retry with backoff, the circuit breaker counts one logical operation (not per-attempt), and mixer status surfaces as toasts.
 - **Customizable:** Open Settings (`⚙️`) to toggle effects and customize fade durations.
 
 ### 🎙️ STUDIO RECORDING
 
-- **Master Rec:** Hit the big RED button to record your **entire performance** (beats + music) to a high-quality `.wav` file.
+- **Master Rec:** Hit the big RED button to record your **entire performance** (beats + music) to a high-quality `.wav` file. The capture tap disconnects while idle to save CPU.
+- **Pad Safety:** All looping pads choke on window blur / tab hide, so a missed key release can never drone forever.
 - **Visualizer:** 16-band frequency analyzer with "Scanner" LED rack.
 - **AudioWorklet Capture:** Zero-latency PCM capture via dedicated AudioWorkletProcessor.
 

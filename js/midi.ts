@@ -18,10 +18,41 @@ let selectedMidiName = '';
 let midiDeviceSelect: HTMLSelectElement | null = null;
 let midiStatusEl: HTMLElement | null = null;
 
+export function getSelectedMidiId(): string { return selectedMidiId; }
+export function setSelectedMidiDevice(id: string, name = ''): void {
+    selectedMidiId = typeof id === 'string' && id ? id.slice(0, 256) : 'all';
+    if (name) selectedMidiName = name.slice(0, 256);
+    try {
+        if (midiDeviceSelect) midiDeviceSelect.value = selectedMidiId;
+    } catch { /* select may not contain the id yet */ }
+}
+
+function readPersistedMidiDevice(): string | null {
+    try {
+        const raw = localStorage.getItem('ug_settings');
+        if (!raw) return null;
+        const s = JSON.parse(raw);
+        if (s && typeof s.midiDevice === 'string' && s.midiDevice) return s.midiDevice.slice(0, 256);
+    } catch { /* ignore */ }
+    return null;
+}
+
+function persistMidiDevice(id: string): void {
+    try {
+        const raw = localStorage.getItem('ug_settings');
+        const s = raw ? JSON.parse(raw) : {};
+        if (s && typeof s === 'object') {
+            s.midiDevice = id.slice(0, 256);
+            localStorage.setItem('ug_settings', JSON.stringify(s));
+        }
+    } catch { /* ignore */ }
+}
+
 let startPadFn: ((pad: number) => void) | null = null;
 let stopPadFn: ((pad: number) => void) | null = null;
 let activeVoicesRef: Record<number, any> | null = null;
 let padVolumesRef: number[] | null = null;
+let _midiAccessRequested = false;
 
 // --- MIDI Mapping Persistence ---
 
@@ -45,13 +76,34 @@ function loadMidiMappings(): void {
         const data = JSON.parse(saved);
         const patch: Partial<AppStateData> = {};
         if (data.padMidiMap && typeof data.padMidiMap === 'object') {
-            patch.padMidiMap = data.padMidiMap;
+            const clean: Record<number, number> = {};
+            for (const [k, v] of Object.entries(data.padMidiMap)) {
+                const note = Number(k);
+                const pad = Number(v);
+                if (Number.isInteger(note) && note >= 0 && note <= 127 && Number.isInteger(pad) && pad >= 0 && pad <= 15) {
+                    clean[note] = pad;
+                }
+            }
+            patch.padMidiMap = clean;
         }
         if (Array.isArray(data.padKeyMap) && data.padKeyMap.length === 16) {
-            patch.padKeyMap = data.padKeyMap;
+            const keys = data.padKeyMap.map((k: unknown) => typeof k === 'string' ? k.slice(0, 8).toLowerCase() : '');
+            if (keys.every((k: string) => typeof k === 'string' && k.length > 0)) {
+                patch.padKeyMap = keys;
+            }
         }
         if (data.controlMidiMap && typeof data.controlMidiMap === 'object') {
-            patch.controlMidiMap = data.controlMidiMap;
+            const cleanCtrl: Record<number, string> = {};
+            for (const [k, v] of Object.entries(data.controlMidiMap)) {
+                const cc = Number(k);
+                if (!Number.isInteger(cc) || cc < 0 || cc > 127) continue;
+                if (typeof v !== 'string' || !v) continue;
+                const id = v.slice(0, 64);
+                if (!/^[A-Za-z0-9_-]+$/.test(id)) continue;
+                if (!document.getElementById(id)) continue;
+                cleanCtrl[cc] = id;
+            }
+            patch.controlMidiMap = cleanCtrl;
         }
         if (Object.keys(patch).length > 0) {
             state.update(patch);
@@ -88,11 +140,15 @@ export function initMIDI(deps: MidiDeps): void {
     midiDeviceSelect = document.getElementById('midiDeviceSelect') as HTMLSelectElement;
     midiStatusEl = document.getElementById('midiStatus');
     
+    const persistedMidi = readPersistedMidiDevice();
+    if (persistedMidi) selectedMidiId = persistedMidi;
+
     if (midiDeviceSelect) {
         midiDeviceSelect.addEventListener('change', (e) => {
             const target = e.target as HTMLSelectElement;
             selectedMidiId = target.value;
             selectedMidiName = target.options[target.selectedIndex]?.text || '';
+            persistMidiDevice(selectedMidiId);
         });
     }
 
@@ -120,11 +176,16 @@ export function initMIDI(deps: MidiDeps): void {
 }
 
 export function enableMIDI(): void {
+    if (_midiAccessRequested) return;
+    _midiAccessRequested = true;
     if (!navigator.requestMIDIAccess) {
         console.error("WebMIDI not supported in this environment.");
         return;
     }
-    navigator.requestMIDIAccess().then(onMIDISuccess, onMIDIFailure);
+    navigator.requestMIDIAccess().then(onMIDISuccess, (e) => {
+        _midiAccessRequested = false;
+        onMIDIFailure();
+    });
 }
 
 function onMIDISuccess(midiAccess: WebMidi.MIDIAccess): void {
@@ -161,6 +222,12 @@ function updateMidiStatus(midiAccess: WebMidi.MIDIAccess): void {
     if (foundSelected && selectedMidiId !== 'all') {
         // Update the stored ID in case it changed but name matched
         selectedMidiId = midiDeviceSelect.value;
+    } else if (!foundSelected) {
+        // Selected device disconnected — fall back to ALL instead of dropping
+        // every message (previously a stale ID bricked all MIDI input).
+        selectedMidiId = 'all';
+        selectedMidiName = '';
+        try { midiDeviceSelect.value = 'all'; } catch { /* ignore */ }
     }
     if (deviceCount > 0) {
         midiStatusEl.innerText = `MIDI: ON (${deviceCount})`;
@@ -223,11 +290,21 @@ function updateControlFromMidi(targetId: string, value: number) {
     const scaled = min + (value / 127) * (max - min);
     el.value = scaled.toString();
     el.dispatchEvent(new Event('input'));
+    // Settings autosave listens to 'change' — without this MIDI moves evaporate on reload.
+    try { el.dispatchEvent(new Event('change')); } catch { /* ignore */ }
 }
 
 function getMIDIMessage(message: any): void {
-    if (selectedMidiId !== 'all' && message.target.id !== selectedMidiId) return;
-    const [status, data1, data2] = message.data;
+    try {
+    const targetId = message?.target?.id;
+    if (selectedMidiId !== 'all' && targetId !== undefined && targetId !== selectedMidiId) return;
+    const raw = message?.data;
+    if (!raw || typeof raw.length !== 'number' || raw.length < 3) return;
+    const status = Number(raw[0]);
+    const data1 = Number(raw[1]);
+    const data2 = Number(raw[2]);
+    if (!Number.isFinite(status) || !Number.isFinite(data1) || !Number.isFinite(data2)) return;
+    if (data1 < 0 || data1 > 127 || data2 < 0 || data2 > 127) return;
     const cmd = status >> 4;
 
     // Handle Learn Mode (Note-On with velocity only — Note-Off/cmd-8 must
@@ -244,21 +321,24 @@ function getMIDIMessage(message: any): void {
     // Pad triggers (Note On/Off)
     if (cmd === 9 && data2 > 0) { // Note On
         const padIndex = state.padMidiMap[data1];
-        if (padIndex !== undefined && startPadFn) {
+        if (Number.isInteger(padIndex) && padIndex >= 0 && padIndex <= 15 && startPadFn) {
             startPadFn(padIndex);
             if (activeVoicesRef && activeVoicesRef[padIndex] && activeVoicesRef[padIndex].gain && padVolumesRef) {
                 const vol = (data2 / 127) * (padVolumesRef[padIndex] || 1);
                 try {
                     ensureAudio();
                     if (!audioCtx) return;
-                    activeVoicesRef[padIndex].gain.gain.cancelScheduledValues(audioCtx.currentTime);
-                    activeVoicesRef[padIndex].gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+                    const g = activeVoicesRef[padIndex].gain.gain;
+                    const t = audioCtx.currentTime;
+                    g.cancelScheduledValues(t);
+                    try { g.setValueAtTime(Math.max(0.0001, g.value), t); } catch { /* ignore */ }
+                    g.linearRampToValueAtTime(Math.max(0.0001, vol), t + 0.005);
                 } catch (e) {}
             }
         }
     } else if (cmd === 8 || (cmd === 9 && data2 === 0)) { // Note Off
         const padIndex = state.padMidiMap[data1];
-        if (padIndex !== undefined && stopPadFn) {
+        if (Number.isInteger(padIndex) && padIndex >= 0 && padIndex <= 15 && stopPadFn) {
             stopPadFn(padIndex);
         }
     }
@@ -269,5 +349,8 @@ function getMIDIMessage(message: any): void {
         if (targetId) {
             updateControlFromMidi(targetId, data2);
         }
+    }
+    } catch (e) {
+        try { logger.warn('[MIDI] Dropped malformed message', e); } catch { /* ignore */ }
     }
 }

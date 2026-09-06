@@ -1,6 +1,6 @@
 // === VISUALS & LIGHTS MODULE ===
-import { VISUALIZER_BARS } from './constants';
-import { analyser, masterGain, audioCtx, resumeAudioContext, ensureAudio } from './audio';
+import { VISUALIZER_BARS, STARTUP_SOUND_VOLUME } from './constants';
+import { analyser, masterGain, audioCtx, resumeAudioContext, ensureAudio, isAudioAvailable } from './audio';
 import { logger } from './logger';
 import { state } from './state';
 import { throttle } from './utils';
@@ -8,7 +8,7 @@ import { BASS_THRESHOLD, MID_THRESHOLD, HIGH_THRESHOLD, AVG_THRESHOLD, SCANNER_I
 
 let dataArray: Uint8Array | null = null;
 function ensureDataArray(): Uint8Array | null {
-    if (!ensureAudio()) return null;
+    if (!isAudioAvailable()) return null;
     // Reallocate if the context was rebuilt (frequencyBinCount may change).
     const an = analyser;
     if (!an) return null;
@@ -25,10 +25,18 @@ let scannerIndex = 0;
 let scannerDirection = 1;
 let lastScannerUpdate = 0;
 
+let _rafHandle: number | null = null;
+let _visualsInit = false;
+let lastLedPush = 0;
+
 export function initVisuals(): void {
+    // Second init previously orphaned 16 nodes and grew the array forever.
+    if (_visualsInit) return;
+    _visualsInit = true;
     const visualizerContainer = document.getElementById('visualizer');
     if (visualizerContainer) {
         visualizerContainer.innerHTML = '';
+        visualizerBars.length = 0;
         for (let i = 0; i < VISUALIZER_BARS; i++) {
             const bar = document.createElement('div');
             bar.className = 'bar';
@@ -44,34 +52,45 @@ export function initVisuals(): void {
     ].filter(l => l !== null)) as HTMLElement[];
     
     setupScrews();
-    
+
     masterLoop();
+}
+
+export function destroyVisuals(): void {
+    if (_rafHandle !== null) {
+        try { cancelAnimationFrame(_rafHandle); } catch { /* ignore */ }
+        _rafHandle = null;
+    }
+    _visualsInit = false;
 }
 
 function setupScrews(): void {
     const screws = document.querySelectorAll<HTMLElement>('.screw');
     screws.forEach(screw => {
+        // Guard re-init: setupScrews previously stacked duplicate listeners.
+        if ((screw as any).__ugScrewWired) return;
+        (screw as any).__ugScrewWired = true;
         let clicks = 0;
         screw.addEventListener('click', () => {
-             clicks++;
-              // Lefty-loosey attempts
-              let rotationDir = 1;
-              
-              // Debugging class detection
-              logger.debug("Clicked screw classes:", screw.className);
-              
-              if (screw.matches('.br') || screw.classList.contains('br')) {
-                  logger.debug("Matches BR! Reversing direction.");
-                  rotationDir = -1;
-              }
+             clicks = Math.min(clicks + 1, 20); // cap unbounded transform/shadow growth
+               // Lefty-loosey attempts
+               let rotationDir = 1;
 
-              const rotation = clicks * 60 * rotationDir; 
-              const lift = 1 + (clicks * 0.05); // Subtle rise
-              
-              screw.style.transform = `rotate(${rotation}deg) scale(${lift})`;
-              
-              // Visual feedback: shadow gets deeper as it comes out?
-              screw.style.boxShadow = `${clicks}px ${clicks}px ${clicks+2}px rgba(0,0,0,0.5)`;
+               // Debugging class detection
+               logger.debug("Clicked screw classes:", screw.className);
+
+               if (screw.matches('.br') || screw.classList.contains('br')) {
+                   logger.debug("Matches BR! Reversing direction.");
+                   rotationDir = -1;
+               }
+
+               const rotation = clicks * 60 * rotationDir;
+               const lift = 1 + (clicks * 0.05); // Subtle rise
+
+               screw.style.transform = `rotate(${rotation}deg) scale(${lift})`;
+
+               // Visual feedback: shadow gets deeper as it comes out?
+               screw.style.boxShadow = `${clicks}px ${clicks}px ${clicks+2}px rgba(0,0,0,0.5)`;
 
               if (clicks >= 7) {
                   if (!screw.classList.contains('dropped')) {
@@ -104,7 +123,7 @@ const updateLEDs = throttle((dataArray: Uint8Array, leds: HTMLElement[]) => {
 }, 100);
 
 function masterLoop(): void {
-    requestAnimationFrame(masterLoop);
+    _rafHandle = requestAnimationFrame(masterLoop);
     // Skip expensive processing when tab is hidden
     if (document.hidden) return;
     const an = analyser;
@@ -133,10 +152,16 @@ function masterLoop(): void {
                 visualizerBars[i].style.height = Math.max(5, (value / 255) * 100) + '%';
             }
         }
-        
-        // Update LEDs using throttled function (pass a snapshot — the shared
-        // dataArray is mutated in place by the next getByteFrequencyData)
-        updateLEDs(dataArray.slice() as Uint8Array, leds);
+
+        // Gate the snapshot copy to the LED throttle window — previously a
+        // 60fps slice() was allocated even though updateLEDs drops most calls.
+        const nowLed = performance.now();
+        if (!lastLedPush || nowLed - lastLedPush >= 100) {
+            lastLedPush = nowLed;
+            // Update LEDs using throttled function (pass a snapshot — the shared
+            // dataArray is mutated in place by the next getByteFrequencyData)
+            updateLEDs(dataArray.slice() as Uint8Array, leds);
+        }
     } else {
         visualizerBars.forEach(bar => bar.style.height = '5%');
         const now = performance.now();
@@ -178,7 +203,9 @@ export function playStartupSound(): void {
                 const source = audioCtx.createBufferSource();
                 const gain = audioCtx.createGain();
                 source.buffer = audioBuffer;
-                gain.gain.value = 0.6;
+                const masterVolEl = document.getElementById('masterVol') as HTMLInputElement | null;
+                const masterVol = masterVolEl ? Math.min(1, Math.max(0, parseFloat(masterVolEl.value) || 1)) : 1;
+                gain.gain.value = STARTUP_SOUND_VOLUME * masterVol;
                 source.connect(gain);
                 gain.connect(masterGain);
                 source.start(0);
@@ -189,7 +216,8 @@ export function playStartupSound(): void {
                 // Fallback for extreme cases: try playing via native Audio element (bypasses Web Audio chain)
                 try {
                     const audio = new Audio(soundPath);
-                    audio.volume = 0.6;
+                    const masterVolEl = document.getElementById('masterVol') as HTMLInputElement | null;
+                    audio.volume = STARTUP_SOUND_VOLUME * (masterVolEl ? Math.min(1, Math.max(0, parseFloat(masterVolEl.value) || 1)) : 1);
                     audio.play().catch((pErr: any) => logger.error(`[Visuals] Native Audio Fallback failed: ${pErr.message || String(pErr)}`));
                 } catch (fallbackErr: any) {
                     logger.error(`[Visuals] All startup sound attempts failed: ${fallbackErr.message || String(fallbackErr)}`);
