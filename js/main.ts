@@ -1,6 +1,6 @@
 // === MAIN ENTRY POINT ===
 // Gangsta Player Pro 3 - Modular Architecture
-import { resumeAudioContext, masterGain, audioCtx, bufferToWave, initWorklets } from './audio';
+import { resumeAudioContext, masterGain, audioCtx, bufferToWave, initWorklets, ensureAudio } from './audio';
 import { enableMIDI, initMIDI } from './midi';
 import {
     initSampler, createPadGrid, setupPadKeyboardHandlers, getPadGrid,
@@ -25,7 +25,7 @@ import { toast } from './toast';
 import { logger } from './logger';
 import { HighFidelityRecorder } from './recorder-client';
 
-import { saveSession, loadSession } from './session';
+import { saveSession, loadSession, purgeLegacySessionKey } from './session';
 import { initCrashRecovery, checkAndRestore } from './crash-recovery';
 
 import './types';
@@ -302,7 +302,6 @@ function setupGlobalKeyboardShortcuts() {
             }
         } else if (e.code === 'Enter') {
             e.preventDefault();
-            if (state.isCrossfadeInProgress) return;
             stopPlayback();
         } else if (e.code === 'ArrowLeft' || e.code === 'ArrowRight') {
             // Seek ±5s — documented in the help modal but never implemented
@@ -333,8 +332,9 @@ function setupMasterRecording() {
                 // START RECORDING
                 try {
                     if (!hiFiRecorder) {
-                        if (!masterGain) {
+                        if (!ensureAudio() || !masterGain) {
                             logger.error("AudioContext unavailable. Cannot start recorder.");
+                            toast.error("AUDIO NOT READY");
                             return;
                         }
                         hiFiRecorder = new HighFidelityRecorder(masterGain);
@@ -386,6 +386,7 @@ function setupMasterRecording() {
 
 async function initApp() {
     logger.info('[MAIN] Initializing Gangsta Player Pro 3 Core...');
+    purgeLegacySessionKey();
     applyPlatformStyles();
     
     // Initialize Worklets first
@@ -439,6 +440,9 @@ async function initApp() {
 
     // Reclaim blob URLs on teardown
     window.addEventListener('beforeunload', disposePlayerUrls);
+    window.addEventListener('beforeunload', () => {
+        try { hiFiRecorder?.dispose(); } catch { /* ignore */ }
+    });
 
     // Context menus, keyboard shortcuts, and master recording
     setupContextMenus();
@@ -601,8 +605,9 @@ async function initApp() {
 
     // Initialize crash recovery (auto-save)
     initCrashRecovery();
-    // Check for previous crash and prompt restore (non-blocking)
-    checkAndRestore();
+    // NOTE: checkAndRestore() already ran above (gated before initPlaylist).
+    // Do NOT call it again here — two concurrent prompts fight over
+    // confirmModal and double-restore/clear snapshots.
 
     // === GURU CRASH PROTECTION (RENDERER) ===
     window.onerror = (message, source, lineno, colno, error) => {

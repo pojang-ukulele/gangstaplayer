@@ -50,6 +50,12 @@ export class DatabaseManager {
 
     // TRACK OPERATIONS
     public upsertTrack(track: any) {
+        if (!track || typeof track.path !== 'string' || !track.path || typeof track.id !== 'string' || !track.id) {
+            throw new Error('upsertTrack: id and path are required');
+        }
+        if (track.path.length > 32760 || String(track.name ?? '').length > 512) {
+            throw new Error('upsertTrack: field too long');
+        }
         const stmt = this.db.prepare(`
             INSERT INTO tracks (id, path, name, duration, bpm, metadata)
             VALUES (@id, @path, @name, @duration, @bpm, @metadata)
@@ -121,7 +127,7 @@ export class DatabaseManager {
     }
 
     public close() {
-        this.db.close();
+        try { this.db.close(); } finally { _instance = null; }
     }
 }
 

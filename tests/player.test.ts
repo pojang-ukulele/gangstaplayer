@@ -21,6 +21,7 @@ jest.mock('../js/audio', () => ({
     masterGain: { gain: { value: 1 } },
     analyser: { getByteFrequencyData: jest.fn(), fftSize: 256 },
     initWorklets: jest.fn(),
+    ensureAudio: jest.fn(() => true),
 }));
 
 // --- Mock settings ---

@@ -1,4 +1,4 @@
-import { audioCtx } from './audio';
+import { audioCtx, ensureAudio } from './audio';
 import { bufferToWaveWorker } from './worker-client';
 import { logger } from './logger';
 
@@ -6,15 +6,19 @@ export class HighFidelityRecorder {
     private node: AudioWorkletNode | null = null;
     private chunks: Float32Array[][] = [];
     private stopAckHandler: ((event: MessageEvent) => void) | null = null;
+    private accepting = false;
 
     constructor(private sourceNode: AudioNode) {}
 
     async init(): Promise<void> {
+        if (!ensureAudio() || !audioCtx) throw new Error('Audio not ready');
         try {
             this.node = new AudioWorkletNode(audioCtx, 'recorder-processor');
             this.node.port.onmessage = (event) => {
                 if (event.data.type === 'DATA') {
-                    this.chunks.push(event.data.payload);
+                    if (!this.accepting) return; // post-STOP stragglers → next take
+                    const payload = event.data.payload as Float32Array[];
+                    if (Array.isArray(payload) && payload.length > 0) this.chunks.push(payload);
                 }
             };
             this.sourceNode.connect(this.node);
@@ -28,6 +32,7 @@ export class HighFidelityRecorder {
     start(): void {
         if (!this.node) return;
         this.chunks = [];
+        this.accepting = true;
         this.node.port.postMessage({ type: 'START' });
         logger.info('[Recorder] Recording started');
     }
@@ -61,8 +66,8 @@ export class HighFidelityRecorder {
 
         logger.info(`[Recorder] Recording stopped. Captured ${this.chunks.length} blocks.`);
 
-        // Detach chunks before compiling: late DATA messages can't mutate the
-        // array mid-flatten, and length math stays consistent.
+        // Freeze intake before snapshot so late DATA can't pollute next take.
+        this.accepting = false;
         const captured = this.chunks;
         this.chunks = [];
 
@@ -73,20 +78,33 @@ export class HighFidelityRecorder {
         if (chunks.length === 0) throw new Error('No data recorded');
 
         const numChannels = chunks[0].length;
-        const blockSize = chunks[0][0].length;
-        const totalLength = chunks.length * blockSize;
+        if (!numChannels) throw new Error('No data recorded');
+        // Sum actual lengths — last quantum / channel drift breaks fixed math.
+        let totalLength = 0;
+        for (const block of chunks) {
+            if (!block || block.length !== numChannels) continue;
+            totalLength += block[0]?.length ?? 0;
+        }
+        if (totalLength <= 0) throw new Error('No data recorded');
 
-        // Build interleaved Float32Array per channel directly from raw chunks
         const channels: Float32Array[] = [];
         for (let channel = 0; channel < numChannels; channel++) {
             const channelData = new Float32Array(totalLength);
-            for (let i = 0; i < chunks.length; i++) {
-                channelData.set(chunks[i][channel], i * blockSize);
+            let off = 0;
+            for (const block of chunks) {
+                const src = block?.[channel];
+                if (!src || src.length === 0) continue;
+                if (off + src.length > totalLength) break;
+                channelData.set(src, off);
+                off += src.length;
             }
-            channels.push(channelData);
+            channels.push(channelData.subarray(0, off));
         }
+        const finalLen = channels[0]?.length ?? 0;
+        if (finalLen <= 0) throw new Error('No data recorded');
 
         // Build a minimal AudioBuffer-like object for the worker (avoids AudioBuffer + round-trip)
+        if (!audioCtx) throw new Error('Audio not ready');
         const bufferLike = {
             numberOfChannels: numChannels,
             sampleRate: audioCtx.sampleRate,
@@ -94,11 +112,13 @@ export class HighFidelityRecorder {
         };
 
         // Send directly to worker — skip AudioBuffer creation on main thread
-        return await bufferToWaveWorker(bufferLike, totalLength);
+        return await bufferToWaveWorker(bufferLike, finalLen);
     }
 
     dispose(): void {
+        this.accepting = false;
         if (this.node) {
+            try { this.sourceNode.disconnect(this.node); } catch { /* ignore */ }
             this.node.disconnect();
             this.node = null;
         }

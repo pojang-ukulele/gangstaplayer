@@ -4,15 +4,15 @@
  * Uses CSS .active class for visibility (instead of inline style.display).
  */
 
-/** Track the last focused element before a modal opened, for focus restoration */
-let _lastFocused: HTMLElement | null = null;
+/** Focus stack for nested modals (crash prompt over settings, etc.) */
+const _focusStack: HTMLElement[] = [];
 
 /**
  * Opens a modal with focus management.
  * Uses CSS .active class to show the modal.
  */
 export function openModal(modal: HTMLElement): void {
-    _lastFocused = document.activeElement as HTMLElement;
+    _focusStack.push(document.activeElement as HTMLElement);
     modal.classList.add('active');
     modal.setAttribute('aria-hidden', 'false');
     // Focus the first focusable element inside the modal
@@ -20,7 +20,12 @@ export function openModal(modal: HTMLElement): void {
         'button, input, select, textarea, [tabindex]:not([tabindex="-1"])'
     );
     if (firstFocusable) {
-        setTimeout(() => firstFocusable.focus(), 50);
+        const target = modal;
+        setTimeout(() => {
+            if (target.classList.contains('active')) {
+                try { firstFocusable.focus(); } catch { /* ignore */ }
+            }
+        }, 50);
     }
 }
 
@@ -32,9 +37,11 @@ export function closeModal(modal: HTMLElement): void {
     modal.classList.remove('active');
     modal.setAttribute('aria-hidden', 'true');
     // Restore focus to the element that was focused before the modal opened
-    if (_lastFocused) {
-        _lastFocused.focus();
-        _lastFocused = null;
+    const prev = _focusStack.pop();
+    // Only steal focus back if the modal still held it (50ms delayed focus
+    // in openModal can otherwise yank focus after the user moved on).
+    if (prev && document.activeElement && modal.contains(document.activeElement)) {
+        try { prev.focus(); } catch { /* ignore */ }
     }
 }
 

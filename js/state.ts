@@ -130,7 +130,11 @@ class ReactiveStore implements AppStateData {
     }
 
     /**
-     * Update state and trigger subscribers — ONLY way to mutate state
+     * Update state and trigger subscribers — ONLY way to mutate state.
+     * NOTE: playlist Track objects must be treated as immutable. Mutating
+     * `track.bpm` in place then calling `update({playlist:[...playlist]})`
+     * is INVISIBLE here (same element refs => shallowEqual true => no notify).
+     * Always replace the element with a new object (see replaceTrackInPlaylist).
      */
     update(patch: Partial<AppStateData>): void {
         const changedKeys: Array<keyof AppStateData> = [];

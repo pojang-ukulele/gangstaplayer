@@ -139,11 +139,12 @@ function saveSnapshot(reason?: string): void {
 
     const snapshot = collectSnapshot(reason);
 
-    // Rotate snapshots: shift older ones down
-    const prev0 = loadFromStorage(STORAGE_KEY);
-    if (prev0) saveToStorage(getSnapshotKey(1), prev0);
+    // Rotate snapshots newest->_1->_2. Read older slots FIRST before
+    // overwriting, otherwise _2 becomes a duplicate of _1's predecessor.
     const prev1 = loadFromStorage(getSnapshotKey(1));
+    const prev0 = loadFromStorage(STORAGE_KEY);
     if (prev1) saveToStorage(getSnapshotKey(2), prev1);
+    if (prev0) saveToStorage(getSnapshotKey(1), prev0);
 
     saveToStorage(STORAGE_KEY, snapshot);
     logger.debug(`[CrashRecovery] Snapshot saved (${reason || 'periodic'})`);
@@ -212,18 +213,21 @@ export async function restoreSnapshot(): Promise<boolean> {
                 const idx = parseInt(key);
                 const p = snapshot.pads[idx];
                 if (!p || !Number.isInteger(idx) || idx < 0 || idx > 15 || !p.path) continue;
-                padPaths[idx] = p.path;
-                padVolumes[idx] = p.vol ?? 0.75;
-                padBPMs[idx] = p.bpm || 0;
-                padSyncState[idx] = p.sync || false;
+                // Don't claim padPaths before the file proves loadable —
+                // otherwise failures leave ghost paths with no buffer.
+                try {
+                    await loadSampleFromPath(p.path, idx);
+                    padVolumes[idx] = (typeof p.vol === 'number' && Number.isFinite(p.vol)) ? Math.min(1, Math.max(0, p.vol)) : 0.75;
+                    padBPMs[idx] = p.bpm || 0;
+                    padSyncState[idx] = p.sync || false;
+                } catch (err: unknown) {
+                    logger.warn(`[CrashRecovery] Pad ${idx} reload failed: ${(err as Error)?.message || err}`);
+                    continue;
+                }
                 // Restore volume slider UI
                 const grid = document.getElementById('padGrid');
                 const slider = grid?.children[idx]?.querySelector('.pad-slider') as HTMLInputElement;
-                if (slider) slider.value = (p.vol ?? 0.75).toString();
-                // Trigger async re-load of sample
-                loadSampleFromPath(p.path, idx).catch((err: any) => {
-                    logger.warn(`[CrashRecovery] Pad ${idx} reload failed: ${err?.message || err}`);
-                });
+                if (slider) slider.value = padVolumes[idx].toString();
             }
         }
 
@@ -282,7 +286,9 @@ export function initCrashRecovery(): void {
  * Check if there is a saved snapshot and prompt user to restore.
  * Returns true if a snapshot was restored.
  */
+let _restorePromptOpen = false;
 export function checkAndRestore(): Promise<boolean> {
+    if (_restorePromptOpen) return Promise.resolve(false);
     return new Promise((resolve) => {
         const snapshot = getLatestSnapshot();
         if (!snapshot) {
@@ -310,11 +316,13 @@ export function checkAndRestore(): Promise<boolean> {
 
         if (titleEl) titleEl.innerText = 'CRASH RECOVERY';
         if (msgEl) msgEl.innerText = `We detected an unsaved session from ${ageStr}.\nRestore it?`;
+        _restorePromptOpen = true;
+        const done = (v: boolean) => { _restorePromptOpen = false; resolve(v); };
         if (yesBtn) {
             yesBtn.onclick = async () => {
                 closeModal(modal);
                 const ok = await restoreSnapshot();
-                resolve(ok);
+                done(ok);
             };
         }
         if (noBtn) {
@@ -322,7 +330,7 @@ export function checkAndRestore(): Promise<boolean> {
                 closeModal(modal);
                 clearSnapshots();
                 toast.info("Crash session discarded.");
-                resolve(false);
+                done(false);
             };
         }
         // Via the shared modal API so ESC/close behaves like every other modal

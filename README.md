@@ -41,7 +41,8 @@
 - **BPM Sync:** Matches the tempo of the next song to the current one for seamless mixing.
 - **Auto-Cruise:** Just hit "MIX" and let it flow using proper crossfades.
 - **Fast Mix:** Hit Next/Prev buttons (`>|` or `|<`) for a fast 4-second DJ cut.
-- **Transport Lock:** All transport controls are locked during crossfade blending for stability.
+- **Transport Lock:** Progress/seek/tempo/Next/Prev lock during crossfade blending for stability — STOP (and ENTER) always stays armed and aborts the blend.
+- **Sonetra AI (pre-warm only):** When enabled, blends trigger background AI-transition generation for future mixes; live AI-stem playback is not implemented.
 - **Customizable:** Open Settings (`⚙️`) to toggle effects and customize fade durations.
 
 ### 🎙️ STUDIO RECORDING
@@ -52,7 +53,9 @@
 
 ### 🛡️ SECURITY & RELIABILITY
 
-- **Path Validation:** All file I/O hardened against directory traversal, null-byte injection, and oversized payloads. Reads are restricted to media/kit file types; writes go only to dialog-approved paths or the app data directory.
+- **Path Validation:** All file I/O hardened against directory traversal, null-byte injection, and oversized payloads. Reads are restricted to media/kit file types (`wav/mp3/ogg/flac/m4a/aac/webm/json`); writes are limited to `.json`/`.wav` via dialog-approved paths or the app `recordings/` directory (database and log files are never writable from the renderer).
+- **Lazy Audio Engine:** The AudioContext and sampler/deck signal chains build on first use and rebuild after a closed-context reset — a pre-gesture failure no longer bricks audio permanently.
+- **Session Integrity:** Session files carry a SHA-256 corruption-evidence checksum (not attacker-proof by design — no secret is stored); corrupt/edited files abort load.
 - **Single Instance Lock:** Only one app instance can run at a time (protects the track database).
 - **Crash Recovery:** Persistent auto-save snapshots every 30s with post-mortem diagnostic reports.
 - **Audio Signature Validation:** Magic-number verification ensures only valid WAV/MP3/OGG/FLAC/M4A/WebM files are loaded.

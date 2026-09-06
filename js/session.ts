@@ -24,82 +24,43 @@ import {
 } from './sampler';
 
 // ==================== SESSION INTEGRITY ====================
-// Secret key for HMAC-SHA256. Generated per-session or persisted.
-// In production, this should be derived from a user password or hardware token.
-// For enterprise deployment, move this to a secure enclave.
-let _sessionKey: CryptoKey | null = null;
+// Honest corruption-evidence checksum (SHA-256, no secret). A stored HMAC key
+// in the same localStorage as the data can't stop an attacker who can read
+// both — so we don't pretend. This catches truncated/edited/corrupt files.
 
-const SESSION_KEY_STORAGE = 'ug_session_hmac_key';
-
-/**
- * Generate or retrieve the crypto key used for session HMAC.
- * Uses Web Crypto API (SubtleCrypto) with SHA-256.
- */
-async function getSessionKey(): Promise<CryptoKey> {
-    if (_sessionKey) return _sessionKey;
-
-    // Try to load existing key from localStorage (raw bytes base64-encoded)
-    const rawKey = localStorage.getItem(SESSION_KEY_STORAGE);
-    if (rawKey) {
-        try {
-            const keyBytes = Uint8Array.from(atob(rawKey), c => c.charCodeAt(0));
-            _sessionKey = await crypto.subtle.importKey(
-                'raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']
-            );
-            return _sessionKey;
-        } catch (e) {
-            logger.warn('[Session] Failed to restore HMAC key, generating new one');
-        }
-    }
-
-    // Generate a new random HMAC key
-    _sessionKey = await crypto.subtle.generateKey(
-        { name: 'HMAC', hash: 'SHA-256' }, true, ['sign', 'verify']
-    );
-
-    // Persist the key to localStorage (base64 encoded)
-    const exported = await crypto.subtle.exportKey('raw', _sessionKey);
-    const base64 = btoa(String.fromCharCode(...new Uint8Array(exported)));
-    localStorage.setItem(SESSION_KEY_STORAGE, base64);
-
-    return _sessionKey;
+/** One-time purge of the legacy HMAC key (no longer used — see above). */
+export function purgeLegacySessionKey(): void {
+    try {
+        localStorage.removeItem('ug_session_hmac_key');
+    } catch { /* storage unavailable — nothing to purge */ }
 }
-
-/**
- * Compute an HMAC-SHA256 signature for session data (integrity check).
- */
-async function computeHMAC(data: string): Promise<string> {
-    const key = await getSessionKey();
-    const enc = new TextEncoder();
-    const sig = await crypto.subtle.sign('HMAC', key, enc.encode(data));
-    // Convert ArrayBuffer to hex string
-    return Array.from(new Uint8Array(sig))
+async function sha256Hex(data: string): Promise<string> {
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(data));
+    return Array.from(new Uint8Array(digest))
         .map(b => b.toString(16).padStart(2, '0'))
         .join('');
 }
 
-/**
- * Verify HMAC-SHA256 signature (returns true if signature matches).
- */
-async function verifyHMAC(data: string, expectedSignature: string): Promise<boolean> {
-    const actualSignature = await computeHMAC(data);
-    // Constant-time comparison to prevent timing attacks
-    let match = true;
-    const expectedBytes = hexToBytes(expectedSignature);
-    const actualBytes = hexToBytes(actualSignature);
-    if (expectedBytes.length !== actualBytes.length) return false;
-    for (let i = 0; i < expectedBytes.length; i++) {
-        if (expectedBytes[i] !== actualBytes[i]) match = false;
+async function verifyChecksum(data: string, expected: string): Promise<boolean> {
+    try {
+        if (!/^[0-9a-f]{64}$/i.test(expected)) return false;
+        const actual = await sha256Hex(data);
+        return actual.toLowerCase() === expected.toLowerCase();
+    } catch {
+        return false;
     }
-    return match;
 }
 
-function hexToBytes(hex: string): Uint8Array {
-    const bytes = new Uint8Array(hex.length / 2);
-    for (let i = 0; i < hex.length; i += 2) {
-        bytes[i / 2] = parseInt(hex.substr(i, 2), 16);
-    }
-    return bytes;
+function clampNum(v: unknown, lo: number, hi: number, fb: number): number {
+    const n = typeof v === 'number' ? v : parseFloat(String(v));
+    if (!Number.isFinite(n)) return fb;
+    return Math.min(hi, Math.max(lo, n));
+}
+
+function isValidTrack(t: unknown): t is Track {
+    if (!t || typeof t !== 'object') return false;
+    const o = t as Record<string, unknown>;
+    return typeof o.id === 'string' && typeof o.name === 'string' && typeof o.path === 'string';
 }
 
 // === Types ===
@@ -115,7 +76,7 @@ interface SessionPad {
 interface SessionData {
     version: number;
     name: string;
-    signature?: string; // HMAC-SHA256 integrity check
+    signature?: string; // SHA-256 corruption-evidence checksum (not a secret)
     kit: {
         pads: SessionPad[];
     };
@@ -200,9 +161,9 @@ export async function saveSession(): Promise<void> {
             },
         };
 
-        // Compute HMAC signature for integrity verification
+        // Corruption-evidence checksum (NOT attacker-proof — no secret).
         const sessionJson = JSON.stringify(session, null, 2);
-        session.signature = await computeHMAC(sessionJson);
+        session.signature = await sha256Hex(sessionJson);
 
         const fs = window.fileSystem;
         if (fs?.saveFile) {
@@ -244,21 +205,25 @@ export async function loadSession(): Promise<void> {
         }
 
         const rawData = await fs.readFile(filePath);
-        const jsonStr = new TextDecoder().decode(rawData);
+        if (!rawData || (rawData as Uint8Array).byteLength > 25 * 1024 * 1024) {
+            toast.error("SESSION FILE TOO LARGE OR UNREADABLE");
+            return;
+        }
+        const jsonStr = new TextDecoder().decode(rawData as Uint8Array);
         const session: SessionData = JSON.parse(jsonStr);
 
-        // Verify HMAC signature for integrity
+        // Verify checksum (corruption evidence only — not attacker-proof)
         if (session.signature) {
             const sessionJsonWithoutSig = JSON.stringify({ ...session, signature: undefined }, null, 2);
-            const isValid = await verifyHMAC(sessionJsonWithoutSig, session.signature);
+            const isValid = await verifyChecksum(sessionJsonWithoutSig, session.signature);
             if (!isValid) {
-                logger.error('[Session] HMAC verification failed - session may have been tampered with');
+                logger.error('[Session] Checksum mismatch - file is corrupt or was edited outside the app');
                 toast.error("SESSION CORRUPTED - LOAD ABORTED");
                 return;
             }
         } else {
             // Legacy session without signature - warn but allow loading (for backward compatibility)
-            logger.warn('[Session] No HMAC signature found - loading legacy session (no integrity check)');
+            logger.warn('[Session] No checksum found - loading legacy session (no integrity check)');
         }
 
         if (session.version !== SESSION_VERSION) {
@@ -273,9 +238,16 @@ export async function loadSession(): Promise<void> {
             isPlaying: false,
         });
 
-        // 2. Load playlist
+        // 2. Load playlist (validated, bounded — crafted files must not OOM)
         if (Array.isArray(session.playlist)) {
-            state.update({ playlist: session.playlist });
+            const clean = session.playlist.filter(isValidTrack).slice(0, 2000).map(t => ({
+                id: String(t.id).slice(0, 128),
+                name: String(t.name).slice(0, 512),
+                path: String(t.path).slice(0, 32760),
+                duration: clampNum(t.duration, 0, 86400, 0),
+                bpm: t.bpm === undefined ? undefined : clampNum(t.bpm, 0, 300, 0),
+            }));
+            state.update({ playlist: clean });
         }
 
         // 3. Load kit
@@ -289,21 +261,25 @@ export async function loadSession(): Promise<void> {
                 padSyncState[i] = false;
             }
 
-            // Load each pad asynchronously
-            const loadPromises = session.kit.pads.map(async (p) => {
-                if (p.path) {
-                    await loadSampleFromPath(p.path, p.index);
-                    if (p.vol !== undefined) padVolumes[p.index] = p.vol;
-                    if (p.bpm !== undefined) padBPMs[p.index] = p.bpm;
-                    if (p.sync !== undefined) padSyncState[p.index] = p.sync;
+            // Sequential loads: 16 parallel decodeAudioData of arbitrary files OOMs.
+            for (const p of session.kit.pads.slice(0, 16)) {
+                const idx = Number((p as SessionPad)?.index);
+                const ppath = typeof (p as SessionPad)?.path === 'string' ? (p as SessionPad).path.slice(0, 32760) : '';
+                if (!ppath || !Number.isInteger(idx) || idx < 0 || idx > 15) continue;
+                try {
+                    await loadSampleFromPath(ppath, idx);
+                    const vol = (p as SessionPad).vol;
+                    if (typeof vol === 'number' && Number.isFinite(vol)) padVolumes[idx] = Math.min(1, Math.max(0, vol));
+                    const bpm = (p as SessionPad).bpm;
+                    if (typeof bpm === 'number' && Number.isFinite(bpm)) padBPMs[idx] = Math.min(300, Math.max(0, bpm));
+                    if (typeof (p as SessionPad).sync === 'boolean') padSyncState[idx] = (p as SessionPad).sync as boolean;
 
                     // Update the volume slider UI
                     const grid = document.getElementById('padGrid');
-                    const slider = grid?.children[p.index]?.querySelector('.pad-slider') as HTMLInputElement;
-                    if (slider) slider.value = (p.vol ?? 0.75).toString();
-                }
-            });
-            await Promise.allSettled(loadPromises);
+                    const slider = grid?.children[idx]?.querySelector('.pad-slider') as HTMLInputElement;
+                    if (slider) slider.value = padVolumes[idx].toString();
+                } catch { /* per-pad failure is non-fatal */ }
+            }
         }
 
         // 4. Restore settings.
@@ -316,8 +292,8 @@ export async function loadSession(): Promise<void> {
             settings.autoMix.filterSweep = filterSweep ?? true;
             settings.autoMix.hpfSweep = hpfSweep ?? true;
             settings.autoMix.bpmSync = bpmSync ?? false;
-            settings.autoMix.trackDuration = trackDuration ?? 10;
-            settings.autoMix.btnDuration = btnDuration ?? 4;
+            settings.autoMix.trackDuration = clampNum(trackDuration, 0.5, 60, 10);
+            settings.autoMix.btnDuration = clampNum(btnDuration, 0.5, 30, 4);
             applySettingsToUI();
             saveSettings();
         }
@@ -326,13 +302,15 @@ export async function loadSession(): Promise<void> {
         if (session.ui) {
             const volSlider = document.getElementById('masterVol') as HTMLInputElement;
             if (volSlider && session.ui.masterVolume !== undefined) {
-                volSlider.value = session.ui.masterVolume.toString();
+                const mv = clampNum(session.ui.masterVolume, 0, 1, 1);
+                volSlider.value = mv.toString();
                 volSlider.dispatchEvent(new Event('input'));
             }
 
             const tempo = document.getElementById('tempoSlider') as HTMLInputElement;
             if (tempo && session.ui.tempoValue !== undefined) {
-                tempo.value = session.ui.tempoValue.toString();
+                const tv = clampNum(session.ui.tempoValue, 0.5, 1.5, 1);
+                tempo.value = tv.toString();
                 tempo.dispatchEvent(new Event('input'));
             }
 

@@ -36,7 +36,7 @@ async function build() {
         outfile: path.join(BUILD_DIR, 'main.js'),
         minify: MINIFY,
         sourcemap: SOURCEMAP,
-        external: ['electron', 'fsevents', 'better-sqlite3']
+        external: ['electron', 'fsevents', 'better-sqlite3', 'form-data']
     });
 
     console.log('Building Preload...');
@@ -62,7 +62,7 @@ async function build() {
             outfile: path.join(BUILD_DIR, 'sonetra-bridge.js'),
             minify: MINIFY,
             sourcemap: SOURCEMAP,
-            external: ['electron']
+            external: ['electron', 'form-data', 'better-sqlite3']
         });
     }
 

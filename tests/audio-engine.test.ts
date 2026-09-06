@@ -61,6 +61,7 @@ jest.mock('../js/audio', () => ({
     analyser: { getByteFrequencyData: jest.fn(), fftSize: 256 },
     resumeAudioContext: jest.fn().mockResolvedValue(undefined),
     initWorklets: jest.fn(),
+    ensureAudio: jest.fn(() => true),
 }));
 
 // ============================================================

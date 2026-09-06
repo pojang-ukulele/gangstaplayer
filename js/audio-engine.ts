@@ -1,4 +1,4 @@
-import { audioCtx, masterGain } from './audio';
+import { audioCtx, masterGain, ensureAudio } from './audio';
 import { state } from './state';
 import {
     LOWSHELF_FREQ, PEAKING_FREQ, PEAKING_Q, HIGHSHELF_FREQ,
@@ -31,10 +31,19 @@ export class AudioChannel {
                 console.error(`[AudioChannel] Media error code ${err.code}: ${err.message} (src=${this.audio.src.slice(0, 64)})`);
             }
         });
-        if (!audioCtx || !masterGain) {
-            console.error("AudioContext or masterGain is not available. Audio features will be limited.");
-            return;
-        }
+        // Chain builds lazily via ensureNodes() — constructing at import time
+        // used to permanently brick audio when the context wasn't ready yet.
+        this.ensureNodes();
+    }
+
+    /** Build (or rebuild after a closed-context reset) the signal chain. */
+    ensureNodes(): boolean {
+        if (this.gain && this.lowEQ && this.source && audioCtx && masterGain) return true;
+        if (!ensureAudio() || !audioCtx || !masterGain) return false;
+        try { this.source?.disconnect(); } catch { /* ignore */ }
+        try { this.gain?.disconnect(); } catch { /* ignore */ }
+        this._isWorkletConnected = false;
+        this.workletNode = null;
         this.gain = audioCtx.createGain();
         this.lowEQ = audioCtx.createBiquadFilter();
         this.midEQ = audioCtx.createBiquadFilter();
@@ -60,6 +69,7 @@ export class AudioChannel {
             this.hpFilter.connect(this.gain);
             this.gain.connect(masterGain);
         }
+        return true;
     }
 
     /**
@@ -67,7 +77,7 @@ export class AudioChannel {
      * If it fails, the signal remains intact via the base chain.
      */
     initWorklet(): void {
-        if (!audioCtx || !masterGain) {
+        if (!this.ensureNodes() || !audioCtx || !masterGain) {
             console.error("Cannot initialize worklet: AudioContext is not available.");
             return;
         }
@@ -92,7 +102,7 @@ export class AudioChannel {
     }
 
     reset(): void {
-        if (!audioCtx || !this.gain || !this.lowEQ || !this.midEQ || !this.highEQ || !this.lpFilter || !this.hpFilter) {
+        if (!this.ensureNodes() || !audioCtx || !this.gain || !this.lowEQ || !this.midEQ || !this.highEQ || !this.lpFilter || !this.hpFilter) {
             console.warn("[AudioChannel] Cannot reset: AudioContext or audio nodes not available.");
             return;
         }

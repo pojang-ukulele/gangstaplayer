@@ -14,7 +14,7 @@ import * as http from 'http';
 import * as fs from 'fs';
 import FormData from 'form-data';
 
-const AUDIO_EXTENSIONS = new Set(['wav', 'mp3', 'ogg', 'flac', 'm4a', 'aac']);
+const AUDIO_EXTENSIONS = new Set(['wav', 'mp3', 'ogg', 'flac', 'm4a', 'aac', 'webm']);
 
 function execFileAsync(cmd: string, args: string[], timeoutMs: number): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -84,10 +84,17 @@ function isSafeAudioPath(filePath: string): { safe: boolean; resolved?: string; 
         // FALLBACK: Paths that arrive here come from native file dialogs or
         // drag-drop in the renderer (user-consented sources). The whitelist
         // cannot enumerate every music folder, so consented paths are accepted
-        // — but only if they exist and look like audio files.
+        // — but only if they exist, look like audio files, and are bounded.
         const ext = path.extname(resolved).replace('.', '').toLowerCase();
         if (!AUDIO_EXTENSIONS.has(ext)) {
             return { safe: false, error: `Non-audio file type rejected (.${ext})` };
+        }
+        try {
+            const st = fs.statSync(resolved);
+            if (!st.isFile()) return { safe: false, error: 'Not a file' };
+            if (st.size > 100 * 1024 * 1024) return { safe: false, error: 'File too large' };
+        } catch {
+            return { safe: false, error: 'File does not exist' };
         }
         if (!fs.existsSync(resolved)) {
             return { safe: false, error: 'File does not exist' };
@@ -679,6 +686,8 @@ class SonetraBridge {
      * Uses circuit breaker + exponential backoff for resilience.
      */
     async createTransition(track1Path: string, track2Path: string, style = 'smooth'): Promise<{ success: boolean, audioBuffer?: Buffer, error?: string }> {
+        const ALLOWED_STYLES = new Set(['smooth', 'chopped', 'screwed', 'blend']);
+        const safeStyle = ALLOWED_STYLES.has(style) ? style : 'smooth';
         // Validate paths before any operation (SECURITY)
         const path1 = isSafeAudioPath(track1Path);
         if (!path1.safe) {
@@ -708,7 +717,7 @@ class SonetraBridge {
                         const requestOptions = {
                             hostname: this.serverHost,
                             port: this.serverPort,
-                            path: `/transition/create?style=${style}`,
+                            path: `/transition/create?style=${encodeURIComponent(safeStyle)}`,
                             method: 'POST',
                             headers: formData.getHeaders(),
                             timeout: 60000

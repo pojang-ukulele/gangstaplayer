@@ -145,8 +145,9 @@ class GangstaLogger {
         const consoleFn = console[consoleMethod as keyof Console] as ((...args: any[]) => void) | undefined;
         if (typeof consoleFn === 'function') consoleFn(`[${entry.level}] ${entry.message}`);
 
-        // Persist to disk via Electron Bridge
-        if (window.fileSystem?.appendLog) {
+        // Persist to disk via Electron Bridge (skip DEBUG — high-frequency
+        // debug spam previously IPC-flooded the main process on every frame)
+        if (entry.level !== 'DEBUG' && window.fileSystem?.appendLog) {
             window.fileSystem.appendLog(entry.level, entry.message).catch(() => {});
         }
     }

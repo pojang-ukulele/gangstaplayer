@@ -7,7 +7,7 @@ import { getDbManager } from './db-manager';
 import { logManager, LogLevel } from './log-manager';
 import { MAX_FILE_SIZE_BYTES, VALID_AUDIO_EXTENSIONS } from './js/constants';
 
-const READABLE_EXTENSIONS = new Set([...VALID_AUDIO_EXTENSIONS, 'm4a', 'aac', 'json']);
+const READABLE_EXTENSIONS = new Set([...VALID_AUDIO_EXTENSIONS, 'json']);
 
 // Transition cache for pre-computed transitions (byte-budgeted)
 const MAX_CACHE_ENTRIES = 50;
@@ -46,25 +46,35 @@ const dialogReturnedPaths = new Set<string>();
  */
 function validatePath(p: string): string | null {
   if (!p || typeof p !== 'string') return null;
+  if (p.includes('\0')) return null;
+  if (p.length > 32760) return null;
   const normalized = path.normalize(p);
-  if (normalized.includes('\0')) return null;
   if (!path.isAbsolute(normalized)) return null;
-  const resolved = path.resolve(normalized);
-  if (resolved !== normalized) return null;
-  return resolved;
+  // path.resolve collapses trailing separators / dot segments so the
+  // allowlist comparison below is canonical.
+  return path.resolve(normalized);
 }
+
+const SAVE_ALLOWED_EXTS = new Set(['json', 'wav']);
+const SAVE_BLOCKED_BASENAMES = new Set(['gangsta.db', 'gangsta.db-wal', 'gangsta.db-shm', 'gangsta_log.txt']);
 
 /**
  * Returns true if the path is allowed for writing.
  * Path is allowed if it:
- *   1) Was returned by a native save dialog (user-approved), OR
- *   2) Resides under app.getPath('userData')
+ *   1) Was returned by a native save dialog (user-approved), AND has an
+ *      allowed extension, AND is not a blocked internal file, OR
+ *   2) Resides under app.getPath('userData')/recordings with allowed ext
+ * This stops a compromised renderer from overwriting gangsta.db / logs.
  */
 function isSavePathAllowed(p: string): boolean {
+  const ext = path.extname(p).replace('.', '').toLowerCase();
+  if (!SAVE_ALLOWED_EXTS.has(ext)) return false;
+  if (SAVE_BLOCKED_BASENAMES.has(path.basename(p).toLowerCase())) return false;
   if (dialogReturnedPaths.has(p)) return true;
   const userDataPath = app.getPath('userData');
-  const relative = path.relative(userDataPath, p);
-  if (relative && !relative.startsWith('..') && !path.isAbsolute(relative)) return true;
+  const recDir = path.join(userDataPath, 'recordings');
+  const rel = path.relative(recDir, p);
+  if (rel && !rel.startsWith('..') && !path.isAbsolute(rel)) return true;
   return false;
 }
 
@@ -150,7 +160,8 @@ function registerIpcHandlers(): void {
       filters: [{ name: 'JSON Kit File', extensions: ['json'] }]
     });
     if (canceled || !filePath) return null;
-    dialogReturnedPaths.add(filePath);
+    const v = validatePath(filePath);
+    if (v) dialogReturnedPaths.add(v);
     return filePath;
   });
 
@@ -166,7 +177,8 @@ function registerIpcHandlers(): void {
       filters: [{ name: 'Session File', extensions: ['json'] }]
     });
     if (canceled || !filePath) return null;
-    dialogReturnedPaths.add(filePath);
+    const v = validatePath(filePath);
+    if (v) dialogReturnedPaths.add(v);
     return filePath;
   });
 
@@ -178,7 +190,7 @@ function registerIpcHandlers(): void {
       properties: ['openFile'],
       filters: [{ name: 'JSON Kit File', extensions: ['json'] }]
     });
-    if (canceled) return null;
+    if (canceled || !filePaths || !filePaths.length) return null;
     return filePaths[0];
   });
 
@@ -191,7 +203,8 @@ function registerIpcHandlers(): void {
       filters: [{ name: 'WAV Audio', extensions: ['wav'] }]
     });
     if (canceled || !filePath) return null;
-    dialogReturnedPaths.add(filePath);
+    const v = validatePath(filePath);
+    if (v) dialogReturnedPaths.add(v);
     return filePath;
   });
 
@@ -263,9 +276,21 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle('fs:save-recording', async (_event, buffer: ArrayBuffer, filename: string) => {
     try {
+      if (typeof filename !== 'string' || !filename) return null;
+      const safe = path.basename(filename).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 128);
+      if (!safe.toLowerCase().endsWith('.wav')) return null;
+      const view = buffer instanceof ArrayBuffer ? new Uint8Array(buffer)
+        : (buffer as unknown as { byteLength?: number });
+      const len = (view as Uint8Array).byteLength ?? (view as { byteLength?: number }).byteLength ?? 0;
+      if (!len || len > MAX_FILE_SIZE_BYTES) {
+        logToDisk('ERROR', `Security: Blocked recording save with bad size (${len})`);
+        return null;
+      }
       const userDataPath = app.getPath('userData');
-      const recPath = path.join(userDataPath, 'recordings', path.basename(filename));
-      fs.writeFileSync(recPath, Buffer.from(buffer));
+      const recDir = path.join(userDataPath, 'recordings');
+      if (!fs.existsSync(recDir)) fs.mkdirSync(recDir, { recursive: true });
+      const recPath = path.join(recDir, safe);
+      fs.writeFileSync(recPath, Buffer.from(buffer as ArrayBuffer));
       return recPath;
     } catch (err) {
       logToDisk('ERROR', `Failed to save recording: ${err}`);
@@ -293,9 +318,9 @@ function registerIpcHandlers(): void {
     const { canceled, filePaths } = await dialog.showOpenDialog(win, {
       title: 'Load Audio Sample',
       properties: ['openFile'],
-      filters: [{ name: 'Audio Files', extensions: ['wav', 'mp3', 'ogg', 'flac'] }]
+      filters: [{ name: 'Audio Files', extensions: [...VALID_AUDIO_EXTENSIONS] }]
     });
-    if (canceled) return null;
+    if (canceled || !filePaths || !filePaths.length) return null;
     return filePaths[0];
   });
 
@@ -426,14 +451,22 @@ function createWindow() {
 
   win.loadFile(path.join(__dirname, 'index.html'));
 
-  win.on('close', async () => {
+  // Fallback: if the renderer crashes before app:ready-to-show, the window
+  // would stay hidden forever. Force-show after 8s.
+  setTimeout(() => {
+    try { if (!win.isDestroyed() && !win.isVisible()) win.show(); } catch { /* ignore */ }
+  }, 8000).unref?.();
+
+  win.on('close', () => {
     dialogReturnedPaths.clear();
     try {
       getDbManager()?.close();
     } catch (e) {
       logToDisk('ERROR', `DB close failed: ${e}`);
     }
-    await sonetraBridge.stopServer();
+    // Fire-and-forget: 'close' must not be async — awaiting here lets the
+    // window die mid-cleanup with a dirty WAL and orphaned python.
+    void sonetraBridge.stopServer().catch(() => undefined);
   });
 
   return win;
@@ -459,4 +492,7 @@ process.on('uncaughtException', (error) => {
     .then((report) => console.error(`GURU ERROR: Crash report generated at ${report}`))
     .catch(() => console.error('GURU ERROR: Failed to write crash report'))
     .finally(() => app.exit(1));
+});
+process.on('unhandledRejection', (reason) => {
+  logToDisk('ERROR', `UNHANDLED REJECTION: ${(reason as Error)?.stack || reason}`);
 });

@@ -1,5 +1,34 @@
 # Changelog
 
+## [Unreleased] — "Paranoid Audit Follow-ups"
+
+Second audit pass (critical → low) with fixes verified via `tsc --noEmit` and the full Jest suite (77/77).
+
+### 🚨 Critical
+
+- **Reactive state swallowed BPM updates**: in-place `track.bpm` mutation + `[...playlist]` was invisible to `shallowEqual` — no subscribers fired. All BPM paths now replace the track object immutably.
+- **loadTrack race**: generation counter was claimed after `await getSafeUrl`, so rapid Next/Prev let a stale fetch clobber `audio.src`. Counter is claimed before any await; stale blobs are revoked. Track reads collapsed to a single IPC read shared by playback + decode.
+- **Unkillable crossfade**: bare `setTimeout` + disabled STOP let blends resurrect audio after stop. Crossfade now has a cancellable timer+generation, STOP/ENTER always abort, and only seek/tempo/Next/Prev lock mid-blend.
+- **Save allowlist bypass**: any `userData` path was writable (including `gangsta.db`). Writes now require `.json`/`.wav`, block internal files, and accept only dialog-approved paths or `recordings/`. Dialog paths stored canonicalized; `fs:save-recording` validates name/size.
+- **Sonetra `style` injection**: raw interpolation into the query string. Styles allowlisted + `encodeURIComponent`; fallback requires audio ext, file type, and 100 MB cap.
+- **Session restore hardening**: HMAC-with-stored-key replaced with honest SHA-256 corruption checksum; legacy `ug_session_hmac_key` purged on startup. Restore validates/bounds playlist (2000 max), pad indices 0–15, vol/BPM ranges, durations, file size; pads load sequentially (no 16-way decode OOM).
+- **Crash recovery**: double `checkAndRestore()` removed (single gated call + re-entrancy guard), snapshot rotation order fixed (`_1` read before overwrite), pads claimed only after successful load (no ghost paths).
+- **Teardown/crash evidence**: `close` handler is sync (no more dirty WAL/orphaned Python), `unhandledRejection` logged, ERROR/WARN kept in the post-mortem buffer, hidden-window force-show fallback after 8 s.
+
+### 🎧 Playback & playlist
+
+- `bpmSync` wired (tempo-matches incoming deck, clamped 0.5–1.5); `enableAI` guarded and documented as pre-warm only.
+- `getSafeUrl` failures return `""` and abort with a toast instead of loading a raw filesystem path into `<audio>`.
+- Playlist search remaps `currentTrackIndex` by track id with a keystroke-generation guard; empty drag-drop paths skipped; `crypto.randomUUID` fallback added.
+- Move Up/Down moves contiguous blocks correctly and follows the playing track; VirtualScroller re-asserts row geometry on force refresh and destroys prior instance on re-init.
+
+### 🎛️ MIDI / recorder / robustness
+
+- MIDI learn ignores Note-Off; CC scaling respects each slider's min/max; key-bind swaps to keep uniqueness, ignores modifiers, 10 s timeout.
+- Recorder ignores post-STOP stragglers, sums real block lengths, disconnects source on dispose, disposes on unload.
+- Gain pool cancels prior automation; volume/MIDI writes cancel-then-set; plain canvas clicks no longer overwrite tuned loops; DEBUG excluded from disk IPC; modal focus uses a stack with guarded autofocus; LED path snapshots the FFT array; worker posts time out and unknown messages resolve instead of hanging.
+- Build: `form-data` external in both main bundles; playlist click logging removed; session UI restores clamped; version synced to 4.20.1.
+
 ## [v4.20.1] — 2026-08-25 — "Full Audit Fix Batch"
 
 Full-codebase defect audit (5 critical, 9 high, 23 medium findings) with fixes applied and verified via `tsc --noEmit`, the full Jest suite, esbuild bundle, and Playwright smoke test.

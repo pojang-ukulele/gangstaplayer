@@ -47,7 +47,9 @@ export const BLOB_REVOKE_CROSSFADE_MS = 3000;
 
 // === Security ===
 export const MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024; // 100MB
-export const VALID_AUDIO_EXTENSIONS = ['wav', 'mp3', 'ogg', 'flac'];
+// Single source of truth for playable audio. Dialog filter, main-process
+// read allowlist, and Sonetra validation must all derive from this.
+export const VALID_AUDIO_EXTENSIONS = ['wav', 'mp3', 'ogg', 'flac', 'm4a', 'aac', 'webm'];
 
 // === Crash Recovery ===
 export const AUTO_SAVE_INTERVAL_MS = 30000;

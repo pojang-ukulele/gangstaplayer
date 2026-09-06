@@ -1,14 +1,21 @@
 // === VISUALS & LIGHTS MODULE ===
 import { VISUALIZER_BARS } from './constants';
-import { analyser, masterGain, audioCtx, resumeAudioContext } from './audio';
+import { analyser, masterGain, audioCtx, resumeAudioContext, ensureAudio } from './audio';
 import { logger } from './logger';
 import { state } from './state';
 import { throttle } from './utils';
 import { BASS_THRESHOLD, MID_THRESHOLD, HIGH_THRESHOLD, AVG_THRESHOLD, SCANNER_INTERVAL_MS } from './constants';
 
 let dataArray: Uint8Array | null = null;
-if (analyser) {
-    dataArray = new Uint8Array(analyser.frequencyBinCount);
+function ensureDataArray(): Uint8Array | null {
+    if (!ensureAudio()) return null;
+    // Reallocate if the context was rebuilt (frequencyBinCount may change).
+    const an = analyser;
+    if (!an) return null;
+    if (!dataArray || dataArray.length !== an.frequencyBinCount) {
+        try { dataArray = new Uint8Array(an.frequencyBinCount); } catch { return null; }
+    }
+    return dataArray;
 }
 const visualizerBars: HTMLElement[] = [];
 const barColors = ['#ff0000', '#d4002b', '#aa0055', '#800080', '#990ae6', '#bc13fe', '#bc13fe', '#a030f0', '#8a50d0', '#7070b0', '#509090', '#30b070', '#20d050', '#10f030', '#39ff14', '#39ff14'];
@@ -100,7 +107,12 @@ function masterLoop(): void {
     requestAnimationFrame(masterLoop);
     // Skip expensive processing when tab is hidden
     if (document.hidden) return;
-    if (analyser && dataArray) analyser.getByteFrequencyData(dataArray as unknown as Uint8Array<ArrayBuffer>);
+    const an = analyser;
+    const buf = ensureDataArray();
+    if (an && buf) {
+        try { an.getByteFrequencyData(buf as unknown as Uint8Array<ArrayBuffer>); } catch { /* ignore */ }
+    }
+    dataArray = buf;
     
     let totalVol = 0;
     let totalAvg = 0;
@@ -122,8 +134,9 @@ function masterLoop(): void {
             }
         }
         
-        // Update LEDs using throttled function
-        updateLEDs(dataArray as Uint8Array, leds);
+        // Update LEDs using throttled function (pass a snapshot — the shared
+        // dataArray is mutated in place by the next getByteFrequencyData)
+        updateLEDs(dataArray.slice() as Uint8Array, leds);
     } else {
         visualizerBars.forEach(bar => bar.style.height = '5%');
         const now = performance.now();
@@ -156,10 +169,12 @@ export function playStartupSound(): void {
             .then(arrayBuffer => {
                 logger.debug("[Visuals] Startup sound binary loaded, decoding...");
                 // Note: We use the context's native decoder here to avoid any worker-pool race conditions on boot
+                if (!ensureAudio() || !audioCtx) throw new Error('Audio not ready');
                 return audioCtx.decodeAudioData(arrayBuffer);
             })
             .then(audioBuffer => {
                 logger.info("[Visuals] Startup sound decoded, initiating playback.");
+                if (!audioCtx || !masterGain) throw new Error('Audio chain not ready');
                 const source = audioCtx.createBufferSource();
                 const gain = audioCtx.createGain();
                 source.buffer = audioBuffer;

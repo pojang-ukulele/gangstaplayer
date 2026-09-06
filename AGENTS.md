@@ -4,7 +4,7 @@
 
 Electron-based desktop ghetto-tech sampler, tape deck, and DJ mixing application. Turns the PC into a beat-making, chopper-screwing powerhouse with 16-pad sampler, playlist player, AI auto-mix, and studio recording.
 
-- **Version:** 4.20.0
+- **Version:** 4.20.1
 - **License:** MIT
 - **Main repo:** https://github.com/coreyshearwater/ug-gangsta-player-pro-3
 

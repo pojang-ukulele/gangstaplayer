@@ -1,5 +1,5 @@
 // === PLAYER MODULE ===
-import { audioCtx, resumeAudioContext, masterGain } from './audio';
+import { audioCtx, resumeAudioContext, masterGain, ensureAudio } from './audio';
 import { settings } from './settings';
 import { state, Track, PlaybackMode, LoopMode } from './state';
 import { detectBPMWorker } from './worker-client';
@@ -43,29 +43,30 @@ function revokeLater(url: string, delay = BLOB_REVOKE_DELAY_MS): void {
     }, delay);
 }
 
+function trackBlobUrl(url: string, isMain: boolean): string {
+    if (isMain) {
+        if (mainBlobUrl) revokeLater(mainBlobUrl);
+        mainBlobUrl = url;
+    } else {
+        if (crossfadeBlobUrl) revokeLater(crossfadeBlobUrl);
+        crossfadeBlobUrl = url;
+    }
+    return url;
+}
+
 async function getSafeUrl(filePath: string, isMain: boolean): Promise<string> {
     try {
         const rawData = await window.fileSystem.readFile(filePath);
         if (!rawData) {
             logger.warn(`[SafeURL] File unreadable: ${filePath}`);
-            return filePath;
+            return "";
         }
-        
         const arrayBuffer = normalizeToArrayBuffer(rawData);
         const blob = new Blob([arrayBuffer], { type: 'audio/mpeg' });
-        const url = URL.createObjectURL(blob);
-        
-        if (isMain) {
-            if (mainBlobUrl) revokeLater(mainBlobUrl);
-            mainBlobUrl = url;
-        } else {
-            if (crossfadeBlobUrl) revokeLater(crossfadeBlobUrl);
-            crossfadeBlobUrl = url;
-        }
-        return url;
+        return trackBlobUrl(URL.createObjectURL(blob), isMain);
     } catch (e) {
         logger.error("[SafeURL] Failed to create blob", e);
-        return filePath; 
+        return "";
     }
 }
 
@@ -182,12 +183,32 @@ export async function loadTrack(index: number): Promise<void> {
     const playlist = state.playlist;
     if (!playlist.length || index < 0 || index >= playlist.length) return;
     const track = playlist[index];
+    // Claim the generation BEFORE any await so overlapping calls can't both
+    // assign audio.src — stale resolutions are discarded below.
+    const loadId = ++_loadTrackId;
     state.update({ currentTrackIndex: index });
     if (renderPlaylistFn) renderPlaylistFn();
     
     engine.main.reset();
     logger.info(`[Player] Loading track: ${track.name} [ID: ${track.id}]`);
-    const safeUrl = await getSafeUrl(track.path, true);
+    // Single IPC read shared by playback blob + decode/BPM. Previously this
+    // read the file twice (2x I/O, 2x RAM, TOCTOU). decodeAudioData detaches
+    // its input, so the blob gets a copy.
+    let sharedBuffer: ArrayBuffer | null = null;
+    try {
+        const rawData = await window.fileSystem.readFile(track.path);
+        if (rawData) sharedBuffer = normalizeToArrayBuffer(rawData);
+    } catch (e) {
+        logger.warn(`[Player] Read failed for ${track.path}`, e);
+    }
+    if (loadId !== _loadTrackId) return;
+    if (!sharedBuffer) {
+        toast.error("TRACK UNREADABLE — KEPT PREVIOUS TRACK");
+        hideSpinnerIfCurrent(loadId);
+        return;
+    }
+    const blobCopy = sharedBuffer.slice(0);
+    const safeUrl = trackBlobUrl(URL.createObjectURL(new Blob([blobCopy], { type: 'audio/mpeg' })), true);
     engine.main.load(safeUrl);
     engine.main.audio.playbackRate = tempoSlider ? parseFloat(tempoSlider.value) : 1;
     
@@ -198,25 +219,17 @@ export async function loadTrack(index: number): Promise<void> {
         trackTitle.innerText = hasBpm ? `${track.name} [${track.bpm}bpm]` : track.name;
     }
 
-    // Cancellation guard: if loadTrack is called again before this finishes, skip stale results
-    const loadId = ++_loadTrackId;
-
     // Show spinner during async load (decoding + BPM analysis)
     if (trackSpinner) trackSpinner.classList.add('active');
 
-    // Single-pass high-performance decoding
+    // Single-pass high-performance decoding (reuses the shared buffer)
     (async () => {
         try {
-            const rawData = await window.fileSystem.readFile(track.path);
-            if (_loadTrackId !== loadId) {
-                hideSpinnerIfCurrent(loadId);
-                return; // cancelled by newer loadTrack call
-            }
-            
-            const arrayBuffer = normalizeToArrayBuffer(rawData);
-            
+            if (!sharedBuffer) { hideSpinnerIfCurrent(loadId); return; }
+            if (!ensureAudio() || !audioCtx) { hideSpinnerIfCurrent(loadId); return; }
             // Use native decoder (reliable)
-            const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+            const audioBuffer = await audioCtx.decodeAudioData(sharedBuffer);
+            sharedBuffer = null;
             if (_loadTrackId !== loadId) {
                 hideSpinnerIfCurrent(loadId);
                 return; // cancelled
@@ -229,8 +242,14 @@ export async function loadTrack(index: number): Promise<void> {
                     hideSpinnerIfCurrent(loadId);
                     return; // cancelled
                 }
-                track.bpm = detectedValue;
-                state.update({ masterBPM: detectedValue });
+                const pIdx = state.playlist.findIndex(t => t.id === track.id);
+                if (pIdx >= 0) {
+                    const next = [...state.playlist];
+                    next[pIdx] = { ...next[pIdx], bpm: detectedValue };
+                    state.update({ masterBPM: detectedValue, playlist: next });
+                } else {
+                    state.update({ masterBPM: detectedValue });
+                }
                 if (renderPlaylistFn) renderPlaylistFn();
                 logger.info(`[Player] Async analysis complete: ${detectedValue} BPM`);
             }
@@ -254,13 +273,18 @@ export async function loadTrack(index: number): Promise<void> {
     })();
 }
 
+let crossfadeTimer: ReturnType<typeof setTimeout> | null = null;
+let crossfadeGen = 0;
+
 function updateControlsLock(locked: boolean): void {
     const nextBtn = document.getElementById('nextBtn');
     const prevBtn = document.getElementById('prevBtn');
     const loopBtn = document.getElementById('loopBtn');
     // Sliders must lock too: dragging volume mid-blend executes
     // gain automation on the outgoing channel and desyncs the mix.
-    const lockable = [progressBar, playPauseBtn, stopBtn, nextBtn, prevBtn, loopBtn, masterVol, tempoSlider];
+    // STOP stays enabled so an in-flight blend is always abortable —
+    // previously stopBtn was disabled and finishCrossfade resurrected audio.
+    const lockable = [progressBar, playPauseBtn, nextBtn, prevBtn, loopBtn, masterVol, tempoSlider];
     lockable.forEach(el => {
         if (el) {
             (el as HTMLButtonElement | HTMLInputElement).disabled = locked;
@@ -275,7 +299,7 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
     const playlist = state.playlist;
     if (state.isCrossfadeInProgress || !playlist.length) return;
     
-    if (!audioCtx) { // Check if audioCtx is available before resuming
+    if (!ensureAudio() || !audioCtx) { // Check if audioCtx is available before resuming
         toast.error("Audio not available for crossfade. Please refresh the page.");
         return;
     }
@@ -301,25 +325,44 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
 
     engine.crossfade.reset();
     const safeUrl = await getSafeUrl(playlist[nextIdx].path, false);
+    if (!safeUrl) {
+        state.update({ isCrossfadeInProgress: false });
+        updateControlsLock(false);
+        if (setBlendingIndexFn) setBlendingIndexFn(-1);
+        if (autoMixBtn) autoMixBtn.classList.remove('blending');
+        toast.error("NEXT TRACK UNREADABLE — CROSSFADE ABORTED");
+        return;
+    }
     engine.crossfade.load(safeUrl);
 
-    // Sonetra AI integration (minimal): when enabled, pre-warm the transition
-    // cache for this pair so future mixes have AI transitions available.
-    // Full AI-generated transition playback requires the Python backend to
-    // return a playable buffer AND a playback design decision — the checkbox
-    // previously did literally nothing.
+    // Sonetra AI: pre-warm only. Cached AI transitions are generated in the
+    // background for future mixes; live AI-stem playback is NOT implemented
+    // (checkbox previously implied it was). Guard indices — currentTrackIndex
+    // can be -1 on an empty/fresh playlist.
     if (settings.autoMix.enableAI && window.sonetra) {
         const cur = playlist[state.currentTrackIndex];
         const nxt = playlist[nextIdx];
-        window.sonetra.precomputeTransition(cur.path, nxt.path)
-            .then((r) => logger.info(`[AutoMix] Sonetra transition cache: ${r.success ? (r.cached ? 'hit' : 'generated') : r.error}`))
-            .catch(() => { /* offline / server down — non-fatal */ });
+        if (cur && nxt) {
+            window.sonetra.precomputeTransition(cur.path, nxt.path)
+                .then((r) => logger.info(`[AutoMix] Sonetra transition cache: ${r.success ? (r.cached ? 'hit' : 'generated') : r.error}`))
+                .catch(() => { /* offline / server down — non-fatal */ });
+        }
     }
 
     cross.lowEQ.gain.value = settings.autoMix.eqCrossfade ? -24 : 0;
     cross.midEQ.gain.value = settings.autoMix.eqCrossfade ? -6 : 0;
     cross.gain.gain.value = 0.001;
     cross.audio.playbackRate = engine.main.audio.playbackRate;
+    // BPM Sync (was a dead checkbox): tempo-match incoming to outgoing.
+    if (settings.autoMix.bpmSync) {
+        const curBpm = playlist[state.currentTrackIndex]?.bpm ?? 0;
+        const nxtBpm = playlist[nextIdx]?.bpm ?? 0;
+        if (curBpm > 0 && nxtBpm > 0) {
+            const matched = engine.main.audio.playbackRate * (curBpm / nxtBpm);
+            cross.audio.playbackRate = Math.min(1.5, Math.max(0.5, matched));
+            logger.info(`[AutoMix] BPM sync ${curBpm}->${nxtBpm} rate=${cross.audio.playbackRate.toFixed(3)}`);
+        }
+    }
 
     try {
         await engine.crossfade.audio.play();
@@ -367,7 +410,13 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
     cross.gain.gain.setValueAtTime(0.001, now);
     cross.gain.gain.linearRampToValueAtTime(1, now + duration);
 
-    setTimeout(() => { finishCrossfade(nextIdx); }, duration * 1000);
+    const gen = ++crossfadeGen;
+    if (crossfadeTimer) clearTimeout(crossfadeTimer);
+    crossfadeTimer = setTimeout(() => {
+        crossfadeTimer = null;
+        if (gen !== crossfadeGen) return;
+        finishCrossfade(nextIdx);
+    }, duration * 1000);
 }
 
 function finishCrossfade(nextIndex: number): void {
@@ -408,7 +457,7 @@ function finishCrossfade(nextIndex: number): void {
 
 export function playTrack(): void {
     if (state.isCrossfadeInProgress || !state.playlist.length || !engine.main.audio) return;
-    if (!audioCtx) { // Check if audioCtx is available
+    if (!ensureAudio() || !audioCtx) { // Check if audioCtx is available
         toast.error("Audio not available. Please refresh the page.");
         return;
     }
@@ -426,6 +475,9 @@ export function pauseTrack(): void {
 }
 
 export function stopPlayback(): void {
+    // Abort any pending blend first so finishCrossfade can't resurrect audio.
+    crossfadeGen++;
+    if (crossfadeTimer) { clearTimeout(crossfadeTimer); crossfadeTimer = null; }
     engine.main.audio.pause();
     engine.main.audio.currentTime = 0;
     engine.crossfade.audio.pause();

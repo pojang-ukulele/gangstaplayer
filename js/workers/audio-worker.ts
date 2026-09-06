@@ -30,13 +30,24 @@ self.onmessage = function(e: MessageEvent<WorkerMessage>) {
             if (payload.data && payload.sampleRate) {
                 const bpm = detectBPM(payload.data, payload.sampleRate, payload.threshold, payload.minStepSeconds);
                 self.postMessage({ type: 'BPM_RESULT', bpm, id });
+            } else {
+                self.postMessage({ type: 'BPM_RESULT', bpm: 0, id });
             }
             break;
         case 'BUFFER_TO_WAVE':
             if (payload.buffer && payload.len !== undefined) {
-                const waveBlob = bufferToWave(payload.buffer, payload.len);
-                self.postMessage({ type: 'WAVE_RESULT', blob: waveBlob, id });
+                try {
+                    const waveBlob = bufferToWave(payload.buffer, payload.len);
+                    self.postMessage({ type: 'WAVE_RESULT', blob: waveBlob, id });
+                } catch {
+                    self.postMessage({ type: 'WAVE_RESULT', blob: null, id });
+                }
+            } else {
+                self.postMessage({ type: 'WAVE_RESULT', blob: null, id });
             }
+            break;
+        default:
+            self.postMessage({ type: 'UNKNOWN', id });
             break;
     }
 };

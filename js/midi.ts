@@ -1,4 +1,4 @@
-import { audioCtx } from './audio';
+import { audioCtx, ensureAudio } from './audio';
 import { state, AppStateData } from './state';
 import { toast } from './toast';
 import { logger } from './logger';
@@ -214,12 +214,15 @@ function handleMidiLearn(cmd: number, data1: number) {
 }
 
 function updateControlFromMidi(targetId: string, value: number) {
-    const normalized = value / 127;
     const el = document.getElementById(targetId) as HTMLInputElement;
-    if (el) {
-        el.value = normalized.toString();
-        el.dispatchEvent(new Event('input'));
-    }
+    if (!el) return;
+    // Respect the slider's own range (tempo 0.5-1.5 vs volume 0-1).
+    // Previously every CC was written as 0-1, parking tempo at the bottom.
+    const min = parseFloat(el.min || '0');
+    const max = parseFloat(el.max || '1');
+    const scaled = min + (value / 127) * (max - min);
+    el.value = scaled.toString();
+    el.dispatchEvent(new Event('input'));
 }
 
 function getMIDIMessage(message: any): void {
@@ -227,9 +230,12 @@ function getMIDIMessage(message: any): void {
     const [status, data1, data2] = message.data;
     const cmd = status >> 4;
 
-    // Handle Learn Mode
+    // Handle Learn Mode (Note-On with velocity only — Note-Off/cmd-8 must
+    // never become a binding or pads trigger on release and never on hit)
     if (state.isLearningMidi && state.midiLearnTarget) {
-        if (cmd === 9 || cmd === 11) { // Note On or CC
+        if (cmd === 9 && data2 > 0) { // Note On
+            handleMidiLearn(cmd, data1);
+        } else if (cmd === 11) { // CC
             handleMidiLearn(cmd, data1);
         }
         return;
@@ -242,7 +248,12 @@ function getMIDIMessage(message: any): void {
             startPadFn(padIndex);
             if (activeVoicesRef && activeVoicesRef[padIndex] && activeVoicesRef[padIndex].gain && padVolumesRef) {
                 const vol = (data2 / 127) * (padVolumesRef[padIndex] || 1);
-                try { activeVoicesRef[padIndex].gain.gain.setValueAtTime(vol, audioCtx.currentTime); } catch (e) {}
+                try {
+                    ensureAudio();
+                    if (!audioCtx) return;
+                    activeVoicesRef[padIndex].gain.gain.cancelScheduledValues(audioCtx.currentTime);
+                    activeVoicesRef[padIndex].gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+                } catch (e) {}
             }
         }
     } else if (cmd === 8 || (cmd === 9 && data2 === 0)) { // Note Off

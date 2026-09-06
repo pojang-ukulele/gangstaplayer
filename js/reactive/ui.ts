@@ -85,8 +85,14 @@ export class VirtualScroller<T> {
                 el.remove();
                 this.visibleItems.delete(idx);
             } else if (force) {
-                // Update in place if forced (e.g. selection state changed)
+                // Update in place if forced (e.g. selection state changed).
+                // Re-assert geometry: reused rows keep stale top/height after
+                // reorder/resize if the callback doesn't set them.
                 this.renderItem(this.items[idx], idx, el);
+                el.style.position = 'absolute';
+                el.style.top = `${idx * this.itemHeight}px`;
+                el.style.width = '100%';
+                el.style.height = `${this.itemHeight}px`;
             }
         }
 

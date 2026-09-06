@@ -23,10 +23,10 @@ export interface ElectronAPI {
 export interface FileSystemAPI {
     readFile(filePath: string): Promise<Uint8Array>;
     saveFile(filePath: string, data: Uint8Array): Promise<boolean>;
-    saveRecording(fileName: string, data: ArrayBuffer): Promise<string>;
+    saveRecording(buffer: ArrayBuffer, filename: string): Promise<string | null>;
     appendLog(level: string, message: string): Promise<void>;
     getLogPath(): Promise<string>;
-    ensureRecordingsDir(): Promise<void>;
+    ensureRecordingsDir(): Promise<string>;
 }
 
 export interface SonetraAPI {

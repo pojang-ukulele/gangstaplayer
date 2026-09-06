@@ -30,14 +30,11 @@ class LogManager {
         // Add to ring buffer
         this.addToBuffer(entry);
 
-        // Immediate flush for High Interest events
+        // Immediate flush for High Interest events, but KEEP them in the
+        // ring buffer — post-mortem bundles are built from the buffer and
+        // previously every ERROR/WARN was deleted before a crash report.
         if (level === 'ERROR' || level === 'WARN') {
             this.flushEntryToDisk(entry);
-            const idx = this.buffer.indexOf(entry);
-            if (idx !== -1) {
-                this.buffer.splice(idx, 1);
-                this.currentBufferSize -= Buffer.byteLength(entry, 'utf8');
-            }
         }
     }
 

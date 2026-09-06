@@ -1,4 +1,4 @@
-import { audioCtx } from './audio';
+import { audioCtx, ensureAudio } from './audio';
 import { detectBPMWorker } from './worker-client';
 import { state, Track } from './state';
 import { VirtualScroller } from './reactive/ui';
@@ -51,20 +51,25 @@ export function initPlaylist(deps: PlaylistDeps): void {
     }
 
     if (searchInput) {
+        let searchGen = 0;
         searchInput.addEventListener('input', async () => {
+            const myGen = ++searchGen;
             const query = searchInput.value;
-            if (db && query.length > 0) {
-                const results = await db.searchTracks(query);
-                // Filtered results invalidate every existing index
-                state.update({ playlist: results, selectedIndices: [] });
-                anchorIndex = -1;
-                pivotIndex = -1;
-            } else if (db) {
-                const all = await db.getAllTracks();
-                state.update({ playlist: all, selectedIndices: [] });
-                anchorIndex = -1;
-                pivotIndex = -1;
-            }
+            // Keep the playing track stable across filter swaps: remap by id.
+            const curId = state.playlist[state.currentTrackIndex]?.id;
+            const results = (db && query.length > 0)
+                ? await db.searchTracks(query)
+                : (db ? await db.getAllTracks() : state.playlist);
+            if (myGen !== searchGen) return; // stale keystroke, drop
+            const list = Array.isArray(results) ? results : [];
+            const newCur = curId ? list.findIndex(t => t?.id === curId) : -1;
+            state.update({
+                playlist: list,
+                selectedIndices: [],
+                ...(newCur !== state.currentTrackIndex ? { currentTrackIndex: newCur } : {}),
+            });
+            anchorIndex = -1;
+            pivotIndex = -1;
         });
     }
 
@@ -81,8 +86,9 @@ export function initPlaylist(deps: PlaylistDeps): void {
     state.subscribe('currentTrackIndex', refreshSelection);
     state.subscribe('blendingIndex', refreshSelection);
     
-    // Initial vScroller setup
+    // Initial vScroller setup (destroy previous on re-init / hot reload)
     if (playlistEl) {
+        if (vScroller) { try { vScroller.destroy(); } catch { /* ignore */ } vScroller = null; }
         vScroller = new VirtualScroller({
             container: playlistEl,
             items: state.playlist,
@@ -107,9 +113,10 @@ async function analyzeTrackInBackground(track: Track): Promise<void> {
         if (db) {
             const cached = await db.getTrack(track.path);
             if (cached && cached.bpm > 0) {
-                track.bpm = cached.bpm;
-                track.duration = cached.duration;
-                state.update({ playlist: [...state.playlist] });
+                const idx = state.playlist.findIndex(t => t.id === track.id);
+                const next = [...state.playlist];
+                if (idx >= 0) next[idx] = { ...next[idx], bpm: cached.bpm, duration: cached.duration };
+                state.update({ playlist: next });
                 return;
             }
         }
@@ -134,12 +141,15 @@ async function analyzeTrackInBackground(track: Track): Promise<void> {
         }
 
         // Use native decoder (decoder pool workers are unreliable)
+        if (!ensureAudio() || !audioCtx) return;
         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
 
         const bpm = await detectBPMWorker(audioBuffer);
         
-        track.bpm = bpm; 
-        track.duration = audioBuffer.duration;
+        const idx = state.playlist.findIndex(t => t.id === track.id);
+        const next = [...state.playlist];
+        if (idx >= 0) next[idx] = { ...next[idx], bpm, duration: audioBuffer.duration };
+        else { track.bpm = bpm; track.duration = audioBuffer.duration; }
 
         // 2. Persist to DB
         if (db) {
@@ -147,30 +157,38 @@ async function analyzeTrackInBackground(track: Track): Promise<void> {
                 id: track.id,
                 path: track.path,
                 name: track.name,
-                duration: track.duration,
-                bpm: track.bpm
+                duration: audioBuffer.duration,
+                bpm
             });
         }
 
-        state.update({ playlist: [...state.playlist] });
+        state.update({ playlist: next });
     } catch (e) {
         console.warn(`[Playlist] BPM analysis skipped for ${track.name}`);
-        track.bpm = 0; 
-        state.update({ playlist: [...state.playlist] });
+        const idx = state.playlist.findIndex(t => t.id === track.id);
+        if (idx >= 0) {
+            const next = [...state.playlist];
+            next[idx] = { ...next[idx], bpm: 0 };
+            state.update({ playlist: next });
+        }
     }
 }
 
 export function addTracksToPlaylist(files: File[]): void {
     const currentPlaylist = [...state.playlist];
     const startIdx = currentPlaylist.length;
+    const uuid = (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function')
+        ? () => crypto.randomUUID()
+        : () => `id-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
     files.forEach((file) => {
         const fullPath = window.electronAPI.getPathForFile(file);
-        const track: Track = { 
-            id: crypto.randomUUID(),
-            name: file.name, 
-            path: fullPath, 
-            duration: 0, 
-            bpm: undefined 
+        if (!fullPath) return; // non-file drop — don't create unplayable rows
+        const track: Track = {
+            id: uuid(),
+            name: file.name,
+            path: fullPath,
+            duration: 0,
+            bpm: undefined
         };
         currentPlaylist.push(track);
         
@@ -228,7 +246,6 @@ function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HT
         li.addEventListener('click', (e) => {
             e.stopPropagation();
             const idx = parseInt(li.dataset.index || "0");
-            console.log(`[Playlist] Item Clicked: ${idx}`);
             
             const currentSelected = [...state.selectedIndices];
             if (e.ctrlKey || e.metaKey) {
@@ -255,10 +272,8 @@ function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HT
         li.addEventListener('dblclick', (e) => {
             e.stopPropagation();
             const idx = parseInt(li.dataset.index || "0");
-            console.log(`[Playlist] Item Dbl-Clicked: ${idx}`);
             if (loadTrackFn) {
                 loadTrackFn(idx).then(() => {
-                    console.log(`[Playlist] Track ${idx} loaded, triggering play...`);
                     if (playTrackFn) playTrackFn();
                 }).catch(err => console.error(`[Playlist] Load failed for ${idx}:`, err));
             }
@@ -619,36 +634,45 @@ export function setupPlaylistHandlers(): void {
 
     if (ctxMoveUp) ctxMoveUp.addEventListener('click', () => {
         if (!state.selectedIndices.length) return;
-        const currentPlaylist = [...state.playlist];
-        const sorted = [...state.selectedIndices].sort((a,b) => a-b);
-        if (sorted[0] > 0) {
-            sorted.forEach(idx => {
-                const temp = currentPlaylist[idx];
-                currentPlaylist[idx] = currentPlaylist[idx-1];
-                currentPlaylist[idx-1] = temp;
-            });
-            state.update({ 
-                playlist: currentPlaylist,
-                selectedIndices: sorted.map(i => i-1) 
-            });
+        const list = [...state.playlist];
+        const sel = new Set(state.selectedIndices);
+        const sorted = [...sel].sort((a, b) => a - b);
+        if (sorted[0] <= 0) return;
+        // Ascending; skip swap when predecessor is also selected so
+        // contiguous blocks move together instead of reversing.
+        for (const idx of sorted) {
+            if (sel.has(idx - 1)) continue;
+            [list[idx - 1], list[idx]] = [list[idx], list[idx - 1]];
+            sel.delete(idx); sel.add(idx - 1);
         }
+        const curId = state.playlist[state.currentTrackIndex]?.id;
+        const newCur = curId ? list.findIndex(t => t?.id === curId) : state.currentTrackIndex;
+        state.update({
+            playlist: list,
+            selectedIndices: [...sel],
+            ...(newCur !== state.currentTrackIndex ? { currentTrackIndex: newCur } : {}),
+        });
     });
 
     if (ctxMoveDown) ctxMoveDown.addEventListener('click', () => {
         if (!state.selectedIndices.length) return;
-        const currentPlaylist = [...state.playlist];
-        const sorted = [...state.selectedIndices].sort((a,b) => b-a);
-        if (sorted[0] < currentPlaylist.length - 1) {
-             sorted.forEach(idx => {
-                const temp = currentPlaylist[idx];
-                currentPlaylist[idx] = currentPlaylist[idx+1];
-                currentPlaylist[idx+1] = temp;
-            });
-            state.update({ 
-                playlist: currentPlaylist,
-                selectedIndices: sorted.map(i => i+1) 
-            });
+        const list = [...state.playlist];
+        const sel = new Set(state.selectedIndices);
+        const sorted = [...sel].sort((a, b) => b - a);
+        if (sorted[0] >= list.length - 1) return;
+        // Descending; skip swap when successor is also selected (block move).
+        for (const idx of sorted) {
+            if (sel.has(idx + 1)) continue;
+            [list[idx + 1], list[idx]] = [list[idx], list[idx + 1]];
+            sel.delete(idx); sel.add(idx + 1);
         }
+        const curId = state.playlist[state.currentTrackIndex]?.id;
+        const newCur = curId ? list.findIndex(t => t?.id === curId) : state.currentTrackIndex;
+        state.update({
+            playlist: list,
+            selectedIndices: [...sel],
+            ...(newCur !== state.currentTrackIndex ? { currentTrackIndex: newCur } : {}),
+        });
     });
 
     if (ctxPlay) ctxPlay.addEventListener('click', () => {

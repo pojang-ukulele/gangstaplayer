@@ -72,14 +72,23 @@ function getWorker(): Worker {
     return worker;
 }
 
-function post(kind: RequestKind, buildMessage: (id: number) => { type: string; payload: any }, transfer: Transferable[]): Promise<any> {
+function post(kind: RequestKind, buildMessage: (id: number) => { type: string; payload: any }, transfer: Transferable[], timeoutMs = 30000): Promise<any> {
     const id = requestId++;
     return new Promise((resolve, reject) => {
-        pendingRequests.set(id, { kind, resolve, reject });
+        const timer = setTimeout(() => {
+            if (pendingRequests.has(id)) {
+                pendingRequests.delete(id);
+                reject(new Error(`Audio worker timed out (${kind})`));
+            }
+        }, timeoutMs);
+        const wrappedResolve = (v: any) => { clearTimeout(timer); resolve(v); };
+        const wrappedReject = (e: Error) => { clearTimeout(timer); reject(e); };
+        pendingRequests.set(id, { kind, resolve: wrappedResolve, reject: wrappedReject });
         try {
             const message = buildMessage(id);
             getWorker().postMessage({ ...message, id }, transfer);
         } catch (e: any) {
+            clearTimeout(timer);
             pendingRequests.delete(id);
             reject(new Error(`Failed to post to audio worker: ${e?.message || e}`));
         }

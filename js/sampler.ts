@@ -1,7 +1,7 @@
 // === SAMPLER MODULE ===
 import { DEFAULT_PAD_VOLUME, POOL_SIZE } from './constants';
 import { state } from './state';
-import { audioCtx, masterGain, resumeAudioContext } from './audio';
+import { audioCtx, masterGain, resumeAudioContext, ensureAudio } from './audio';
 import { engine } from './audio-engine';
 import { toast } from './toast';
 import { logger } from './logger';
@@ -35,17 +35,25 @@ const WAVEFORM_POINTS = 100; // Number of amplitude samples for preview
 const _gainPool: GainNode[] = [];
 let _poolCreated = 0;
 
-function acquireGain(): GainNode {
-    const gain = _gainPool.pop() ?? audioCtx.createGain();
+function acquireGain(): GainNode | null {
+    const pooled = _gainPool.pop();
+    if (pooled) return pooled;
+    if (!ensureAudio() || !audioCtx) return null;
     _poolCreated++;
-    return gain;
+    return audioCtx.createGain();
 }
 
 function releaseGain(gain: GainNode): void {
     // Disconnect the gain node from its input and output
     try { gain.disconnect(); } catch (_) { /* already disconnected */ }
-    // Reset gain to default
-    gain.gain.setValueAtTime(1, audioCtx.currentTime);
+    // Cancel prior automation before reset, or the next voice inherits ramps.
+    try {
+        if (audioCtx) gain.gain.cancelScheduledValues(audioCtx.currentTime);
+    } catch (_) { /* ignore */ }
+    try {
+        if (audioCtx) gain.gain.setValueAtTime(1, audioCtx.currentTime);
+        else gain.gain.value = 1;
+    } catch (_) { gain.gain.value = 1; }
     // Return to pool (limit pool size)
     if (_gainPool.length < (POOL_SIZE || 32)) {
         _gainPool.push(gain);
@@ -255,6 +263,7 @@ export async function loadSampleFile(file: File, index: number): Promise<void> {
         }
         
         // Use native decoder directly (no worker pool — most reliable for one-shot samples)
+        if (!ensureAudio() || !audioCtx) { toast.error("AUDIO NOT READY"); return; }
         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
         
         padBuffers[index] = audioBuffer;
@@ -302,6 +311,7 @@ export async function loadSampleFromPath(path: string, index: number): Promise<v
         logger.info(`[Sampler] Pad ${index}: Got ${arrayBuffer.byteLength} bytes, decoding...`);
         
         // Use native decoder directly
+        if (!ensureAudio() || !audioCtx) return;
         const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
  
         padBuffers[index] = audioBuffer;
@@ -326,9 +336,12 @@ export async function loadSampleFromPath(path: string, index: number): Promise<v
 export function startPad(index: number): void {
     logger.debug(`[Sampler] startPad(${index}) called. Buffer exists: ${!!padBuffers[index]}`);
     if (!padBuffers[index]) return;
-    
-    // Guard against AudioContext being in closed state
-    if (audioCtx.state === 'closed') {
+    if (!ensureAudio() || !audioCtx || !masterGain) {
+        logger.warn(`[Sampler] Audio not ready, cannot start pad ${index}`);
+        return;
+    }
+    // Guard against AudioContext being in closed state (ensureAudio rebuilds)
+    if (audioCtx.state === 'closed' && !ensureAudio()) {
         logger.warn(`[Sampler] AudioContext is closed, cannot start pad ${index}`);
         return;
     }
@@ -352,6 +365,7 @@ export function startPad(index: number): void {
         }
         
         const gainNode = acquireGain();
+        if (!gainNode) { logger.warn(`[Sampler] No gain node for pad ${index}`); return; }
         const currentVol = padVolumes[index] !== undefined ? padVolumes[index] : DEFAULT_PAD_VOLUME;
         gainNode.gain.setValueAtTime(currentVol, audioCtx.currentTime);
         
@@ -475,9 +489,15 @@ function renderPad(index: number, existing?: HTMLElement): HTMLElement {
         });
 
         volSlider.addEventListener('input', () => {
-            padVolumes[index] = parseFloat(volSlider.value);
+            const v = parseFloat(volSlider.value);
+            padVolumes[index] = Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : 0.75;
             const currentVoice = activeVoices[index];
-            if (currentVoice) currentVoice.gain.gain.setValueAtTime(padVolumes[index], audioCtx.currentTime);
+            if (currentVoice && audioCtx) {
+                try {
+                    currentVoice.gain.gain.cancelScheduledValues(audioCtx.currentTime);
+                    currentVoice.gain.gain.setValueAtTime(padVolumes[index], audioCtx.currentTime);
+                } catch { /* audio closed */ }
+            }
         });
 
         // === WAVEFORM LOOP POINT EDITING ===
@@ -531,8 +551,11 @@ function renderPad(index: number, existing?: HTMLElement): HTMLElement {
                         padLoopEnd[index] = -1;
                         toast.info("LOOP CLEARED");
                     } else {
-                        // Regular click: set BOTH start and end around nearest beat to make a 1-bar loop
-                        if (padBPMs[index] > 0) {
+                        // Regular click: only create a 1-bar loop when none exists.
+                        // Previously every click silently overwrote a hand-tuned loop.
+                        if (padLoopStart[index] >= 0 && padLoopEnd[index] > padLoopStart[index]) {
+                            toast.info("LOOP EXISTS — ALT+CLICK TO CLEAR");
+                        } else if (padBPMs[index] > 0) {
                             const beatSec = 60 / padBPMs[index];
                             const barSec = beatSec * 4; // 4 beats = 1 bar
                             // Snap start down to the bar boundary
@@ -582,15 +605,34 @@ function renderPad(index: number, existing?: HTMLElement): HTMLElement {
 }
 
 export function setupPadKeyboardHandlers(): void {
+    let keyLearnTimer: ReturnType<typeof setTimeout> | null = null;
+    const cancelKeyLearn = () => {
+        if (keyLearnTimer) { clearTimeout(keyLearnTimer); keyLearnTimer = null; }
+    };
+    state.subscribe('isLearningKey', (learning) => {
+        cancelKeyLearn();
+        if (!learning) return;
+        keyLearnTimer = setTimeout(() => {
+            if (!state.isLearningKey) return;
+            state.update({ isLearningKey: false, keyLearnTargetPad: null });
+            toast.info("KEY BIND TIMED OUT");
+        }, 10000);
+    });
     document.addEventListener('keydown', (e) => {
         if (e.repeat) return;
         
-        // Handle Key Learn Mode
+        // Handle Key Learn Mode (steal-free: swap so two pads never share a key)
         if (state.isLearningKey && state.keyLearnTargetPad !== null) {
             e.preventDefault();
             const padIndex = state.keyLearnTargetPad;
+            const key = e.key.toLowerCase();
+            // Ignore pure modifiers — binding "shift" strands the pad.
+            if (['shift', 'control', 'alt', 'meta'].includes(key)) return;
             const newMap = [...state.padKeyMap];
-            newMap[padIndex] = e.key.toLowerCase();
+            const other = newMap.indexOf(key);
+            if (other !== -1 && other !== padIndex) newMap[other] = newMap[padIndex];
+            newMap[padIndex] = key;
+            cancelKeyLearn();
             state.update({ padKeyMap: newMap, isLearningKey: false, keyLearnTargetPad: null });
             toast.success(`PAD ${padIndex + 1} BOUND TO KEY "${e.key.toUpperCase()}"`);
             return;
@@ -637,6 +679,7 @@ async function startRecording(index: number): Promise<void> {
             const arrayBuffer = await blob.arrayBuffer();
              
              try {
+                if (!ensureAudio() || !audioCtx) { toast.error("AUDIO NOT READY"); return; }
                 const decodedBuffer = await audioCtx.decodeAudioData(arrayBuffer);
                 padBuffers[index] = decodedBuffer;
                 padPaths[index] = `REC_${Date.now()}`;
