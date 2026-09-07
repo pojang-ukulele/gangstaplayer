@@ -411,6 +411,14 @@ export function startPad(index: number): void {
         logger.warn(`[Sampler] AudioContext is closed, cannot start pad ${index}`);
         return;
     }
+    // Context rebuild orphans live voices (gain nodes bound to the dead
+    // context/master). Stop them so the new trigger isn't silent/mixed.
+    try {
+        const cur = (audioCtx as AudioContext | null);
+        if (cur && (_poolCtx as AudioContext | null) && (_poolCtx as AudioContext | null) !== cur) {
+            stopAllPads();
+        }
+    } catch { /* ignore */ }
     
     resumeAudioContext();
     
@@ -535,7 +543,7 @@ export function createPadGrid(): void {
 }
 
 function escapeAttr(s: string): string {
-    return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/`/g, '&#96;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 function renderPad(index: number, existing?: HTMLElement): HTMLElement {
@@ -852,7 +860,9 @@ function stopRecording(index: number): void {
 /** Abort all in-flight pad recordings and release mic streams (unload safety). */
 export function stopAllRecordings(): void {
     for (const key of Object.keys(activeRecorders)) {
+        if (key.startsWith('__cancel_') || key === '__pending__') continue;
         const idx = Number(key);
+        if (!Number.isInteger(idx)) continue;
         try {
             const rec = activeRecorders[idx];
             if (rec && rec.state !== 'inactive') {
@@ -923,6 +933,7 @@ async function loadKitDialog(): Promise<void> {
         if (!path) return;
         
         const data = await fsBridgeRef.readFile(path);
+        if (!data) { toast.error("FAILED TO LOAD KIT"); return; }
         const jsonStr = new TextDecoder().decode(data);
         const kit = JSON.parse(jsonStr);
         

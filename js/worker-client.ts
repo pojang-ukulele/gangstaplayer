@@ -90,7 +90,8 @@ function getWorker(): Worker {
 }
 
 function post(kind: RequestKind, buildMessage: (id: number) => { type: string; payload: any }, transfer: Transferable[], timeoutMs = 30000): Promise<any> {
-    const id = requestId++;
+    requestId = (requestId + 1) % 1000000000;
+    const id = requestId;
     return new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
             if (pendingRequests.has(id)) {
@@ -155,6 +156,10 @@ export function detectBPMWorker(audioBuffer: AudioBuffer, options?: { threshold?
  * Convert an AudioBuffer (or pre-built channel object) to a WAV Blob using a worker.
  */
 export function bufferToWaveWorker(audioBuffer: AudioBuffer | { numberOfChannels: number; sampleRate: number; channels: Float32Array[] }, len: number): Promise<Blob> {
+    const safeLen = Math.floor(Number(len));
+    if (!Number.isInteger(safeLen) || safeLen <= 0 || safeLen > 268435456) {
+        return Promise.reject(new Error('Invalid encode length'));
+    }
     let bufferPayload: { numberOfChannels: number; sampleRate: number; channels: Float32Array[] };
     const transferables: ArrayBufferLike[] = [];
 
@@ -180,7 +185,7 @@ export function bufferToWaveWorker(audioBuffer: AudioBuffer | { numberOfChannels
 
     return post('WAVE', (id) => ({
         type: 'BUFFER_TO_WAVE',
-        payload: { buffer: bufferPayload, len },
+        payload: { buffer: bufferPayload, len: safeLen },
         id
     }), transferables as Transferable[]).then((blob) => {
         if (!(blob instanceof Blob)) {

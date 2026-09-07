@@ -110,7 +110,7 @@ function isSafeAudioPath(filePath: string): { safe: boolean; resolved?: string; 
         if (!fs.existsSync(resolved)) {
             return { safe: false, error: 'File does not exist' };
         }
-        console.warn(`[Sonetra] Path outside whitelist accepted via user-consent fallback: ${resolved}`);
+        console.warn('[Sonetra] Path outside whitelist accepted via user-consent fallback');
         return { safe: true, resolved };
 
     } catch (err: any) {

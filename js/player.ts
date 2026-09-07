@@ -54,7 +54,7 @@ function trackBlobUrl(url: string, isMain: boolean): string {
     return url;
 }
 
-async function getSafeUrl(filePath: string, isMain: boolean): Promise<string> {
+async function getSafeUrl(filePath: string, isMain: boolean, verifyDecode = false): Promise<string> {
     try {
         const rawData = await window.fileSystem.readFile(filePath);
         if (!rawData) {
@@ -70,6 +70,13 @@ async function getSafeUrl(filePath: string, isMain: boolean): Promise<string> {
         if (sigErr) {
             logger.warn(`[SafeURL] Rejected non-audio file: ${filePath} (${sigErr})`);
             return "";
+        }
+        if (verifyDecode && ensureAudio() && audioCtx) {
+            try { await audioCtx.decodeAudioData(arrayBuffer.slice(0)); }
+            catch {
+                logger.warn(`[SafeURL] Rejected undecodable file: ${filePath}`);
+                return "";
+            }
         }
         const blob = new Blob([arrayBuffer], { type: 'audio/mpeg' });
         return trackBlobUrl(URL.createObjectURL(blob), isMain);
@@ -394,7 +401,7 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
     if (autoMixBtn) autoMixBtn.classList.add('blending');
 
     engine.crossfade.reset();
-    const safeUrl = await getSafeUrl(playlist[nextIdx].path, false);
+    const safeUrl = await getSafeUrl(playlist[nextIdx].path, false, true);
     if (!safeUrl) {
         state.update({ isCrossfadeInProgress: false });
         updateControlsLock(false);
@@ -455,7 +462,8 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
         return;
     }
 
-    const duration = customDuration !== null ? customDuration : settings.autoMix.trackDuration;
+    const rawDuration = customDuration !== null ? customDuration : settings.autoMix.trackDuration;
+    const duration = Number.isFinite(rawDuration) ? Math.min(60, Math.max(0.5, rawDuration)) : settings.autoMix.trackDuration;
     const now = audioCtx.currentTime;
 
     // --- AUTOMATION: OUTGOING (Main) ---

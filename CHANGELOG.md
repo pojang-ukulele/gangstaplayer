@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased] — "Paranoid Audit Fixes (2026-09-07)"
+
+### 🛠️ 2026-09-07 batch (verified: `tsc --noEmit` clean, Jest 93/93 with `--coverage=false`)
+
+- **IPC hardening (`main.ts`)**: symlink-aware `fs:save-file` checks (`lstatSync` + `realpath` re-check), post-read oversize guard on `fs:read-file`, length-checked transition cache keys, per-channel rate limits (reads, writes, logs, dialogs, Sonetra, DB search), bounded `dialogReturnedPaths` (64) cleared on `window-all-closed`, single-window `activate` guard.
+- **Modal Escape wedge fixed**: topmost-modal resolution + confirm-modal Escape routes through the No-button path so the confirm queue drains; added Tab focus trap in `modals.ts`.
+- **Player/engine**: crossfade target decode-verified via `getSafeUrl(..., verifyDecode)`; crossfade duration clamped `0.5–60s`; `swapChannels` fully releases the retired element (`removeAttribute`+`load()`) and enforces unity gain on the promoted deck.
+- **Playlist**: non-audio drops rejected at add time (ext allowlist + path/name bounds); filter restore merges tracks added while filtered; delete fully releases deck sources; dblclick/ctxPlay generation-guarded; reorder aborts armed blends; re-init drops stale subscriptions.
+- **MIDI**: control-learn unbinds old CC; velocity uses `??` (muted stays muted); CC→settings throttled 60ms; device name persisted/restored; disconnect persists fallback; learn-timeout subscription deduped.
+- **Session/crash**: session rollback now covers pads + `masterBPM`/`isAutoMixEnabled`/`blendingIndex`; realm-safe size guard; 20s per-pad timeouts; waveform re-render after loop restore; crash snapshots version-checked, size-bounded, logged truthfully, single-timer init.
+- **Settings/keyboard/a11y**: AutoMix AI checkbox actuates the player engine; restore-defaults uses constants + re-applies output/MIDI; slider DOM max widened to match code clamps; Space/checkbox-range double-trigger and Delete/arrows focus-hijack fixed; toasts expose `role=status`/`aria-live`.
+- **Pipeline/misc**: recorder STOP ack 2s; worker `requestId` wraps + WAV length validated; LED bins fractional to FFT size; sampler `escapeAttr` covers quotes, orphaned voices stopped on context rebuild, `stopAllRecordings` skips cancel markers; gangsta-processor bypasses DSP at defaults; ANSI/OSC stripping covers hyperlink/charset/CSI; Sonetra fallback no longer logs paths; IPC types corrected (`null` returns, `restart-status` channel); `utils` array-like length bounded.
+
 ## [Unreleased] — "Paranoid Audit Follow-ups"
 
 ### ➕ 2026-09-06 batch (verified: `tsc --noEmit` clean, Jest 81/81 with `--coverage=false`)

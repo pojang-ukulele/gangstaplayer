@@ -29,6 +29,29 @@ export function openModal(modal: HTMLElement): void {
             }
         }, 50);
     }
+    // Focus trap: Tab cycles inside the topmost modal instead of escaping
+    // to the deck behind it.
+    if (!(modal as any).__ugTrapWired) {
+        (modal as any).__ugTrapWired = true;
+        modal.addEventListener('keydown', (e) => {
+            if (e.key !== 'Tab') return;
+            if (!modal.classList.contains('active')) return;
+            const focusables = Array.from(
+                modal.querySelectorAll<HTMLElement>('button, input, select, textarea, [tabindex]:not([tabindex="-1"])')
+            ).filter(el => !(el as HTMLInputElement).disabled && el.offsetParent !== null);
+            if (focusables.length === 0) { e.preventDefault(); return; }
+            const first = focusables[0];
+            const last = focusables[focusables.length - 1];
+            if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+            else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+        });
+    }
+}
+
+/** Topmost open modal in DOM order (last .active wins, not first). */
+export function getTopModal(): HTMLElement | null {
+    const actives = Array.from(document.querySelectorAll<HTMLElement>('.modal.active'));
+    return actives.length ? actives[actives.length - 1] : null;
 }
 
 /**

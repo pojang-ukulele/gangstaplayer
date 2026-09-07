@@ -35,7 +35,12 @@ class LogManager {
     public log(level: LogLevel, source: 'MAIN' | 'RENDERER', message: string) {
         if (!this.VALID_LEVELS.has(level as string)) level = 'INFO';
         if (source !== 'MAIN' && source !== 'RENDERER') source = 'MAIN';
-        let msg = String(message ?? '').replace(/[\r\n\x00-\x1F\x7F]+/g, ' ').replace(/\x1b\[[0-9;]*m/g, '').slice(0, 2000);
+        let msg = String(message ?? '')
+            .replace(/[\r\n\x00-\x1F\x7F]+/g, ' ')
+            .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+            .replace(/\x1b\([0-9A-Z]/g, '')
+            .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')
+            .slice(0, 2000);
         const timestamp = new Date().toISOString();
         const entry = `[${timestamp}] [${source}] [${level}] ${msg}\n`;
 

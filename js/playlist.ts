@@ -27,12 +27,21 @@ let contextMenu: HTMLElement | null = null;
 
 let loadTrackFn: ((index: number) => Promise<void>) | null = null;
 let playTrackFn: (() => void) | null = null;
+let _uiLoadGen = 0;
 let vScroller: VirtualScroller<Track> | null = null;
+let _playlistUnsubs: (() => void)[] | null = null;
 let _dbLoadGen = 0;
 let _isFiltering = false;
 const ITEM_HEIGHT = 26; // Pixels — compact single-line row
 
+let _playlistInit = false;
 export function initPlaylist(deps: PlaylistDeps): void {
+    if (_playlistInit) {
+        loadTrackFn = deps.loadTrack;
+        playTrackFn = deps.playTrack;
+        if (vScroller) { try { vScroller.destroy(); } catch { /* ignore */ } vScroller = null; }
+    }
+    _playlistInit = true;
     loadTrackFn = deps.loadTrack;
     playTrackFn = deps.playTrack;
     playlistEl = document.getElementById('playlist');
@@ -86,11 +95,16 @@ export function initPlaylist(deps: PlaylistDeps): void {
                     });
                 } else {
                     if (myGen !== searchGen) return;
-                    // Restore the stashed queue; fall back to DB only if no stash.
+                    // Restore the stashed queue, merging tracks added while
+                    // filtered (they went to the visible list, backup stale).
                     if (fullPlaylistBackup !== null) {
                         const restored = fullPlaylistBackup;
                         fullPlaylistBackup = null;
                         setFiltering(false);
+                        const liveIds = new Set(restored.map(t => t.id));
+                        for (const t of state.playlist) {
+                            if (t && t.id && !liveIds.has(t.id)) { restored.push(t); liveIds.add(t.id); }
+                        }
                         const curId = state.playlist[state.currentTrackIndex]?.id;
                         const newCur = curId ? restored.findIndex(t => t?.id === curId) : state.currentTrackIndex;
                         state.update({
@@ -113,17 +127,21 @@ export function initPlaylist(deps: PlaylistDeps): void {
     }
 
     // === REACTIVE SUBSCRIPTIONS ===
-    state.subscribe('playlist', (playlist) => {
-        if (vScroller) vScroller.updateItems(playlist);
-    });
-    
+    // Drop previous subscriptions on re-init so one selection change
+    // doesn't render N times via leaked closures.
     const refreshSelection = () => {
         if (vScroller) vScroller.refresh(true);
     };
-
-    state.subscribe('selectedIndices', refreshSelection);
-    state.subscribe('currentTrackIndex', refreshSelection);
-    state.subscribe('blendingIndex', refreshSelection);
+    if (_playlistUnsubs) { _playlistUnsubs.forEach(fn => { try { fn(); } catch { /* ignore */ } }); }
+    _playlistUnsubs = [
+    state.subscribe('playlist', (playlist) => {
+        if (vScroller) vScroller.updateItems(playlist);
+    }),
+    
+    state.subscribe('selectedIndices', refreshSelection),
+    state.subscribe('currentTrackIndex', refreshSelection),
+    state.subscribe('blendingIndex', refreshSelection),
+    ];
     
     // Initial vScroller setup (destroy previous on re-init / hot reload)
     if (playlistEl) {
@@ -258,14 +276,18 @@ export function addTracksToPlaylist(files: File[]): void {
     const uuid = (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function')
         ? () => crypto.randomUUID()
         : () => `id-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
+    const AUDIO_EXTS = new Set(['wav', 'mp3', 'ogg', 'flac', 'm4a', 'aac', 'webm']);
     files.forEach((file) => {
         const fullPath = window.electronAPI.getPathForFile(file);
         if (!fullPath) return; // non-file drop — don't create unplayable rows
+        if (fullPath.length > 32760) return;
+        const ext = fullPath.split('.').pop()?.toLowerCase() ?? '';
+        if (!AUDIO_EXTS.has(ext)) return; // reject non-audio at add time
         if (existingPaths.has(fullPath)) return; // dedup: same path, same song
         existingPaths.add(fullPath);
         const track: Track = {
             id: uuid(),
-            name: file.name,
+            name: String(file.name).slice(0, 512),
             path: fullPath,
             duration: 0,
             bpm: undefined
@@ -353,7 +375,9 @@ function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HT
             e.stopPropagation();
             const idx = parseInt(li.dataset.index || "0");
             if (loadTrackFn) {
+                const gen = ++_uiLoadGen;
                 loadTrackFn(idx).then(() => {
+                    if (gen !== _uiLoadGen) return; // superseded by newer click
                     if (playTrackFn) playTrackFn();
                 }).catch(err => console.error(`[Playlist] Load failed for ${idx}:`, err));
             }
@@ -482,7 +506,11 @@ export function renderPlaylist(): void {
  */
 function reorderPlaylist(fromIndex: number, toIndex: number, insertAfter: boolean): void {
     // Reordering under an armed finishCrossfade(nextIdx) promotes the wrong track.
-    if (state.isCrossfadeInProgress) return;
+    // Abort the blend first so the timer can't fire with a stale index.
+    if (state.isCrossfadeInProgress) {
+        try { abortCrossfade(); } catch { /* ignore */ }
+        try { toast.info('CROSSFADE ABORTED FOR REORDER'); } catch { /* ignore */ }
+    }
     // Reordering a filtered view would corrupt the real queue — clear search first.
     if (_isFiltering) {
         try { toast.info('CLEAR SEARCH BEFORE REORDERING'); } catch { /* ignore */ }
@@ -633,9 +661,9 @@ export function removeSelectedTracks(): void {
         // Kill audible playback of the removed track + abort any armed blend
         // that would otherwise promote the deleted channel on timer fire.
         try { engine.main.audio.pause(); } catch { /* ignore */ }
-        try { engine.main.audio.src = ""; } catch { /* ignore */ }
+        try { engine.main.audio.removeAttribute('src'); engine.main.audio.load(); } catch { try { engine.main.audio.src = ""; } catch { /* ignore */ } }
         try { engine.crossfade.audio.pause(); } catch { /* ignore */ }
-        try { engine.crossfade.audio.src = ""; } catch { /* ignore */ }
+        try { engine.crossfade.audio.removeAttribute('src'); engine.crossfade.audio.load(); } catch { try { engine.crossfade.audio.src = ""; } catch { /* ignore */ } }
         try { setBlendingIndex(-1); } catch { /* ignore */ }
         state.update({ isPlaying: false, masterBPM: 0, isCrossfadeInProgress: false });
     } else if (currentIndex >= 0) {
@@ -810,7 +838,9 @@ export function setupPlaylistHandlers(): void {
                  const idx = parseInt(idxStr);
                  if (!isNaN(idx) && idx >= 0 && idx < state.playlist.length) {
                      if (loadTrackFn) {
+                         const gen = ++_uiLoadGen;
                          loadTrackFn(idx).then(() => {
+                             if (gen !== _uiLoadGen) return;
                              if (playTrackFn) playTrackFn();
                          }).catch(() => undefined);
                      }

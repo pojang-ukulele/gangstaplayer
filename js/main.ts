@@ -280,9 +280,21 @@ function setupGlobalKeyboardShortcuts() {
                 return;
             }
             e.preventDefault();
-            // Try modals first
-            const activeModal = document.querySelector('.modal.active');
+            // Try modals first — topmost, not first in DOM order. The confirm
+            // modal must go through its No-button path so the queue drains;
+            // closeModal() directly would wedge _confirmOpen forever.
+            // Try modals first — topmost, not first in DOM order. The confirm
+            // modal must go through its No-button path so the queue drains;
+            // closeModal() directly would wedge _confirmOpen forever.
+            const topModal = (document.querySelectorAll('.modal.active').length
+                ? document.querySelectorAll('.modal.active')[document.querySelectorAll('.modal.active').length - 1]
+                : null) as HTMLElement | null;
+            const activeModal = topModal ?? document.querySelector('.modal.active');
             if (activeModal) {
+                if (activeModal.id === 'confirmModal') {
+                    const noBtn = document.getElementById('confirmNo') as HTMLElement | null;
+                    if (noBtn) { (noBtn as HTMLButtonElement).click(); return; }
+                }
                 import('./modals').then(({ closeModal }) => closeModal(activeModal as HTMLElement));
                 return;
             }
@@ -308,6 +320,9 @@ function setupGlobalKeyboardShortcuts() {
         if (tag === 'INPUT' && inputType === 'range' && (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'ArrowUp' || e.key === 'ArrowDown')) return;
         // Focused buttons: Space clicks natively — don't also toggle transport.
         if (tag === 'BUTTON' && e.code === 'Space') return;
+        // Focused checkboxes/ranges: Space toggles the control natively —
+        // must not also toggle transport or seek.
+        if (tag === 'INPUT' && (inputType === 'checkbox' || inputType === 'range') && e.code === 'Space') return;
 
         // Transport — blocked during AutoMix blending
         if (e.code === 'Space') {
@@ -335,8 +350,12 @@ function setupGlobalKeyboardShortcuts() {
             }
         }
         
-        // Playlist Navigation
+        // Playlist Navigation — only when focus is not inside an
+        // interactive control (buttons/inputs/selects), otherwise Delete or
+        // arrows hijack the focused control's native behavior.
         if (['ArrowUp', 'ArrowDown', 'Delete', 'Backspace'].includes(e.key)) {
+            if (tag === 'INPUT' || tag === 'BUTTON' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+            if (target?.isContentEditable) return;
             handlePlaylistNavigation(e);
         }
     });

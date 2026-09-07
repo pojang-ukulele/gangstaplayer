@@ -64,6 +64,24 @@ class GangstaProcessor extends GBaseProcessor {
     const targetCutoff = parameters.filterCutoff?.[0] ?? 20000;
     const resonance = parameters.filterResonance?.[0] ?? 0.1;
 
+    // Bypass: defaults mean bitcrusher/drive/filter are all no-ops. Running
+    // 2x oversample + ladder per sample anyway wastes CPU on every quantum.
+    const isBypass = targetBitDepth >= 15.5 && targetDrive <= 0.001
+        && targetCutoff >= 19900 && resonance <= 0.11
+        && this.smoothBitDepth >= 15.5 && this.smoothDrive <= 0.001 && this.smoothCutoff >= 19900;
+    if (isBypass) {
+        for (let channel = 0; channel < input.length; channel++) {
+            const chanIn = input[channel];
+            const chanOut = output[channel];
+            if (!chanIn || !chanOut) continue;
+            const m = Math.min(chanIn.length, chanOut.length);
+            for (let i = 0; i < m; i++) chanOut[i] = chanIn[i];
+            if (channel === 0) this.prevL = chanIn[n - 1] ?? this.prevL;
+            else if (channel === 1) this.prevR = chanIn[n - 1] ?? this.prevR;
+        }
+        return true;
+    }
+
     // OVERSAMPLING CONSTANTS
     const osRate = sampleRate * 2;
     // Clamp feedback: r up to 4.0 previously latched Infinity/NaN forever.

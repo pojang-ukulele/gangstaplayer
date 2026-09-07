@@ -56,6 +56,7 @@ interface CrashSnapshot {
 // === Internal State ===
 
 let _timer: ReturnType<typeof setInterval> | null = null;
+let _crashInit = false;
 let _lastSaveTime = 0;
 let _hasUnsavedChanges = false;
 
@@ -86,7 +87,10 @@ function loadFromStorage(key: string): CrashSnapshot | null {
     try {
         const raw = localStorage.getItem(key);
         if (!raw) return null;
-        return JSON.parse(raw) as CrashSnapshot;
+        if (raw.length > 4_000_000) { try { localStorage.removeItem(key); } catch { /* ignore */ } return null; }
+        const snap = JSON.parse(raw) as CrashSnapshot;
+        if (!snap || snap.version !== SNAPSHOT_VERSION) return null;
+        return snap;
     } catch (e) {
         logger.warn('[CrashRecovery] Failed to read snapshot', e);
         return null;
@@ -168,8 +172,10 @@ function saveSnapshot(reason?: string): void {
     if (ok) {
         _lastSaveTime = now;
         _hasUnsavedChanges = false;
+        logger.debug(`[CrashRecovery] Snapshot saved (${reason || 'periodic'})`);
+    } else {
+        logger.warn('[CrashRecovery] Snapshot save failed (quota?) — will retry');
     }
-    logger.debug(`[CrashRecovery] Snapshot saved (${reason || 'periodic'})`);
 }
 
 // === Restore Snapshot ===
@@ -259,17 +265,19 @@ export async function restoreSnapshot(): Promise<boolean> {
             if (Object.keys(updates).length > 0) state.update(updates);
         }
 
-        // 3. Restore sampler pads
+        // 3. Restore sampler pads (per-pad timeout: 16 missing files = slow fail)
+        const withTimeout = <T>(p: Promise<T>, ms: number): Promise<T> =>
+            Promise.race([p, new Promise<T>((_, rej) => setTimeout(() => rej(new Error('pad restore timeout')), ms))]);
         const padKeys = Object.keys(snapshot.pads);
         if (padKeys.length > 0) {
             for (const key of padKeys) {
                 const idx = parseInt(key);
                 const p = snapshot.pads[idx];
-                if (!p || !Number.isInteger(idx) || idx < 0 || idx > 15 || !p.path) continue;
+                if (!p || !Number.isInteger(idx) || idx < 0 || idx >= NUM_PADS || !p.path) continue;
                 // Don't claim padPaths before the file proves loadable —
                 // otherwise failures leave ghost paths with no buffer.
                 try {
-                    await loadSampleFromPath(p.path, idx);
+                    await withTimeout(loadSampleFromPath(p.path, idx), 20000);
                     padVolumes[idx] = (typeof p.vol === 'number' && Number.isFinite(p.vol)) ? Math.min(1, Math.max(0, p.vol)) : 0.75;
                     padBPMs[idx] = p.bpm || 0;
                     padSyncState[idx] = p.sync || false;
@@ -315,6 +323,9 @@ export async function restoreSnapshot(): Promise<boolean> {
 // === Initialization ===
 
 export function initCrashRecovery(): void {
+    if (_timer) { clearInterval(_timer); _timer = null; }
+    if (_crashInit) return;
+    _crashInit = true;
     // Subscribe to state changes for auto-save (suppressed during restore so
     // the restore itself doesn't re-dirty and resurrect cleared snapshots).
     state.subscribeAll(() => {
@@ -365,6 +376,7 @@ export function checkAndRestore(): Promise<boolean> {
         logger.info(`[CrashRecovery] Found snapshot from ${new Date(snapshot.timestamp).toLocaleString()} (${ageStr})`);
 
         if (!document.getElementById('confirmModal')) {
+            clearSnapshots();
             resolve(false);
             return;
         }

@@ -270,13 +270,22 @@ class AudioEngine {
         this.crossfade = temp;
 
         this.crossfade.audio.pause();
-        this.crossfade.audio.src = "";
+        try { this.crossfade.audio.removeAttribute('src'); this.crossfade.audio.load(); }
+        catch { try { this.crossfade.audio.src = ""; } catch { /* ignore */ } }
         // Retired deck must be silent for its next life as the incoming channel.
         try { if (this.crossfade.gain) this.crossfade.gain.gain.value = 0; } catch { /* ignore */ }
 
         // The loop flag was set on the retired element — re-apply it to the
         // promoted one or LOOP ONE silently stops working after any crossfade.
         this.main.audio.loop = (state.loopMode === 'one');
+        // Timer-vs-audio-clock drift can leave the promoted gain below 1 —
+        // enforce unity so the deck never gets stuck quiet after a swap.
+        try {
+            if (this.main.gain && audioCtx) {
+                this.main.gain.gain.cancelScheduledValues(audioCtx.currentTime);
+                this.main.gain.gain.setValueAtTime(1, audioCtx.currentTime);
+            }
+        } catch { /* ignore */ }
     }
 }
 

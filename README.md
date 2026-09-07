@@ -57,7 +57,7 @@
 
 ### 🛡️ SECURITY & RELIABILITY
 
-- **Path Validation:** All file I/O hardened against directory traversal, null-byte injection, and oversized payloads. Reads are restricted to media/kit file types (`wav/mp3/ogg/flac/m4a/aac/webm/json`); writes are limited to `.json`/`.wav` via dialog-approved paths or the app `recordings/` directory (database and log files are never writable from the renderer).
+- **Path Validation:** All file I/O hardened against directory traversal, null-byte injection, symlink swaps, and oversized payloads. Reads are restricted to media/kit file types (`wav/mp3/ogg/flac/m4a/aac/webm/json`); writes are limited to `.json`/`.wav` via dialog-approved paths or the app `recordings/` directory (database and log files are never writable from the renderer). Hot IPC channels are rate-limited and transition cache keys are length-checked.
 - **Lazy Audio Engine:** The AudioContext and sampler/deck signal chains build on first use and rebuild after a closed-context reset — a pre-gesture failure no longer bricks audio permanently.
 - **Session Integrity:** Session files carry a SHA-256 corruption-evidence checksum (not attacker-proof by design — no secret is stored); corrupt/edited files abort load.
 - **Single Instance Lock:** Only one app instance can run at a time (protects the track database).
@@ -65,6 +65,7 @@
 - **Audio Signature Validation:** Magic-number verification ensures only valid WAV/MP3/OGG/FLAC/M4A/WebM files are loaded.
 - **Worklet Race Protection:** Retry logic for AudioWorklet initialization prevents silent engine startup failures.
 - **Recoverable Audio Worker:** BPM/WAV worker crashes reject pending work with clear errors and respawn on demand — no permanent hangs.
+- **Modal Safety:** Dialogs trap Tab focus and Escape on confirmations routes through the proper dismiss path, so stacked prompts can never wedge the app.
 
 ---
 

@@ -25,6 +25,7 @@ export function setSelectedMidiDevice(id: string, name = ''): void {
     try {
         if (midiDeviceSelect) midiDeviceSelect.value = selectedMidiId;
     } catch { /* select may not contain the id yet */ }
+    try { persistMidiDevice(selectedMidiId, selectedMidiName); } catch { /* ignore */ }
 }
 
 function readPersistedMidiDevice(): string | null {
@@ -37,14 +38,19 @@ function readPersistedMidiDevice(): string | null {
     return null;
 }
 
-function persistMidiDevice(id: string): void {
+function persistMidiDevice(id: string, name = ''): void {
     try {
         const raw = localStorage.getItem('ug_settings');
         const s = raw ? JSON.parse(raw) : {};
         if (s && typeof s === 'object') {
             s.midiDevice = id.slice(0, 256);
+            if (name) s.midiDeviceName = name.slice(0, 256);
             localStorage.setItem('ug_settings', JSON.stringify(s));
         }
+    } catch { /* ignore */ }
+    try {
+        if (name) localStorage.setItem('ug_midi_name', name.slice(0, 256));
+        else if (selectedMidiName) localStorage.setItem('ug_midi_name', selectedMidiName.slice(0, 256));
     } catch { /* ignore */ }
 }
 
@@ -116,6 +122,8 @@ function loadMidiMappings(): void {
 
 // Auto-save whenever any mapping changes
 let _mappingUnsubs: (() => void)[] | null = null;
+let _learnUnsub: (() => void) | null = null;
+let _midiInit = false;
 
 function subscribeMappingAutoSave(): void {
     // Clean up previous subscriptions if any
@@ -142,6 +150,15 @@ export function initMIDI(deps: MidiDeps): void {
     
     const persistedMidi = readPersistedMidiDevice();
     if (persistedMidi) selectedMidiId = persistedMidi;
+    try {
+        const nm = localStorage.getItem('ug_midi_name');
+        if (nm && !selectedMidiName) selectedMidiName = nm.slice(0, 256);
+        if (!nm) {
+            const raw = localStorage.getItem('ug_settings');
+            const s = raw ? JSON.parse(raw) : null;
+            if (s && typeof s.midiDeviceName === 'string') selectedMidiName = s.midiDeviceName.slice(0, 256);
+        }
+    } catch { /* ignore */ }
 
     if (midiDeviceSelect) {
         midiDeviceSelect.addEventListener('change', (e) => {
@@ -159,8 +176,10 @@ export function initMIDI(deps: MidiDeps): void {
 
     // Learn modes previously never timed out — a stray click stranded the
     // app capturing every incoming note/CC until a successful bind.
+    // Guard re-init: duplicate subscriptions stacked duplicate 10s timers.
     let learnTimeout: ReturnType<typeof setTimeout> | null = null;
-    state.subscribe('isLearningMidi', (learning) => {
+    if (_learnUnsub) { try { _learnUnsub(); } catch { /* ignore */ } _learnUnsub = null; }
+    _learnUnsub = state.subscribe('isLearningMidi', (learning) => {
         if (learnTimeout) {
             clearTimeout(learnTimeout);
             learnTimeout = null;
@@ -228,6 +247,7 @@ function updateMidiStatus(midiAccess: WebMidi.MIDIAccess): void {
         selectedMidiId = 'all';
         selectedMidiName = '';
         try { midiDeviceSelect.value = 'all'; } catch { /* ignore */ }
+        try { persistMidiDevice('all', ''); } catch { /* ignore */ }
     }
     if (deviceCount > 0) {
         midiStatusEl.innerText = `MIDI: ON (${deviceCount})`;
@@ -272,6 +292,10 @@ function handleMidiLearn(cmd: number, data1: number) {
         for (const [cc, ctrlId] of Object.entries(newMap)) {
             if (Number(cc) === data1) delete newMap[Number(cc)];
         }
+        // 2. Unbind the control's old CC so one control can't accumulate many.
+        for (const cc of Object.keys(newMap)) {
+            if (newMap[Number(cc)] === target.id) delete newMap[Number(cc)];
+        }
         newMap[data1] = target.id as string;
         state.update({ controlMidiMap: newMap });
         toast.success(`${String(target.id).toUpperCase()} BOUND TO CC ${data1}`);
@@ -283,6 +307,13 @@ function handleMidiLearn(cmd: number, data1: number) {
 function updateControlFromMidi(targetId: string, value: number) {
     const el = document.getElementById(targetId) as HTMLInputElement;
     if (!el) return;
+    // Throttle: a knob sweep fires hundreds of CCs/sec; each input+change
+    // previously ran settings save + localStorage + IPC.
+    const now = Date.now();
+    const last = (updateControlFromMidi as any).__last?.[targetId] ?? 0;
+    const isFinal = value === 0 || value === 127;
+    if (!isFinal && now - last < 60) return;
+    ((updateControlFromMidi as any).__last ??= {})[targetId] = now;
     // Respect the slider's own range (tempo 0.5-1.5 vs volume 0-1).
     // Previously every CC was written as 0-1, parking tempo at the bottom.
     const min = parseFloat(el.min || '0');
@@ -324,7 +355,8 @@ function getMIDIMessage(message: any): void {
         if (Number.isInteger(padIndex) && padIndex >= 0 && padIndex <= 15 && startPadFn) {
             startPadFn(padIndex);
             if (activeVoicesRef && activeVoicesRef[padIndex] && activeVoicesRef[padIndex].gain && padVolumesRef) {
-                const vol = (data2 / 127) * (padVolumesRef[padIndex] || 1);
+                const base = padVolumesRef[padIndex] ?? 1;
+                const vol = (data2 / 127) * base;
                 try {
                     ensureAudio();
                     if (!audioCtx) return;

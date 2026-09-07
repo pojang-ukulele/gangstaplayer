@@ -11,17 +11,17 @@ export interface ElectronAPI {
     setFullScreen(flag: boolean): void;
     appReadyToShow(): void;
     openExternal(relativePath: string): Promise<void>;
-    saveKit(): Promise<string | undefined>;
-    saveSessionDialog(): Promise<string | undefined>;
-    loadKit(): Promise<string | undefined>;
+    saveKit(): Promise<string | null | undefined>;
+    saveSessionDialog(): Promise<string | null | undefined>;
+    loadKit(): Promise<string | null | undefined>;
     getPathForFile(file: File): string;
-    saveAudioDialog(): Promise<string | undefined>;
-    openSampleDialog(): Promise<string | undefined>;
-    generateCrashReport(snapshot: any): Promise<string>;
+    saveAudioDialog(): Promise<string | null | undefined>;
+    openSampleDialog(): Promise<string | null | undefined>;
+    generateCrashReport(snapshot: any): Promise<string | null | undefined>;
 }
 
 export interface FileSystemAPI {
-    readFile(filePath: string): Promise<Uint8Array>;
+    readFile(filePath: string): Promise<Uint8Array | null>;
     saveFile(filePath: string, data: Uint8Array): Promise<boolean>;
     saveRecording(buffer: ArrayBuffer, filename: string): Promise<string | null>;
     appendLog(level: string, message: string): Promise<void>;
@@ -33,7 +33,7 @@ export interface SonetraAPI {
     startServer(): Promise<{ success: boolean; error?: string }>;
     stopServer(): Promise<{ success: boolean }>;
     restartServer(): Promise<{ success: boolean; error?: string }>;
-    getStatus(): Promise<{ isRunning: boolean; port?: number; sonetraPath?: string; error?: string }>;
+    getStatus(): Promise<{ isRunning: boolean; port?: number; hasSonetraPath?: boolean; sonetraPath?: string; error?: string }>;
     createTransition(track1Path: string, track2Path: string, style: string): Promise<{ success: boolean; audioBuffer?: any; error?: string }>;
     analyzeTrack(trackPath: string): Promise<any>;
     getCachedTransition(track1Path: string, track2Path: string): Promise<{ success: boolean; audioBuffer?: any; error?: string }>;
@@ -91,6 +91,7 @@ export type IpcChannels =
     | 'db:get-track'
     | 'db:search-tracks'
     | 'db:get-all-tracks'
-    | 'dialog:save-session';
+    | 'dialog:save-session'
+    | 'sonetra:restart-status';
 
 export {};

@@ -61,11 +61,14 @@ export function updateSettings(patch: Partial<Settings>): void {
 }
 
 let setAutoMixEnabledFn: ((enabled: boolean) => void) | null = null;
+let _settingsInit = false;
 
 // openModal/closeModal imported from modals.ts
 
 export function initSettings(deps: { setAutoMixEnabled: (enabled: boolean) => void }): void {
     setAutoMixEnabledFn = deps.setAutoMixEnabled;
+    if (_settingsInit) { loadSettings(); return; }
+    _settingsInit = true;
     const settingsBtn = document.getElementById('settingsBtn');
     const settingsModal = document.getElementById('settingsModal');
     const closeSettings = document.getElementById('closeSettings');
@@ -221,6 +224,13 @@ function updateSliderUI(sliderId: string, labelId: string, val: number): void {
     const slider = document.getElementById(sliderId) as HTMLInputElement;
     const label = document.getElementById(labelId);
     if (slider && label) {
+        // DOM max (20/8) disagrees with code clamp (60/30): widen the control
+        // so restored session values aren't silently clamped by the browser.
+        try {
+            const isTrack = sliderId === 'sliderTrackFade';
+            slider.max = isTrack ? '60' : '30';
+            slider.min = '0.5';
+        } catch { /* ignore */ }
         slider.value = val.toString();
         label.innerText = val.toFixed(1) + 's';
     }
@@ -247,12 +257,20 @@ export function setupSettingsHandlers(): void {
         applyOutputDevice(outputSelect.value);
     });
 
-    // Auto-save on any change (via updateSettings so persistence is unified)
+    // Auto-save on any change (via updateSettings so persistence is unified).
+    // Route AutoMix checkbox changes into the player engine — previously the
+    // settings UI never actuated it (dead setAutoMixEnabledFn signal).
     const inputs = ['fullScreenToggle', 'mixOptEQCrossfade', 'mixOptFilterSweep', 'mixOptHPFSweep', 'mixOptBPMSync', 'mixOptEnableAI'];
     inputs.forEach(id => {
         const el = document.getElementById(id);
         if (el) el.addEventListener('change', () => updateSettings({}));
     });
+    const autoMixBtn = document.getElementById('autoMixBtn');
+    const mixAiCb = document.getElementById('mixOptEnableAI') as HTMLInputElement | null;
+    if (mixAiCb) mixAiCb.addEventListener('change', () => {
+        try { if (setAutoMixEnabledFn) setAutoMixEnabledFn(mixAiCb.checked); } catch { /* ignore */ }
+    });
+    void autoMixBtn;
 
     setupDurationSlider('sliderTrackFade', 'valTrackFade', true);
     setupDurationSlider('sliderBtnFade', 'valBtnFade', false);
@@ -271,12 +289,18 @@ export function setupSettingsHandlers(): void {
                     filterSweep: true,
                     hpfSweep: true,
                     bpmSync: false,
-                    trackDuration: 10.0,
-                    btnDuration: 4.0,
+                    trackDuration: DEFAULT_TRACK_DURATION_S,
+                    btnDuration: DEFAULT_BTN_DURATION_S,
                     enableAI: false
                 };
                 saveSettings();
                 applySettingsToUI();
+                try { applyOutputDevice(_settings.outputDevice); } catch { /* ignore */ }
+                try {
+                    void import('./midi').then((m) => {
+                        try { m.setSelectedMidiDevice('all'); } catch { /* ignore */ }
+                    }).catch(() => undefined);
+                } catch { /* ignore */ }
                 toast.success("SETTINGS RESTORED TO DEFAULTS");
             });
         });

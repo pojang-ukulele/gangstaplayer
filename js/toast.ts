@@ -26,6 +26,8 @@ export const toast: ToastSystem = {
         this.container = document.createElement('div');
         this.container.id = 'toastContainer';
         this.container.className = 'toast-container';
+        this.container.setAttribute('role', 'status');
+        this.container.setAttribute('aria-live', 'polite');
         document.body.appendChild(this.container);
     },
     
@@ -64,9 +66,10 @@ export const toast: ToastSystem = {
         // Animation end cleanup
         (toastEl as unknown as Record<string, number>).__ugToastAt = Date.now();
         const timer = setTimeout(() => {
+            if (!toastEl.isConnected) return;
             toastEl.classList.add('fade-out');
             setTimeout(() => {
-                toastEl.remove();
+                if (toastEl.isConnected) toastEl.remove();
             }, 500);
         }, duration);
         (toastEl as any).__ugToastTimer = timer;

@@ -54,7 +54,7 @@ export class HighFidelityRecorder {
             const timeout = setTimeout(() => {
                 cleanup();
                 resolve(); // proceed with what we have rather than hanging
-            }, 500);
+            }, 2000);
             const cleanup = () => {
                 clearTimeout(timeout);
                 if (this.stopAckHandler && this.node) {

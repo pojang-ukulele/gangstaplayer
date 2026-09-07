@@ -29,6 +29,8 @@ class GangstaLogger {
     private ringBuffer: LogEntry[] = [];
     private minLevel: LogLevel = 'DEBUG';
     private sessionId: string;
+    private _lastDiskWrite = 0;
+    private _diskDropped = 0;
 
     constructor() {
         this.sessionId = this._generateSessionId();
@@ -93,7 +95,7 @@ class GangstaLogger {
         return 'UNKNOWN';
     }
 
-    async generateCrashReport(stateSnapshot: Record<string, unknown>): Promise<string | undefined> {
+    async generateCrashReport(stateSnapshot: Record<string, unknown>): Promise<string | null | undefined> {
         if (window.electronAPI?.generateCrashReport) {
             try {
                 const reportPath = await window.electronAPI.generateCrashReport(stateSnapshot);
@@ -147,8 +149,14 @@ class GangstaLogger {
         if (typeof consoleFn === 'function') consoleFn(`[${entry.level}] ${entry.message}`);
 
         // Persist to disk via Electron Bridge (skip DEBUG — high-frequency
-        // debug spam previously IPC-flooded the main process on every frame)
+        // debug spam previously IPC-flooded the main process on every frame).
+        // Throttle INFO: drum-roll mousedown/click storms emit one IPC each.
         if (entry.level !== 'DEBUG' && window.fileSystem?.appendLog) {
+            if (entry.level === 'INFO') {
+                const now = Date.now();
+                if (now - this._lastDiskWrite < 200) { this._diskDropped++; return; }
+                this._lastDiskWrite = now;
+            }
             window.fileSystem.appendLog(entry.level, entry.message).catch(() => {});
         }
     }

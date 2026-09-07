@@ -107,24 +107,35 @@ function setupScrews(): void {
 }
 
 const updateLEDs = throttle((dataArray: Uint8Array, leds: HTMLElement[]) => {
+    // Bins scale with fftSize/sampleRate — use fractions, not hardcoded bins.
+    const n = dataArray.length || 1;
+    const bassEnd = Math.max(2, Math.floor(n * 0.04));
+    const midStart = Math.floor(n * 0.08);
+    const midEnd = Math.floor(n * 0.24);
+    const highStart = Math.floor(n * 0.6);
+    const highEnd = Math.floor(n * 0.94);
     let bassSum = 0, midSum = 0, highSum = 0;
-    for (let i = 0; i < 5; i++) bassSum += dataArray[i];
-    for (let i = 10; i < 30; i++) midSum += dataArray[i];
-    for (let i = 80; i < 120; i++) highSum += dataArray[i];
+    for (let i = 0; i < bassEnd; i++) bassSum += dataArray[i];
+    for (let i = midStart; i < midEnd; i++) midSum += dataArray[i];
+    for (let i = highStart; i < highEnd; i++) highSum += dataArray[i];
+    const bassN = Math.max(1, bassEnd);
+    const midN = Math.max(1, midEnd - midStart);
+    const highN = Math.max(1, highEnd - highStart);
 
     if (leds.length >= 6) {
-        leds[0].classList.toggle('lit', (bassSum / 5) > BASS_THRESHOLD);
-        leds[5].classList.toggle('lit', (bassSum / 5) > BASS_THRESHOLD);
-        leds[1].classList.toggle('lit', (midSum / 20) > MID_THRESHOLD);
-        leds[4].classList.toggle('lit', (midSum / 20) > MID_THRESHOLD);
-        leds[2].classList.toggle('lit', (highSum / 40) > HIGH_THRESHOLD);
-        leds[3].classList.toggle('lit', (highSum / 40) > HIGH_THRESHOLD);
+        leds[0].classList.toggle('lit', (bassSum / bassN) > BASS_THRESHOLD);
+        leds[5].classList.toggle('lit', (bassSum / bassN) > BASS_THRESHOLD);
+        leds[1].classList.toggle('lit', (midSum / midN) > MID_THRESHOLD);
+        leds[4].classList.toggle('lit', (midSum / midN) > MID_THRESHOLD);
+        leds[2].classList.toggle('lit', (highSum / highN) > HIGH_THRESHOLD);
+        leds[3].classList.toggle('lit', (highSum / highN) > HIGH_THRESHOLD);
     }
 }, 100);
 
 function masterLoop(): void {
     _rafHandle = requestAnimationFrame(masterLoop);
-    // Skip expensive processing when tab is hidden
+    // Skip expensive processing when tab is hidden (still reschedules, but
+    // does no analyser reads, DOM writes, or allocations).
     if (document.hidden) return;
     const an = analyser;
     const buf = ensureDataArray();

@@ -142,8 +142,23 @@ if (!gotLock) {
 }
 
 function registerIpcHandlers(): void {
+  // Simple per-channel rate limiter to blunt IPC spam DoS.
+  // Defined first: dialog handlers below already reference it.
+  const lastCall = new Map<string, number>();
+  const rateLimited = (key: string, minMs: number): boolean => {
+    const now = Date.now();
+    const prev = lastCall.get(key) ?? 0;
+    if (now - prev < minMs) return true;
+    lastCall.set(key, now);
+    // Bound the map: unbounded keys = memory growth via crafted channels.
+    if (lastCall.size > 64) {
+      const oldest = lastCall.keys().next().value;
+      if (oldest) lastCall.delete(oldest);
+    }
+    return false;
+  };
   // ==================== WINDOW CONTROL HANDLERS ====================
-  ipcMain.on('app:minimize', () => { getMainWindow()?.minimize(); });
+  ipcMain.on('app:minimize', () => { if (!rateLimited('app:minimize', 100)) getMainWindow()?.minimize(); });
   ipcMain.on('app:maximize', () => {
     const win = getMainWindow();
     if (!win) return;
@@ -180,6 +195,7 @@ function registerIpcHandlers(): void {
   });
 
   ipcMain.handle('dialog:save-kit', async () => {
+    if (rateLimited('dialog:save-kit', 500)) return null;
     const win = getMainWindow();
     if (!win) return null;
     const { canceled, filePath } = await dialog.showSaveDialog(win, {
@@ -189,7 +205,11 @@ function registerIpcHandlers(): void {
     });
     if (canceled || !filePath) return null;
     const v = validatePath(filePath);
-    if (v) dialogReturnedPaths.add(v);
+    if (v) {
+      // Bound the allowlist: unbounded Set + stale entries across reloads.
+      if (dialogReturnedPaths.size > 64) dialogReturnedPaths.clear();
+      dialogReturnedPaths.add(v);
+    }
     return filePath;
   });
 
@@ -197,6 +217,7 @@ function registerIpcHandlers(): void {
   // renderer never has to mutate the dialog-returned path (which would
   // desync it from the write allowlist).
   ipcMain.handle('dialog:save-session', async () => {
+    if (rateLimited('dialog:save-session', 500)) return null;
     const win = getMainWindow();
     if (!win) return null;
     const { canceled, filePath } = await dialog.showSaveDialog(win, {
@@ -206,11 +227,15 @@ function registerIpcHandlers(): void {
     });
     if (canceled || !filePath) return null;
     const v = validatePath(filePath);
-    if (v) dialogReturnedPaths.add(v);
+    if (v) {
+      if (dialogReturnedPaths.size > 64) dialogReturnedPaths.clear();
+      dialogReturnedPaths.add(v);
+    }
     return filePath;
   });
 
   ipcMain.handle('dialog:load-kit', async () => {
+    if (rateLimited('dialog:load-kit', 500)) return null;
     const win = getMainWindow();
     if (!win) return null;
     const { canceled, filePaths } = await dialog.showOpenDialog(win, {
@@ -224,6 +249,7 @@ function registerIpcHandlers(): void {
   });
 
   ipcMain.handle('dialog:save-audio', async () => {
+    if (rateLimited('dialog:save-audio', 500)) return null;
     const win = getMainWindow();
     if (!win) return null;
     const { canceled, filePath } = await dialog.showSaveDialog(win, {
@@ -233,24 +259,26 @@ function registerIpcHandlers(): void {
     });
     if (canceled || !filePath) return null;
     const v = validatePath(filePath);
-    if (v) dialogReturnedPaths.add(v);
+    if (v) {
+      if (dialogReturnedPaths.size > 64) dialogReturnedPaths.clear();
+      dialogReturnedPaths.add(v);
+    }
     return filePath;
   });
 
   // Secure File System Handlers
-  // Simple per-channel rate limiter to blunt IPC spam DoS.
-  const lastCall = new Map<string, number>();
-  const rateLimited = (key: string, minMs: number): boolean => {
-    const now = Date.now();
-    const prev = lastCall.get(key) ?? 0;
-    if (now - prev < minMs) return true;
-    lastCall.set(key, now);
-    return false;
-  };
   const inFlightPrecompute = new Set<string>();
-  const normalizeCacheKey = (a: string, b: string): string =>
-    `${path.resolve(String(a ?? '')).toLowerCase()}||${path.resolve(String(b ?? '')).toLowerCase()}`;
+  const normalizeCacheKey = (a: string, b: string): string => {
+    const sa = String(a ?? '').slice(0, 32760);
+    const sb = String(b ?? '').slice(0, 32760);
+    return `${path.resolve(sa).toLowerCase()}||${path.resolve(sb).toLowerCase()}`;
+  };
+  function checkCacheKeyArgs(a: unknown, b: unknown): boolean {
+    return typeof a === 'string' && typeof b === 'string'
+      && a.length > 0 && b.length > 0 && a.length <= 32760 && b.length <= 32760;
+  }
   ipcMain.handle('fs:save-file', async (_event, pathStr: string, data: Uint8Array) => {
+    if (rateLimited('fs:save-file', 100)) return false;
     const validated = validatePath(pathStr);
     if (!validated) {
       logToDisk('ERROR', `Security: Blocked illegal write attempt to ${pathStr}`);
@@ -267,6 +295,21 @@ function registerIpcHandlers(): void {
     try {
       // Resolve symlinks at write time — a symlink swapped in after the dialog
       // must not redirect the write to gangsta.db / logs.
+      // TOCTOU: also reject pre-existing symlinks outright via lstat so the
+      // check and the write cannot straddle a swap.
+      try {
+        const lst = fs.lstatSync(validated);
+        if (lst.isSymbolicLink()) {
+          const real = fs.realpathSync.native(validated);
+          if (!isSavePathAllowed(real) || SAVE_BLOCKED_BASENAMES.has(path.basename(real).toLowerCase())) {
+            logToDisk('ERROR', `Security: Blocked symlink write ${validated} -> ${real}`);
+            return false;
+          }
+        } else {
+          const real = fs.realpathSync.native(path.dirname(validated));
+          void real;
+        }
+      } catch { /* target may not exist yet — lexical check already passed */ }
       try {
         const real = fs.realpathSync.native(validated);
         if (real !== validated && !isSavePathAllowed(real)) {
@@ -289,6 +332,7 @@ function registerIpcHandlers(): void {
   });
 
   ipcMain.handle('fs:read-file', async (_event, pathStr: string) => {
+    if (rateLimited('fs:read-file', 50)) return null;
     const validated = validatePath(pathStr);
     if (!validated) {
       logToDisk('ERROR', `Security: Blocked illegal read attempt from ${pathStr}`);
@@ -328,6 +372,10 @@ function registerIpcHandlers(): void {
         return null;
       }
       const buffer = await fs.promises.readFile(checkPath);
+      if (buffer.byteLength > MAX_FILE_SIZE_BYTES) {
+        logToDisk('ERROR', `Security: Blocked read with post-read oversize ${validated}`);
+        return null;
+      }
       return buffer;
     } catch (err) {
       logToDisk('ERROR', `Security: Read failed for ${validated}: ${err}`);
@@ -390,11 +438,17 @@ function registerIpcHandlers(): void {
 
   // Persistent Logging Handlers
   ipcMain.handle('fs:append-log', async (_event, level: string, message: string) => {
+    if (rateLimited('fs:append-log', 50)) return false;
     const allowed: ReadonlySet<string> = new Set(['INFO', 'WARN', 'ERROR', 'DEBUG']);
     const lvl = allowed.has(String(level)) ? (level as LogLevel) : 'INFO';
     let msg = String(message ?? '');
     // Strip control chars/newlines to block log forgery + ANSI injection; cap length.
-    msg = msg.replace(/[\r\n\x00-\x1F\x7F]+/g, ' ').replace(/\x1b\[[0-9;]*m/g, '').slice(0, 2000);
+    // Covers SGR, cursor/charset, and OSC hyperlink sequences (not just colors).
+    msg = msg.replace(/[\r\n\x00-\x1F\x7F]+/g, ' ')
+      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+      .replace(/\x1b\([0-9A-Z]/g, '')
+      .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')
+      .slice(0, 2000);
     logManager.log(lvl, 'RENDERER', msg);
     return true;
   });
@@ -419,6 +473,7 @@ function registerIpcHandlers(): void {
   });
 
   ipcMain.handle('dialog:open-sample', async () => {
+    if (rateLimited('dialog:open-sample', 500)) return null;
     const win = getMainWindow();
     if (!win) return null;
     const { canceled, filePaths } = await dialog.showOpenDialog(win, {
@@ -452,6 +507,7 @@ function registerIpcHandlers(): void {
   });
 
   ipcMain.handle('sonetra:create-transition', async (_event, track1Path: string, track2Path: string, style: string) => {
+    if (rateLimited('sonetra:create-transition', 2000)) return { success: false, error: 'Rate limited' };
     if (typeof track1Path !== 'string' || typeof track2Path !== 'string') return { success: false, error: 'Bad paths' };
     if (track1Path.length > 32760 || track2Path.length > 32760) return { success: false, error: 'Path too long' };
     const s = typeof style === 'string' ? style.slice(0, 32) : 'smooth';
@@ -459,6 +515,7 @@ function registerIpcHandlers(): void {
   });
 
   ipcMain.handle('sonetra:analyze-track', async (_event, trackPath: string) => {
+    if (rateLimited('sonetra:analyze-track', 1000)) return { success: false, error: 'Rate limited' };
     if (typeof trackPath !== 'string' || !trackPath || trackPath.length > 32760) {
       return { success: false, error: 'Bad path' };
     }
@@ -466,8 +523,11 @@ function registerIpcHandlers(): void {
   });
 
   ipcMain.handle('sonetra:get-cached-transition', async (_event, track1Path: string, track2Path: string) => {
-    if (typeof track1Path !== 'string' || typeof track2Path !== 'string') {
+    if (!checkCacheKeyArgs(track1Path, track2Path)) {
       return { success: false, error: 'Bad paths' };
+    }
+    if (rateLimited('sonetra:get-cached-transition', 250)) {
+      return { success: false, error: 'Rate limited' };
     }
     const cacheKey = normalizeCacheKey(track1Path, track2Path);
     const cached = transitionCache.get(cacheKey);
@@ -482,8 +542,11 @@ function registerIpcHandlers(): void {
   });
 
   ipcMain.handle('sonetra:precompute-transition', async (_event, track1Path: string, track2Path: string) => {
-    if (typeof track1Path !== 'string' || typeof track2Path !== 'string') {
+    if (!checkCacheKeyArgs(track1Path, track2Path)) {
       return { success: false, error: 'Bad paths' };
+    }
+    if (rateLimited('sonetra:precompute-transition', 1000)) {
+      return { success: false, error: 'Rate limited' };
     }
     const cacheKey = normalizeCacheKey(track1Path, track2Path);
     if (transitionCache.has(cacheKey)) {
@@ -542,6 +605,7 @@ function registerIpcHandlers(): void {
   });
 
   ipcMain.handle('db:search-tracks', async (_event, query) => {
+    if (rateLimited('db:search-tracks', 100)) return [];
     try {
       const q = String(query ?? '').slice(0, 256);
       const db = getDbManager();
@@ -615,11 +679,13 @@ app.whenReady().then(() => {
 });
 
 app.on('window-all-closed', () => {
+  dialogReturnedPaths.clear();
   if (process.platform !== 'darwin') app.quit()
 });
 
 app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0) createWindow()
+  if (BrowserWindow.getAllWindows().length === 0) createWindow();
+  else { getMainWindow()?.focus(); }
 });
 
 // GURU CRASH PROTECTION — registered once; report is written before exit.

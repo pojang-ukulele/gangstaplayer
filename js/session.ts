@@ -115,7 +115,7 @@ export async function saveSession(): Promise<void> {
         // .session.json extension. Rewriting the returned path (the old
         // approach) desynced it from the main-process write allowlist and
         // every save silently failed while claiming success.
-        let filePath: string | undefined;
+        let filePath: string | null | undefined;
         if (window.electronAPI?.saveSessionDialog) {
             filePath = await window.electronAPI.saveSessionDialog();
             if (!filePath) return;
@@ -202,6 +202,10 @@ export async function loadSession(): Promise<void> {
         currentTrackIndex: number;
         loopMode: LoopMode;
         playbackMode: PlaybackMode;
+        masterBPM: number;
+        isAutoMixEnabled: boolean;
+        blendingIndex: number;
+        pads: Array<{ buf: AudioBuffer | undefined; path: string; vol: number; bpm: number; sync: boolean; ls: number; le: number }>;
     } | null = null;
     const restoreRollback = () => {
         if (!rollback) return;
@@ -213,11 +217,23 @@ export async function loadSession(): Promise<void> {
                 isPlaying: false,
                 loopMode: rollback.loopMode,
                 playbackMode: rollback.playbackMode,
+                masterBPM: rollback.masterBPM,
+                isAutoMixEnabled: rollback.isAutoMixEnabled,
+                blendingIndex: rollback.blendingIndex,
+            });
+            rollback.pads.forEach((p, i) => {
+                if (p.buf) padBuffers[i] = p.buf;
+                padPaths[i] = p.path;
+                padVolumes[i] = p.vol;
+                padBPMs[i] = p.bpm;
+                padSyncState[i] = p.sync;
+                padLoopStart[i] = p.ls;
+                padLoopEnd[i] = p.le;
             });
         } catch { /* best-effort */ }
     };
     try {
-        let filePath: string | undefined;
+        let filePath: string | null | undefined;
 
         if (window.electronAPI?.loadKit) {
             filePath = await window.electronAPI.loadKit();
@@ -234,7 +250,9 @@ export async function loadSession(): Promise<void> {
         }
 
         const rawData = await fs.readFile(filePath);
-        if (!rawData || (rawData as Uint8Array).byteLength > 25 * 1024 * 1024) {
+        const rawLen = (rawData as unknown as { byteLength?: number; length?: number })?.byteLength
+            ?? (rawData as unknown as { length?: number })?.length ?? 0;
+        if (!rawData || rawLen > 25 * 1024 * 1024) {
             toast.error("SESSION FILE TOO LARGE OR UNREADABLE");
             return;
         }
@@ -261,12 +279,25 @@ export async function loadSession(): Promise<void> {
 
         // 1. Snapshot current state first — a failed kit restore must not
         // destroy the working kit with no rollback.
+        const padSnap = Array.from({ length: NUM_PADS }, (_, i) => ({
+            buf: padBuffers[i],
+            path: padPaths[i] ?? '',
+            vol: padVolumes[i] ?? 0.75,
+            bpm: padBPMs[i] ?? 0,
+            sync: !!padSyncState[i],
+            ls: padLoopStart[i] ?? -1,
+            le: padLoopEnd[i] ?? -1,
+        }));
         rollback = {
             playlist: [...state.playlist],
             selectedIndices: [...state.selectedIndices],
             currentTrackIndex: state.currentTrackIndex,
             loopMode: state.loopMode,
             playbackMode: state.playbackMode,
+            masterBPM: state.masterBPM,
+            isAutoMixEnabled: state.isAutoMixEnabled,
+            blendingIndex: state.blendingIndex,
+            pads: padSnap,
         };
         state.update({
             playlist: [],
@@ -301,12 +332,15 @@ export async function loadSession(): Promise<void> {
             }
 
             // Sequential loads: 16 parallel decodeAudioData of arbitrary files OOMs.
+            // Per-pad timeout so one huge/missing file can't stall the restore.
+            const withTimeout = <T>(p: Promise<T>, ms: number): Promise<T> =>
+                Promise.race([p, new Promise<T>((_, rej) => setTimeout(() => rej(new Error('pad load timeout')), ms))]);
             for (const p of session.kit.pads.slice(0, NUM_PADS)) {
                 const idx = Number((p as SessionPad)?.index);
                 const ppath = typeof (p as SessionPad)?.path === 'string' ? (p as SessionPad).path.slice(0, 32760) : '';
-                if (!ppath || !Number.isInteger(idx) || idx < 0 || idx > 15) continue;
+                if (!ppath || !Number.isInteger(idx) || idx < 0 || idx >= NUM_PADS) continue;
                 try {
-                    await loadSampleFromPath(ppath, idx);
+                    await withTimeout(loadSampleFromPath(ppath, idx), 20000);
                     const vol = (p as SessionPad).vol;
                     if (typeof vol === 'number' && Number.isFinite(vol)) padVolumes[idx] = Math.min(1, Math.max(0, vol));
                     const bpm = (p as SessionPad).bpm;
@@ -321,6 +355,10 @@ export async function loadSession(): Promise<void> {
                     const grid = document.getElementById('padGrid');
                     const slider = grid?.children[idx]?.querySelector('.pad-slider') as HTMLInputElement;
                     if (slider) slider.value = padVolumes[idx].toString();
+                    try {
+                        const { renderWaveform } = await import('./sampler');
+                        renderWaveform(idx);
+                    } catch { /* ignore */ }
                 } catch { /* per-pad failure is non-fatal */ }
             }
         }

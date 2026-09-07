@@ -1,6 +1,7 @@
 /**
  * Shared utility functions
  */
+import { MAX_FILE_SIZE_BYTES } from './constants';
 
 /**
  * Normalize IPC buffer data to a clean ArrayBuffer.
@@ -36,8 +37,12 @@ export function normalizeToArrayBuffer(data: any): ArrayBuffer {
         if (data.buffer && isArrayBuffer(data.buffer)) {
             return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
         }
-        // If it's array-like but not a TypedArray, try to convert efficiently
+        // If it's array-like but not a TypedArray, try to convert efficiently.
+        // Bound: crafted {length: 1e9} objects previously allocated blindly.
         if (typeof data.length === 'number' && data.length > 0) {
+            if (!Number.isInteger(data.length) || data.length > MAX_FILE_SIZE_BYTES) {
+                throw new Error('normalizeToArrayBuffer: array-like length out of bounds');
+            }
             const bytes = new Uint8Array(data.length);
             for (let i = 0; i < data.length; i++) {
                 bytes[i] = data[i];
