@@ -90,7 +90,9 @@ function getWorker(): Worker {
 }
 
 function post(kind: RequestKind, buildMessage: (id: number) => { type: string; payload: any }, transfer: Transferable[], timeoutMs = 30000): Promise<any> {
-    requestId = (requestId + 1) % 1000000000;
+    do {
+        requestId = (requestId + 1) % 1000000000;
+    } while (pendingRequests.has(requestId));
     const id = requestId;
     return new Promise((resolve, reject) => {
         const timer = setTimeout(() => {
@@ -150,7 +152,7 @@ export function detectBPMWorker(audioBuffer: AudioBuffer, options?: { threshold?
             minStepSeconds: options?.minStepSeconds ?? BPM_MIN_STEP_SECONDS
         },
         id
-    }), [data.buffer]).then((bpm) => typeof bpm === 'number' ? bpm : 0);
+    }), [data.buffer]).then((bpm) => typeof bpm === 'number' && bpm > 0 ? bpm : 0);
 }
 /**
  * Convert an AudioBuffer (or pre-built channel object) to a WAV Blob using a worker.

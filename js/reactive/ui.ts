@@ -76,7 +76,11 @@ export class VirtualScroller<T> {
         this.refresh(true);
     }
 
+    private _refreshing = false;
     public refresh(force = false) {
+        if (this._refreshing) return;
+        this._refreshing = true;
+        try {
         const scrollTop = this.container.scrollTop;
         const viewportHeight = this.container.clientHeight;
         const startIdx = Math.max(0, Math.floor(scrollTop / this.itemHeight) - 5);
@@ -123,6 +127,7 @@ export class VirtualScroller<T> {
                 this.visibleItems.set(i, el);
             }
         }
+        } finally { this._refreshing = false; }
     }
 
     public scrollTo(index: number) {

@@ -106,7 +106,6 @@ function loadMidiMappings(): void {
                 if (typeof v !== 'string' || !v) continue;
                 const id = v.slice(0, 64);
                 if (!/^[A-Za-z0-9_-]+$/.test(id)) continue;
-                if (!document.getElementById(id)) continue;
                 cleanCtrl[cc] = id;
             }
             patch.controlMidiMap = cleanCtrl;

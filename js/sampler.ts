@@ -860,13 +860,18 @@ function stopRecording(index: number): void {
 /** Abort all in-flight pad recordings and release mic streams (unload safety). */
 export function stopAllRecordings(): void {
     for (const key of Object.keys(activeRecorders)) {
-        if (key.startsWith('__cancel_') || key === '__pending__') continue;
+        if (key.startsWith('__cancel_')) continue;
         const idx = Number(key);
         if (!Number.isInteger(idx)) continue;
         try {
-            const rec = activeRecorders[idx];
-            if (rec && rec.state !== 'inactive') {
-                try { rec.stop(); } catch { /* ignore */ }
+            const rec: any = (activeRecorders as any)[idx];
+            if (rec === '__pending__') {
+                (activeRecorders as any)[`__cancel_${idx}`] = true;
+                delete (activeRecorders as any)[idx];
+                continue;
+            }
+            if (rec && (rec as MediaRecorder).state !== 'inactive') {
+                try { (rec as MediaRecorder).stop(); } catch { /* ignore */ }
             } else {
                 delete activeRecorders[idx];
             }

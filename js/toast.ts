@@ -51,6 +51,8 @@ export const toast: ToastSystem = {
             try {
                 const t = (first as any)?.__ugToastTimer;
                 if (t) clearTimeout(t);
+                const t2 = (first as any)?.__ugToastFadeTimer;
+                if (t2) clearTimeout(t2);
             } catch { /* ignore */ }
             first?.remove();
         }
@@ -68,9 +70,10 @@ export const toast: ToastSystem = {
         const timer = setTimeout(() => {
             if (!toastEl.isConnected) return;
             toastEl.classList.add('fade-out');
-            setTimeout(() => {
+            const fade = setTimeout(() => {
                 if (toastEl.isConnected) toastEl.remove();
             }, 500);
+            (toastEl as any).__ugToastFadeTimer = fade;
         }, duration);
         (toastEl as any).__ugToastTimer = timer;
     },

@@ -376,7 +376,6 @@ export function checkAndRestore(): Promise<boolean> {
         logger.info(`[CrashRecovery] Found snapshot from ${new Date(snapshot.timestamp).toLocaleString()} (${ageStr})`);
 
         if (!document.getElementById('confirmModal')) {
-            clearSnapshots();
             resolve(false);
             return;
         }

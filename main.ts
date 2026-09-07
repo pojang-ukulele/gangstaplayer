@@ -35,7 +35,21 @@ function addToCache(key: string, value: Buffer) {
  * Tracks paths returned by native save dialogs so fs:save-file
  * only permits writing to user-approved locations.
  */
-const dialogReturnedPaths = new Set<string>();
+const dialogReturnedPaths = new Map<string, number>();
+const DIALOG_PATH_TTL_MS = 60 * 60 * 1000;
+function addDialogPath(p: string): void {
+  if (dialogReturnedPaths.size > 64) dialogReturnedPaths.clear();
+  dialogReturnedPaths.set(p, Date.now());
+  for (const [k, t] of Array.from(dialogReturnedPaths)) {
+    if (Date.now() - t > DIALOG_PATH_TTL_MS) dialogReturnedPaths.delete(k);
+  }
+}
+function hasDialogPath(p: string): boolean {
+  const t = dialogReturnedPaths.get(p);
+  if (t === undefined) return false;
+  if (Date.now() - t > DIALOG_PATH_TTL_MS) { dialogReturnedPaths.delete(p); return false; }
+  return true;
+}
 
 /**
  * Validates that a path is safe to read/write.
@@ -76,14 +90,14 @@ function isSavePathAllowed(p: string): boolean {
   // Block ADS streams and UNC paths that confuse allowlist checks.
   if (p.includes(':') && !/^[a-zA-Z]:[\\/]/.test(p)) return false;
   if (p.startsWith('\\\\')) return false;
-  if (dialogReturnedPaths.has(p)) {
+  if (hasDialogPath(p)) {
     // Resolve symlinks: a dialog path swapped for a symlink to gangsta.db/logs must not pass.
     try {
       const real = fs.realpathSync.native(p);
       if (real !== p) {
         if (SAVE_BLOCKED_BASENAMES.has(path.basename(real).toLowerCase())) return false;
         // Resolved target must itself be allowlisted (dialog set or recordings dir).
-        if (!dialogReturnedPaths.has(real)) {
+        if (!hasDialogPath(real)) {
           const userDataPath = app.getPath('userData');
           const recDir = path.resolve(path.join(userDataPath, 'recordings'));
           const relReal = path.relative(recDir, real);
@@ -112,7 +126,10 @@ function isSavePathAllowed(p: string): boolean {
  */
 function isReadPathAllowed(p: string): boolean {
   const ext = path.extname(p).replace('.', '').toLowerCase();
-  return READABLE_EXTENSIONS.has(ext);
+  if (!READABLE_EXTENSIONS.has(ext)) return false;
+  if (p.includes(':') && !/^[a-zA-Z]:[\\/]/.test(p)) return false;
+  if (p.startsWith('\\\\')) return false;
+  return true;
 }
 
 function getMainWindow(): BrowserWindow | null {
@@ -206,9 +223,7 @@ function registerIpcHandlers(): void {
     if (canceled || !filePath) return null;
     const v = validatePath(filePath);
     if (v) {
-      // Bound the allowlist: unbounded Set + stale entries across reloads.
-      if (dialogReturnedPaths.size > 64) dialogReturnedPaths.clear();
-      dialogReturnedPaths.add(v);
+      addDialogPath(v);
     }
     return filePath;
   });
@@ -228,8 +243,7 @@ function registerIpcHandlers(): void {
     if (canceled || !filePath) return null;
     const v = validatePath(filePath);
     if (v) {
-      if (dialogReturnedPaths.size > 64) dialogReturnedPaths.clear();
-      dialogReturnedPaths.add(v);
+      addDialogPath(v);
     }
     return filePath;
   });
@@ -260,8 +274,7 @@ function registerIpcHandlers(): void {
     if (canceled || !filePath) return null;
     const v = validatePath(filePath);
     if (v) {
-      if (dialogReturnedPaths.size > 64) dialogReturnedPaths.clear();
-      dialogReturnedPaths.add(v);
+      addDialogPath(v);
     }
     return filePath;
   });
@@ -271,7 +284,11 @@ function registerIpcHandlers(): void {
   const normalizeCacheKey = (a: string, b: string): string => {
     const sa = String(a ?? '').slice(0, 32760);
     const sb = String(b ?? '').slice(0, 32760);
-    return `${path.resolve(sa).toLowerCase()}||${path.resolve(sb).toLowerCase()}`;
+    const norm = (s: string): string => {
+      const r = path.resolve(s);
+      return process.platform === 'win32' || process.platform === 'darwin' ? r.toLowerCase() : r;
+    };
+    return `${norm(sa)}||${norm(sb)}`;
   };
   function checkCacheKeyArgs(a: unknown, b: unknown): boolean {
     return typeof a === 'string' && typeof b === 'string'

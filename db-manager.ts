@@ -181,9 +181,17 @@ let _constructing = false;
 
 export function getDbManager(): DatabaseManager | null {
     if (_instance) return _instance;
-    // Unsynchronized lazy init previously double-opened the same SQLite file
-    // under concurrent IPC. Second caller gets null (caller already null-guards).
-    if (_constructing) return null;
+    if (_constructing) {
+        const start = Date.now();
+        while (!( _instance as unknown) && Date.now() - start < 2000) {
+            const end = Date.now() + 10;
+            while (Date.now() < end) { /* brief spin, init is synchronous */ }
+            if (_instance) return _instance;
+            if (!_constructing) break;
+        }
+        if (_instance) return _instance;
+        if (_constructing) return null;
+    }
     _constructing = true;
     try {
         _instance = new DatabaseManager();

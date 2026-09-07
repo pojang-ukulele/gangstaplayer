@@ -149,6 +149,8 @@ export function initPlayer(deps: PlayerDeps): void {
             autoMixBtn.classList.toggle('active', enabled);
             autoMixBtn.setAttribute('aria-pressed', String(enabled));
         }
+        const cb = document.getElementById('mixOptEnableAI') as HTMLInputElement | null;
+        if (cb && cb.checked !== enabled) cb.checked = enabled;
     });
 
     state.subscribe('loopMode', (mode) => {
@@ -254,6 +256,8 @@ export async function loadTrack(index: number): Promise<void> {
         return;
     }
     if (loadId !== _loadTrackId) { hideSpinnerIfCurrent(loadId); return; }
+    const live = state.playlist;
+    if (index < 0 || index >= live.length || live[index]?.id !== track.id) { hideSpinnerIfCurrent(loadId); return; }
     const blobCopy = sharedBuffer.slice(0);
     const safeUrl = trackBlobUrl(URL.createObjectURL(new Blob([blobCopy], { type: 'audio/mpeg' })), true);
     engine.main.load(safeUrl);
@@ -396,18 +400,26 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
 
     state.update({ isCrossfadeInProgress: true });
     updateControlsLock(true);
+    const myGen = ++crossfadeGen;
+    const expectedId = playlist[nextIdx]?.id;
 
     if (setBlendingIndexFn) setBlendingIndexFn(nextIdx);
     if (autoMixBtn) autoMixBtn.classList.add('blending');
 
     engine.crossfade.reset();
     const safeUrl = await getSafeUrl(playlist[nextIdx].path, false, true);
+    if (myGen !== crossfadeGen || !state.isCrossfadeInProgress) return;
     if (!safeUrl) {
         state.update({ isCrossfadeInProgress: false });
         updateControlsLock(false);
         if (setBlendingIndexFn) setBlendingIndexFn(-1);
         if (autoMixBtn) autoMixBtn.classList.remove('blending');
         toast.error("NEXT TRACK UNREADABLE — CROSSFADE ABORTED");
+        return;
+    }
+    const liveList = state.playlist;
+    if (!expectedId || liveList[nextIdx]?.id !== expectedId) {
+        abortCrossfade();
         return;
     }
     engine.crossfade.load(safeUrl);
@@ -454,11 +466,17 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
     try {
         await engine.crossfade.audio.play();
     } catch (e) {
+        if (myGen !== crossfadeGen) return;
         logger.error("AutoMix Playback Failed", e);
         state.update({ isCrossfadeInProgress: false });
         updateControlsLock(false);
         if (setBlendingIndexFn) setBlendingIndexFn(-1);
         if (autoMixBtn) autoMixBtn.classList.remove('blending');
+        return;
+    }
+    if (myGen !== crossfadeGen || !state.isCrossfadeInProgress) return;
+    if (state.playlist[nextIdx]?.id !== expectedId) {
+        abortCrossfade();
         return;
     }
 
@@ -502,19 +520,23 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
     cross.gain.gain.setValueAtTime(0.001, now);
     cross.gain.gain.linearRampToValueAtTime(1, now + duration);
 
-    const gen = ++crossfadeGen;
+    const gen = myGen;
     if (crossfadeTimer) clearTimeout(crossfadeTimer);
     crossfadeTimer = setTimeout(() => {
         crossfadeTimer = null;
         if (gen !== crossfadeGen) return;
-        finishCrossfade(nextIdx);
+        finishCrossfade(nextIdx, expectedId);
     }, duration * 1000);
 }
 
-function finishCrossfade(nextIndex: number): void {
+function finishCrossfade(nextIndex: number, expectedId?: string): void {
     // Stale timer (aborted by stop/delete) must never resurrect audio.
     if (!state.isCrossfadeInProgress) return;
     if (!Number.isInteger(nextIndex) || nextIndex < 0 || nextIndex >= state.playlist.length) {
+        abortCrossfade();
+        return;
+    }
+    if (expectedId && state.playlist[nextIndex]?.id !== expectedId) {
         abortCrossfade();
         return;
     }
@@ -750,6 +772,15 @@ function setupTransportHandlers(): void {
             try {
                 if (state.isCrossfadeInProgress) engine.crossfade.audio.playbackRate = val;
             } catch { /* ignore */ }
+            try {
+                void import('./sampler').then(m => {
+                    for (const [k, v] of Object.entries(m.activeVoices)) {
+                        if (!v?.source) continue;
+                        if ((m.padSyncState as any)[Number(k)]) continue;
+                        try { v.source.playbackRate.value = val; } catch { /* ignore */ }
+                    }
+                }).catch(() => undefined);
+            } catch { /* ignore */ }
             if (tempoVal) {
                 const displayBpm = state.masterBPM > 0 ? Math.round(state.masterBPM * val) : "---";
                 tempoVal.innerText = `SPEED: ${Math.round(val * 100)}% (BPM: ${displayBpm})`;
@@ -769,8 +800,12 @@ function setupTransportHandlers(): void {
             // Master volume belongs ONLY to masterGain — touching the channel
             // gain here would stomp crossfade fade automation.
             const val = parseFloat(masterVol!.value);
-            if (masterGain) {
-                masterGain.gain.value = val;
+            if (masterGain && Number.isFinite(val)) {
+                try {
+                    const t = (window as unknown as { __ugAudioCtx?: AudioContext } | undefined);
+                    void t;
+                    masterGain.gain.setTargetAtTime(Math.min(1, Math.max(0, val)), masterGain.context.currentTime, 0.02);
+                } catch { try { masterGain.gain.value = val; } catch { /* ignore */ } }
             }
             if (volKnob) {
                 volKnob.innerText = Math.round(val * 100) + '%';

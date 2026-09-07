@@ -277,13 +277,15 @@ export function addTracksToPlaylist(files: File[]): void {
         ? () => crypto.randomUUID()
         : () => `id-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
     const AUDIO_EXTS = new Set(['wav', 'mp3', 'ogg', 'flac', 'm4a', 'aac', 'webm']);
+    let rejected = 0;
+    let dupes = 0;
     files.forEach((file) => {
         const fullPath = window.electronAPI.getPathForFile(file);
-        if (!fullPath) return; // non-file drop — don't create unplayable rows
-        if (fullPath.length > 32760) return;
+        if (!fullPath) { rejected++; return; }
+        if (fullPath.length > 32760) { rejected++; return; }
         const ext = fullPath.split('.').pop()?.toLowerCase() ?? '';
-        if (!AUDIO_EXTS.has(ext)) return; // reject non-audio at add time
-        if (existingPaths.has(fullPath)) return; // dedup: same path, same song
+        if (!AUDIO_EXTS.has(ext)) { rejected++; return; }
+        if (existingPaths.has(fullPath)) { dupes++; return; }
         existingPaths.add(fullPath);
         const track: Track = {
             id: uuid(),
@@ -310,6 +312,8 @@ export function addTracksToPlaylist(files: File[]): void {
     });
 
     state.update({ playlist: currentPlaylist });
+    if (rejected > 0) { try { toast.info(`${rejected} FILE(S) SKIPPED (UNSUPPORTED TYPE)`); } catch { /* ignore */ } }
+    else if (dupes > 0) { try { toast.info(`${dupes} DUPLICATE(S) SKIPPED`); } catch { /* ignore */ } }
 
     if (startIdx === 0 && state.playlist.length > 0 && loadTrackFn) {
         loadTrackFn(0);

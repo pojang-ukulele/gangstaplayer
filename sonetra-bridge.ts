@@ -508,17 +508,22 @@ class SonetraBridge {
     /**
      * Start periodic health polling
      */
+    private _healthFails = 0;
     private _startHealthPolling(): void {
         this._stopHealthPolling();
+        this._healthFails = 0;
         this._healthPollTimer = setInterval(async () => {
             if (!this.isRunning || !this.serverProcess) return;
             const healthy = await this._checkHealth();
             if (!healthy) {
-                console.warn('[Sonetra] Health check failed — server is unresponsive.');
+                this._healthFails++;
+                if (this._healthFails < 2) return;
+                this._healthFails = 0;
+                console.warn('[Sonetra] Health check failed twice — server is unresponsive.');
                 this._fireStatus('crashed', { message: 'Health check failed' });
-                // Kill the process WITHOUT clearing isRunning first — the close
-                // handler must see wasRunning=true so it triggers _attemptRestart.
                 this._forceKill();
+            } else {
+                this._healthFails = 0;
             }
         }, this._healthPollIntervalMs);
     }
@@ -559,11 +564,14 @@ class SonetraBridge {
         if (typeof this.config.pythonPath === 'string' && this.config.pythonPath) {
             try {
                 const resolved = path.resolve(this.config.pythonPath);
-                // Validate it is an actual file (not a dir / planted shim path).
-                if (fs.existsSync(resolved) && fs.statSync(resolved).isFile()) {
+                const base = path.basename(resolved).toLowerCase();
+                const isPythonBin = base === 'python.exe' || base === 'python' || base === 'py' || base.startsWith('python3');
+                if (isPythonBin && fs.existsSync(resolved) && fs.statSync(resolved).isFile()) {
                     pythonCmd = resolved;
                     console.log(`[Sonetra] Using config Python: ${pythonCmd}`);
                     return pythonCmd;
+                } else if (!isPythonBin) {
+                    console.warn('[Sonetra] Ignoring config pythonPath with non-python basename');
                 }
             } catch { /* fall through to bundled/system */ }
         }

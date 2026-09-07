@@ -283,13 +283,8 @@ function setupGlobalKeyboardShortcuts() {
             // Try modals first — topmost, not first in DOM order. The confirm
             // modal must go through its No-button path so the queue drains;
             // closeModal() directly would wedge _confirmOpen forever.
-            // Try modals first — topmost, not first in DOM order. The confirm
-            // modal must go through its No-button path so the queue drains;
-            // closeModal() directly would wedge _confirmOpen forever.
-            const topModal = (document.querySelectorAll('.modal.active').length
-                ? document.querySelectorAll('.modal.active')[document.querySelectorAll('.modal.active').length - 1]
-                : null) as HTMLElement | null;
-            const activeModal = topModal ?? document.querySelector('.modal.active');
+            const actives = document.querySelectorAll('.modal.active');
+            const activeModal = (actives.length ? actives[actives.length - 1] : document.querySelector('.modal.active')) as HTMLElement | null;
             if (activeModal) {
                 if (activeModal.id === 'confirmModal') {
                     const noBtn = document.getElementById('confirmNo') as HTMLElement | null;
@@ -393,6 +388,10 @@ function setupMasterRecording() {
                     try {
                         const wavBlob = await hiFiRecorder.stop();
                         const wavBuffer = await wavBlob.arrayBuffer();
+                        if (wavBuffer.byteLength > 100 * 1024 * 1024) {
+                            toast.error("RECORDING TOO LARGE (100MB CAP) — DISCARDED");
+                            return;
+                        }
 
                         const path = await bridge.saveAudioDialog();
                         if (path) {
@@ -466,7 +465,8 @@ async function initApp() {
     // Sonetra status was previously forwarded by main but never subscribed —
     // surface crashes/restarts instead of dropping the signal.
     try {
-        window.sonetra?.onRestartStatus?.((status: unknown) => {
+        try { (window as unknown as { __ugSonetraUnsub?: () => void }).__ugSonetraUnsub?.(); } catch { /* ignore */ }
+        const unsub = window.sonetra?.onRestartStatus?.((status: unknown) => {
             try {
                 const s = status as { event?: string; message?: string };
                 logger.info(`[Sonetra] status: ${s?.event ?? 'unknown'} ${s?.message ?? ''}`);
@@ -474,6 +474,7 @@ async function initApp() {
                 else if (s?.event === 'restarted' || s?.event === 'started') toast.success('AI MIXER ONLINE');
             } catch { /* ignore */ }
         });
+        try { if (typeof unsub === 'function') (window as unknown as { __ugSonetraUnsub?: () => void }).__ugSonetraUnsub = unsub; } catch { /* ignore */ }
     } catch { /* Sonetra bridge unavailable — non-fatal */ }
 
     initSettings({ setAutoMixEnabled });

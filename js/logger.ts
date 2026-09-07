@@ -154,10 +154,22 @@ class GangstaLogger {
         if (entry.level !== 'DEBUG' && window.fileSystem?.appendLog) {
             if (entry.level === 'INFO') {
                 const now = Date.now();
-                if (now - this._lastDiskWrite < 200) { this._diskDropped++; return; }
+                if (now - this._lastDiskWrite < 200) {
+                    this._diskDropped++;
+                    if (this._diskDropped === 1) {
+                        window.fileSystem.appendLog('INFO', `[Logger] ... throttling INFO burst`).catch(() => undefined);
+                    }
+                    return;
+                }
+                if (this._diskDropped > 0) {
+                    const n = this._diskDropped;
+                    this._diskDropped = 0;
+                    this._lastDiskWrite = now;
+                    window.fileSystem.appendLog('INFO', `[Logger] dropped ${n} INFO message(s) during burst`).catch(() => undefined);
+                }
                 this._lastDiskWrite = now;
             }
-            window.fileSystem.appendLog(entry.level, entry.message).catch(() => {});
+            window.fileSystem.appendLog(entry.level, entry.message).catch(() => undefined);
         }
     }
 

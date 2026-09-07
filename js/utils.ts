@@ -122,12 +122,18 @@ export function validateAudioSignature(
     const hasRiff = matches.includes('wav');
     const hasWave = matches.includes('wave');
     const isRealWav = hasRiff && hasWave;
+    const hasId3 = matches.includes('mp3v2');
+    if (hasId3) {
+        if (buffer.byteLength < 10) return `File does not contain recognized audio data${fileName ? ` (file: ${fileName})` : ''}`;
+        const tagSize = ((view.getUint8(6) & 0x7f) << 21) | ((view.getUint8(7) & 0x7f) << 14) | ((view.getUint8(8) & 0x7f) << 7) | (view.getUint8(9) & 0x7f);
+        if (tagSize <= 0 || 10 + tagSize >= buffer.byteLength) return `File does not contain recognized audio data${fileName ? ` (file: ${fileName})` : ''}`;
+    }
     const hasAudioSignature = isRealWav ||
         matches.includes('mp3') ||
         matches.includes('mp3b') ||
         matches.includes('mp3c') ||
         matches.includes('mp3d') ||
-        matches.includes('mp3v2') || // ID3 tag - could be any audio
+        hasId3 ||
         matches.includes('ogg') ||
         matches.includes('flac') ||
         matches.includes('m4a') ||

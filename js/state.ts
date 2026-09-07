@@ -149,10 +149,10 @@ class ReactiveStore implements AppStateData {
 
             // Runtime validation for enums/numbers — invalid writes previously
             // flowed straight into player logic.
-            if (k === 'loopMode' && value !== 'off' && value !== 'one' && value !== 'all') continue;
-            if (k === 'playbackMode' && value !== 'continuous' && value !== 'single') continue;
-            if (k === 'currentTrackIndex' && (typeof value !== 'number' || !Number.isInteger(value as number))) continue;
-            if ((k === 'masterBPM' || k === 'blendingIndex') && (typeof value !== 'number' || !Number.isFinite(value as number))) continue;
+            if (k === 'loopMode' && value !== 'off' && value !== 'one' && value !== 'all') { console.warn(`[State] rejected invalid loopMode`); continue; }
+            if (k === 'playbackMode' && value !== 'continuous' && value !== 'single') { console.warn(`[State] rejected invalid playbackMode`); continue; }
+            if (k === 'currentTrackIndex' && (typeof value !== 'number' || !Number.isInteger(value as number))) { console.warn(`[State] rejected invalid currentTrackIndex`); continue; }
+            if ((k === 'masterBPM' || k === 'blendingIndex') && (typeof value !== 'number' || !Number.isFinite(value as number))) { console.warn(`[State] rejected invalid ${String(k)}`); continue; }
 
             // Shallow comparison for arrays AND plain objects (pad maps, learn
             // targets) — previously identical-content objects spuriously notified.

@@ -57,9 +57,9 @@
 
 ### 🛡️ SECURITY & RELIABILITY
 
-- **Path Validation:** All file I/O hardened against directory traversal, null-byte injection, symlink swaps, and oversized payloads. Reads are restricted to media/kit file types (`wav/mp3/ogg/flac/m4a/aac/webm/json`); writes are limited to `.json`/`.wav` via dialog-approved paths or the app `recordings/` directory (database and log files are never writable from the renderer). Hot IPC channels are rate-limited and transition cache keys are length-checked.
-- **Lazy Audio Engine:** The AudioContext and sampler/deck signal chains build on first use and rebuild after a closed-context reset — a pre-gesture failure no longer bricks audio permanently.
-- **Session Integrity:** Session files carry a SHA-256 corruption-evidence checksum (not attacker-proof by design — no secret is stored); corrupt/edited files abort load.
+- **Path Validation:** All file I/O hardened against directory traversal, null-byte injection, symlink swaps, ADS/UNC tricks, and oversized payloads. Reads are restricted to media/kit file types (`wav/mp3/ogg/flac/m4a/aac/webm/json`); writes are limited to `.json`/`.wav` via dialog-approved paths (1h TTL) or the app `recordings/` directory (database and log files are never writable from the renderer). Hot IPC channels are rate-limited and transition cache keys are length-checked.
+- **Lazy Audio Engine:** The AudioContext and sampler/deck signal chains build on first use and rebuild after a closed-context reset — a pre-gesture failure no longer bricks audio permanently. Crossfades are generation-guarded with track-ID pinning, so abort/delete/reorder during async load can never promote the wrong deck.
+- **Session Integrity:** Session files carry a canonical SHA-256 corruption-evidence checksum (key-sorted, whitespace-insensitive; not attacker-proof by design — no secret is stored); corrupt/edited files abort load.
 - **Single Instance Lock:** Only one app instance can run at a time (protects the track database).
 - **Crash Recovery:** Persistent auto-save snapshots every 30s with post-mortem diagnostic reports.
 - **Audio Signature Validation:** Magic-number verification ensures only valid WAV/MP3/OGG/FLAC/M4A/WebM files are loaded.

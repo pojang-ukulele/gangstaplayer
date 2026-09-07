@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased] — "Paranoid Audit Round 3 (2026-09-08)"
+
+### 🛠️ 2026-09-08 batch (verified: `tsc --noEmit` clean, Jest 93/93 with `--coverage=false`)
+
+- **Crossfade race closed (`js/player.ts`)**: generation claimed at blend start and re-checked after `getSafeUrl` and after `play()`; expected track-ID pinned through timer into `finishCrossfade(nextIdx, expectedId)`; stale/aborted blends and reordered/deleted targets abort instead of promoting the wrong deck.
+- **Deck TOCTOU closed**: `loadTrack` re-validates `playlist[index].id` after async read/decode before swapping `src`.
+- **Recorder cap corrected (`js/recorder-client.ts`)**: 810k-block math replaced with 90k-block / 90M-sample caps matching 8x128-sample flush batches; intake drops beyond cap; 100MB pre-save guard in master-record save flow.
+- **IPC hardening (`main.ts`)**: `isReadPathAllowed` now blocks ADS streams and UNC paths; dialog save allowlist is timestamped (`Map` + 1h TTL) with expiry sweep; transition cache key is case-sensitive on Linux only.
+- **Audio validation (`js/utils.ts`)**: ID3 prefix alone no longer passes — tag header size validated; RIFF still requires RIFF+WAVE.
+- **Sonetra (`sonetra-bridge.ts`)**: `config.pythonPath` must have a python basename; health poll requires 2 consecutive failures before kill/restart.
+- **Sampler/MIDI/playlist**: `stopAllRecordings` correctly cancels `__pending__` mic claims; CC mappings kept even if DOM not ready (validated on use); drops report `SKIPPED (UNSUPPORTED TYPE)` / `DUPLICATE(S) SKIPPED` toasts; tempo slider retunes live non-SYNC pad voices; MIX deck button syncs back to settings checkbox; session load clears the BPM analysis queue; Sonetra status listener unsubscribed on re-init.
+- **Workers/state/UI**: BPM folds into 60–180 and accepts 30–210 (`-1` normalized to `0` downstream); `VirtualScroller.refresh` reentrancy-guarded; worker `requestId` skips in-use IDs; toast eviction clears fade timers; logger INFO burst reports dropped count; `state.update` warns on rejected invalid writes; CSP adds `http://127.0.0.1:8765`.
+- **Docs**: README/CSP and security notes updated to match.
+
 ## [Unreleased] — "Paranoid Audit Fixes (2026-09-07)"
 
 ### 🛠️ 2026-09-07 batch (verified: `tsc --noEmit` clean, Jest 93/93 with `--coverage=false`)

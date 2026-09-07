@@ -84,10 +84,12 @@ function detectBPM(data: Float32Array, sampleRate: number, threshold = 0.1, minS
     let bpmValue = (sampleRate * 60) / avgInterval;
     
     // The peak detector often catches half-beats, doubling the BPM.
-    // Halve values above 170 to get the true tempo.
-    if (bpmValue > 170) bpmValue = bpmValue / 2;
-    
-    return (bpmValue < 40 || bpmValue > 200) ? 0 : Math.round(bpmValue);
+    // Fold into 60-180 once instead of single halve; keep 30-210 usable
+    // so screwed/ghetto-tech extremes return a value instead of silent 0.
+    while (bpmValue > 180) bpmValue = bpmValue / 2;
+    while (bpmValue < 60 && bpmValue > 0) bpmValue = bpmValue * 2;
+    if (!Number.isFinite(bpmValue)) return -1;
+    return (bpmValue < 30 || bpmValue > 210) ? -1 : Math.round(bpmValue);
 }
 
 function bufferToWave(abuffer: AudioBufferTransfer, len: number): Blob {

@@ -37,6 +37,12 @@ export function purgeLegacySessionKey(): void {
         localStorage.removeItem('ug_session_hmac_key');
     } catch { /* storage unavailable — nothing to purge */ }
 }
+function canonicalize(value: unknown): string {
+    if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
+    if (Array.isArray(value)) return `[${value.map(canonicalize).join(',')}]`;
+    const keys = Object.keys(value as Record<string, unknown>).filter(k => k !== 'signature').sort();
+    return `{${keys.map(k => `${JSON.stringify(k)}:${canonicalize((value as Record<string, unknown>)[k])}`).join(',')}}`;
+}
 async function sha256Hex(data: string): Promise<string> {
     const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(data));
     return Array.from(new Uint8Array(digest))
@@ -170,9 +176,8 @@ export async function saveSession(): Promise<void> {
             },
         };
 
-        // Corruption-evidence checksum (NOT attacker-proof — no secret).
-        const sessionJson = JSON.stringify(session, null, 2);
-        session.signature = await sha256Hex(sessionJson);
+        // Corruption-evidence checksum over canonical form (key-sorted, whitespace-insensitive).
+        session.signature = await sha256Hex(canonicalize(session));
 
         const fs = window.fileSystem;
         if (fs?.saveFile) {
@@ -261,8 +266,7 @@ export async function loadSession(): Promise<void> {
 
         // Verify checksum (corruption evidence only — not attacker-proof)
         if (session.signature) {
-            const sessionJsonWithoutSig = JSON.stringify({ ...session, signature: undefined }, null, 2);
-            const isValid = await verifyChecksum(sessionJsonWithoutSig, session.signature);
+            const isValid = await verifyChecksum(canonicalize(session), session.signature);
             if (!isValid) {
                 logger.error('[Session] Checksum mismatch - file is corrupt or was edited outside the app');
                 toast.error("SESSION CORRUPTED - LOAD ABORTED");
@@ -299,6 +303,10 @@ export async function loadSession(): Promise<void> {
             blendingIndex: state.blendingIndex,
             pads: padSnap,
         };
+        try {
+            const { clearAnalysisQueue } = await import('./playlist');
+            clearAnalysisQueue();
+        } catch { /* ignore */ }
         state.update({
             playlist: [],
             selectedIndices: [],

@@ -21,7 +21,10 @@ export class HighFidelityRecorder {
                 if (event.data.type === 'DATA') {
                     if (!this.accepting) return; // post-STOP stragglers → next take
                     const payload = event.data.payload as Float32Array[];
-                    if (Array.isArray(payload) && payload.length > 0) this.chunks.push(payload);
+                    if (Array.isArray(payload) && payload.length > 0) {
+                        if (this.chunks.length >= 90000) return;
+                        this.chunks.push(payload);
+                    }
                 }
             };
             this.sourceNode.connect(this.node);
@@ -94,8 +97,10 @@ export class HighFidelityRecorder {
 
     private async compileWav(chunks: Float32Array[][]): Promise<Blob> {
         if (chunks.length === 0) throw new Error('No data recorded');
-        // Cap takes (~30min stereo @48kHz ≈ 660MB PCM) — longer takes OOMed before WAV compile.
-        const MAX_BLOCKS = 30 * 60 * (48000 / 128) * 1.2;
+        // Each chunk is one flushed batch (~8x128=1024 samples/ch). 30min @48kHz
+        // ≈ 86.4M samples/ch ≈ 84k chunks. Cap blocks + total PCM samples.
+        const MAX_BLOCKS = 90000;
+        const MAX_SAMPLES = 90 * 1000000;
         if (chunks.length > MAX_BLOCKS) throw new Error('Recording too long (30min cap)');
 
         const numChannels = chunks[0].length;
@@ -107,6 +112,7 @@ export class HighFidelityRecorder {
             totalLength += block[0]?.length ?? 0;
         }
         if (totalLength <= 0) throw new Error('No data recorded');
+        if (totalLength > MAX_SAMPLES) throw new Error('Recording too long (30min cap)');
 
         const channels: Float32Array[] = [];
         for (let channel = 0; channel < numChannels; channel++) {
