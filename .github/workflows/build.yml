@@ -1,49 +1,43 @@
-name: Build and Release
+name: Build & Release Application
 
 on:
   push:
-    branches: [ main ]
+    tags:
+      - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
-  build:
+  release:
+    name: Build on ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            builder-flags: "--mac --universal"
+          - os: windows-latest
+            builder-flags: "--win"
     runs-on: ${{ matrix.os }}
 
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest]
-
     steps:
-    - name: Check out Git repository
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    - name: Install Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: 20
-        cache: 'npm'
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
 
-    - name: Install Dependencies
-      run: npm install
+      - name: Install dependencies
+        run: npm ci
 
-    - name: Obfuscate / Build Source
-      run: node scripts/build.js
+      - name: Run JS build script
+        run: node scripts/build.js --prod
 
-    - name: Build Windows Installer
-      if: matrix.os == 'windows-latest'
-      run: npx electron-builder build --win --x64 --config.directories.app=app-build --config.electronVersion=40.6.0
-
-    - name: Build Mac Universal Installer
-      if: matrix.os == 'macos-latest'
-      # --universal builds for both arm64 and x64 in one dmg
-      run: npx electron-builder build --mac --universal --config.directories.app=app-build --config.electronVersion=30.5.1
-
-    - name: Upload Artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: installers-${{ matrix.os }}
-        path: |
-          dist/*.exe
-          dist/*.dmg
-          dist/*.zip
+      - name: Build and Publish Installer
+        run: npx electron-builder ${{ matrix.builder-flags }} --publish always
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
