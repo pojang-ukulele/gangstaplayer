@@ -5,8 +5,10 @@ import { VirtualScroller } from './reactive/ui';
 import { normalizeToArrayBuffer, validateAudioSignature } from './utils';
 import { engine } from './audio-engine';
 import { abortCrossfade } from './player';
+import { showConfirm } from './modals';
 import { toast } from './toast';
-import { MAX_FILE_SIZE_BYTES } from './constants';
+import { logger } from './logger';
+import { MAX_FILE_SIZE_BYTES, NUM_PADS } from './constants';
 import './types';
 
 interface PlaylistDeps {
@@ -20,6 +22,14 @@ let anchorIndex = -1;
 let pivotIndex = -1; // Start of selection range
 let draggedIndex = -1;
 let isDragging = false;
+// Press-drag multi-select gesture state (mouse down + move across rows).
+let pressIndex = -1;
+let pressWasSelected = false;
+let selectDragging = false;
+let suppressClick = false;
+// Playlist keyboard focus: cleared when the user clicks anywhere outside the
+// playlist so arrows/Delete stop driving it. Set on any press inside.
+let playlistFocused = true;
 
 let playlistEl: HTMLElement | null = null;
 let playlistInput: HTMLInputElement | null = null;
@@ -32,6 +42,7 @@ let vScroller: VirtualScroller<Track> | null = null;
 let _playlistUnsubs: (() => void)[] | null = null;
 let _dbLoadGen = 0;
 let _isFiltering = false;
+let _focusWired = false;
 const ITEM_HEIGHT = 26; // Pixels — compact single-line row
 
 let _playlistInit = false;
@@ -257,7 +268,13 @@ async function analyzeTrackInBackground(track: Track): Promise<void> {
             });
         }
 
-        state.update({ playlist: next });
+        // Drop stale work: track cleared/deleted while DB persist was in flight.
+        // Re-resolve against the live list instead of pushing the pre-await snapshot.
+        const liveIdx = state.playlist.findIndex(t => t.id === track.id);
+        if (liveIdx < 0) return;
+        const live = [...state.playlist];
+        live[liveIdx] = { ...live[liveIdx], bpm, duration: audioBuffer.duration };
+        state.update({ playlist: live });
     } catch (e) {
         console.warn(`[Playlist] BPM analysis skipped for ${track.name}`);
         const idx = state.playlist.findIndex(t => t.id === track.id);
@@ -342,15 +359,60 @@ function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HT
         li.classList.add('blending');
     }
 
-    li.innerText = track.name + bpmSuffix + blendSuffix;
+    const fullText = track.name + bpmSuffix + blendSuffix;
+    li.title = fullText;
+    let titleSpan = li.querySelector('.track-title') as HTMLElement | null;
+    if (!titleSpan) {
+        titleSpan = document.createElement('span');
+        titleSpan.className = 'track-title';
+        li.appendChild(titleSpan);
+    }
+    titleSpan.textContent = fullText;
     
     if (state.selectedIndices.includes(index)) li.classList.add('selected');
     if (index === state.currentTrackIndex) li.classList.add('playing');
     
     // Only add listeners if it's a new element
     if (!existing) {
+        // Press-drag multi-select: plain mousedown selects immediately, moving
+        // across rows extends the range from the press point. Dragging a row
+        // that was ALREADY selected is a reorder gesture, not a selection one.
+        li.addEventListener('mousedown', (e) => {
+            if (e.button !== 0) return;
+            const idx = parseInt(li.dataset.index || "-1");
+            if (idx < 0) return;
+            playlistFocused = true;
+            pressIndex = idx;
+            pressWasSelected = state.selectedIndices.includes(idx);
+            selectDragging = true;
+            suppressClick = false;
+            if (!e.ctrlKey && !e.metaKey && !e.shiftKey && !pressWasSelected) {
+                state.update({ selectedIndices: [idx] });
+                anchorIndex = idx;
+                pivotIndex = idx;
+            } else if (!e.ctrlKey && !e.metaKey && !e.shiftKey && pressWasSelected) {
+                // Reorder candidate — keep the existing multi-selection intact.
+                anchorIndex = idx;
+            }
+        });
+
+        li.addEventListener('mouseenter', (e) => {
+            if (!selectDragging || pressWasSelected) return;
+            if (!(e.buttons & 1)) return;
+            if (e.ctrlKey || e.metaKey || e.shiftKey) return;
+            const idx = parseInt(li.dataset.index || "-1");
+            if (idx < 0 || idx === anchorIndex) return;
+            const s = Math.min(pressIndex, idx);
+            const e_ = Math.max(pressIndex, idx);
+            anchorIndex = idx;
+            if (idx !== pressIndex) suppressClick = true;
+            state.update({ selectedIndices: Array.from({ length: e_ - s + 1 }, (_, i) => s + i) });
+        });
+
         li.addEventListener('click', (e) => {
             e.stopPropagation();
+            // Click after a press-drag would collapse the just-built range.
+            if (suppressClick) { suppressClick = false; return; }
             const idx = parseInt(li.dataset.index || "0");
             
             const currentSelected = [...state.selectedIndices];
@@ -375,6 +437,21 @@ function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HT
             }
         });
 
+        // Hover marquee: long titles scroll only when clipped
+        // (scrollWidth > clientWidth). Resets cleanly on mouseleave.
+        li.addEventListener('mouseenter', () => {
+            const span = li.querySelector('.track-title') as HTMLElement | null;
+            if (!span) return;
+            try {
+                if (span.scrollWidth > li.clientWidth + 4) span.classList.add('marquee');
+                else span.classList.remove('marquee');
+            } catch { /* ignore */ }
+        });
+        li.addEventListener('mouseleave', () => {
+            const span = li.querySelector('.track-title') as HTMLElement | null;
+            if (span) span.classList.remove('marquee');
+        });
+
         li.addEventListener('dblclick', (e) => {
             e.stopPropagation();
             const idx = parseInt(li.dataset.index || "0");
@@ -392,6 +469,9 @@ function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HT
         li.addEventListener('dragstart', (e) => {
             const idx = parseInt(li.dataset.index || "-1");
             if (idx < 0) { e.preventDefault(); return; }
+            // Select-drag in progress (press started on an unselected row):
+            // cancel the reorder so extending the selection doesn't move tracks.
+            if (selectDragging && !pressWasSelected) { e.preventDefault(); return; }
             isDragging = true;
             draggedIndex = idx;
             if (e.dataTransfer) {
@@ -438,9 +518,12 @@ function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HT
         });
 
         li.addEventListener('drop', (e) => {
+            // External file drops must bubble to the playlist container handler —
+            // stopping them here silently swallows drag-and-drop onto any row
+            // (rows cover the whole list, so drops appeared completely broken).
+            if (!isDragging || draggedIndex < 0) return;
             e.preventDefault();
             e.stopPropagation();
-            if (!isDragging || draggedIndex < 0) return;
             
             const targetIdx = parseInt(li.dataset.index || "-1");
             if (targetIdx < 0 || targetIdx === draggedIndex) return;
@@ -466,6 +549,7 @@ function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HT
         li.addEventListener('contextmenu', (e) => {
             e.preventDefault();
             e.stopPropagation();
+            playlistFocused = true;
             const idx = parseInt(li.dataset.index || "0");
             if (!state.selectedIndices.includes(idx)) {
                 state.update({ selectedIndices: [idx] });
@@ -477,17 +561,19 @@ function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HT
                 menu.classList.remove('hidden');
                 menu.style.display = 'block';
                 menu.style.zIndex = '9999';
-                
-                // Use clientX/Y which are more reliable for fixed/absolute overlays in scrollable views
+                hideSamplerSubmenu();
+                void buildSamplerSubmenu(idx);
+
+                // Viewport clamp measured from the live menu (position:fixed +
+                // max-height scroll). clientX/Y are viewport-relative, matching
+                // fixed positioning — no page-scroll math needed.
                 let x = e.clientX;
                 let y = e.clientY;
-                
-                // Keep menu within viewport
-                const menuWidth = 180;
-                const menuHeight = 150;
-                if (x + menuWidth > window.innerWidth) x = window.innerWidth - menuWidth;
-                if (y + menuHeight > window.innerHeight) y = window.innerHeight - menuHeight;
-                
+                menu.style.left = x + 'px';
+                menu.style.top = y + 'px';
+                const rect = menu.getBoundingClientRect();
+                if (rect.right > window.innerWidth) x = Math.max(4, window.innerWidth - rect.width - 4);
+                if (rect.bottom > window.innerHeight) y = Math.max(4, window.innerHeight - rect.height - 4);
                 menu.style.left = x + 'px';
                 menu.style.top = y + 'px';
                 menu.dataset.ctxIndex = idx.toString(); 
@@ -501,6 +587,182 @@ function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HT
 
 export function renderPlaylist(): void {
     if (vScroller) vScroller.refresh(true);
+}
+
+export function isPlaylistFocused(): boolean { return playlistFocused; }
+export function setPlaylistFocused(v: boolean): void { playlistFocused = v; }
+
+export function selectAllTracks(): void {
+    const n = state.playlist.length;
+    if (n <= 0) return;
+    playlistFocused = true;
+    anchorIndex = n - 1;
+    pivotIndex = 0;
+    state.update({ selectedIndices: Array.from({ length: n }, (_, i) => i) });
+}
+
+/** Index the playlist context menu was opened for (-1 if unknown). */
+export function getContextTargetIndex(): number {
+    try {
+        const menu = document.getElementById('contextMenu');
+        const idx = parseInt(menu?.dataset.ctxIndex || '-1');
+        if (Number.isInteger(idx) && idx >= 0 && idx < state.playlist.length) return idx;
+    } catch { /* ignore */ }
+    return -1;
+}
+
+/** Auto-scroll the playlist so the currently playing track is visible. */
+export function focusPlayingTrack(): void {
+    const idx = state.currentTrackIndex;
+    if (idx < 0 || idx >= state.playlist.length) {
+        try { toast.info('NO TRACK PLAYING'); } catch { /* ignore */ }
+        return;
+    }
+    playlistFocused = true;
+    anchorIndex = idx;
+    pivotIndex = idx;
+    state.update({ selectedIndices: [idx] });
+    if (vScroller) vScroller.scrollTo(idx);
+}
+
+/**
+ * Re-run BPM analysis for the given playlist indices.
+ * Resets their BPM to the "analyzing" state first, then enqueues
+ * background analysis (bounded queue, DB persist on completion).
+ */
+export function reanalyzeTracks(indices: number[]): void {
+    const valid = [...new Set(indices)].filter(
+        (i) => Number.isInteger(i) && i >= 0 && i < state.playlist.length
+    );
+    if (!valid.length) return;
+    const next = [...state.playlist];
+    for (const i of valid) next[i] = { ...next[i], bpm: undefined };
+    state.update({ playlist: next });
+    for (const i of valid) enqueueAnalysis(next[i]);
+    try { toast.info(`ANALYZING ${valid.length} TRACK(S)...`); } catch { /* ignore */ }
+}
+
+/** Remove every track from the queue (confirm first if audio is playing). */
+export function clearPlaylist(): void {
+    if (!state.playlist.length) return;
+    if (_isFiltering) {
+        try { toast.info('CLEAR SEARCH BEFORE CLEARING'); } catch { /* ignore */ }
+        return;
+    }
+    const doClear = (): void => {
+        try { abortCrossfade(); } catch { /* ignore */ }
+        clearAnalysisQueue();
+        try { engine.main.audio.pause(); } catch { /* ignore */ }
+        try { engine.main.audio.removeAttribute('src'); engine.main.audio.load(); } catch { try { engine.main.audio.src = ''; } catch { /* ignore */ } }
+        try { engine.crossfade.audio.pause(); } catch { /* ignore */ }
+        try { engine.crossfade.audio.removeAttribute('src'); engine.crossfade.audio.load(); } catch { try { engine.crossfade.audio.src = ''; } catch { /* ignore */ } }
+        anchorIndex = -1;
+        pivotIndex = -1;
+        state.update({
+            playlist: [],
+            selectedIndices: [],
+            currentTrackIndex: -1,
+            isPlaying: false,
+            masterBPM: 0,
+            isCrossfadeInProgress: false,
+            blendingIndex: -1,
+        });
+        try { toast.info('PLAYLIST CLEARED'); } catch { /* ignore */ }
+    };
+    if (state.isPlaying || state.isCrossfadeInProgress) {
+        showConfirm(
+            'CLEAR PLAYLIST?',
+            `This will remove all ${state.playlist.length} tracks and stop playback.`,
+            doClear
+        );
+    } else {
+        doClear();
+    }
+}
+
+// === SAMPLER SUBMENU (Load to Sampler Pad) ===
+let _submenuHideTimer: ReturnType<typeof setTimeout> | null = null;
+
+export function hideSamplerSubmenu(): void {
+    if (_submenuHideTimer) { clearTimeout(_submenuHideTimer); _submenuHideTimer = null; }
+    const sub = document.getElementById('samplerSubmenu');
+    if (sub) {
+        sub.classList.add('hidden');
+        sub.setAttribute('aria-hidden', 'true');
+    }
+    const parent = document.getElementById('ctxLoadToSampler');
+    if (parent) parent.setAttribute('aria-expanded', 'false');
+}
+
+function showSamplerSubmenu(): void {
+    if (_submenuHideTimer) { clearTimeout(_submenuHideTimer); _submenuHideTimer = null; }
+    const sub = document.getElementById('samplerSubmenu');
+    const parent = document.getElementById('ctxLoadToSampler');
+    const menu = document.getElementById('contextMenu');
+    if (!sub || !parent || !menu) return;
+    // Position to the right of the parent menu; flip left on overflow.
+    const menuRect = menu.getBoundingClientRect();
+    sub.classList.remove('hidden');
+    sub.setAttribute('aria-hidden', 'false');
+    parent.setAttribute('aria-expanded', 'true');
+    const subWidth = sub.offsetWidth || 170;
+    if (menuRect.right + subWidth > window.innerWidth) {
+        sub.style.left = 'auto';
+        sub.style.right = '100%';
+    } else {
+        sub.style.right = 'auto';
+        sub.style.left = '100%';
+    }
+    sub.style.top = '-5px';
+    sub.style.bottom = 'auto';
+    // Vertical clamp: the 16-pad list overflows near the window bottom.
+    // Pin its bottom to the item so it grows upward inside the viewport
+    // (max-height + scroll in CSS is the backstop) instead of pushing
+    // past the edge and dragging page scroll with it.
+    const subRect = sub.getBoundingClientRect();
+    if (subRect.bottom > window.innerHeight) {
+        sub.style.top = 'auto';
+        sub.style.bottom = '0';
+    }
+}
+
+async function buildSamplerSubmenu(trackIdx: number): Promise<void> {
+    const sub = document.getElementById('samplerSubmenu');
+    if (!sub) return;
+    sub.innerHTML = '';
+    let occupied: Record<number, boolean> = {};
+    try {
+        const sampler = await import('./sampler');
+        for (let i = 0; i < NUM_PADS; i++) {
+            if (sampler.padBuffers[i]) occupied[i] = true;
+        }
+    } catch { /* sampler unavailable — plain list */ }
+    for (let i = 0; i < NUM_PADS; i++) {
+        const item = document.createElement('div');
+        item.className = 'context-item' + (occupied[i] ? ' pad-occupied' : '');
+        item.setAttribute('role', 'menuitem');
+        item.setAttribute('tabindex', '-1');
+        item.textContent = `PAD ${i + 1}${occupied[i] ? ' ●' : ''}`;
+        item.dataset.padIndex = i.toString();
+        item.addEventListener('click', (e) => {
+            e.stopPropagation();
+            void loadTrackToPad(trackIdx, i);
+        });
+        sub.appendChild(item);
+    }
+}
+
+async function loadTrackToPad(trackIdx: number, padIdx: number): Promise<void> {
+    const track = state.playlist[trackIdx];
+    if (!track) return;
+    try {
+        const sampler = await import('./sampler');
+        await sampler.loadSampleFromPath(track.path, padIdx);
+        try { toast.success(`LOADED TO PAD ${padIdx + 1}`); } catch { /* ignore */ }
+    } catch (e) {
+        logger.warn(`[Playlist] Load to pad ${padIdx} failed`, e);
+        try { toast.error('LOAD TO PAD FAILED'); } catch { /* ignore */ }
+    }
 }
 
 /**
@@ -582,7 +844,17 @@ function reorderPlaylist(fromIndex: number, toIndex: number, insertAfter: boolea
 // === NEW: KEYBOARD NAVIGATION ===
 export function handlePlaylistNavigation(e: KeyboardEvent): void {
     if (!state.playlist.length) return;
-    
+    // Keyboard only drives the playlist while it has focus — clicking
+    // elsewhere in the GUI defocuses it (see setupPlaylistHandlers).
+    if (!playlistFocused) return;
+
+    // Ctrl/Cmd+A selects everything in the current (possibly filtered) view.
+    if ((e.ctrlKey || e.metaKey) && (e.key === 'a' || e.key === 'A')) {
+        e.preventDefault();
+        selectAllTracks();
+        return;
+    }
+
     // Ensure valid anchor/pivot if coming from empty state
     if (anchorIndex === -1) anchorIndex = 0;
     if (pivotIndex === -1) pivotIndex = anchorIndex;
@@ -713,9 +985,11 @@ export function setupPlaylistHandlers(): void {
 
     // Deselect on background click
     if (playlistEl) {
+        playlistEl.addEventListener('mousedown', () => { playlistFocused = true; });
         playlistEl.addEventListener('click', (e) => {
             // Only if directly clicking the container (empty space)
             if (e.target === playlistEl) {
+                playlistFocused = true;
                 state.update({ selectedIndices: [] });
                 pivotIndex = -1;
                 anchorIndex = -1;
@@ -759,7 +1033,25 @@ export function setupPlaylistHandlers(): void {
         });
     }
 
-    document.addEventListener('mouseup', () => { draggedIndex = -1; isDragging = false; document.body.style.cursor = ''; });
+    document.addEventListener('mouseup', () => {
+        draggedIndex = -1; isDragging = false; document.body.style.cursor = '';
+        selectDragging = false;
+        pressIndex = -1;
+        // A row click (if any) fires right after mouseup and consumes
+        // suppressClick first; otherwise clear it so the next real click works.
+        setTimeout(() => { suppressClick = false; }, 0);
+    });
+    // Clicking anywhere outside the playlist defocuses it so arrows/Delete
+    // stop driving the playlist while the user works elsewhere in the GUI.
+    if (!_focusWired) {
+        _focusWired = true;
+        document.addEventListener('mousedown', (e) => {
+            const t = e.target as HTMLElement | null;
+            if (playlistEl && t && playlistEl.contains(t)) return;
+            if (t && t.closest && t.closest('#contextMenu')) return;
+            playlistFocused = false;
+        }, true);
+    }
     // Cancelled drags (Esc, drop outside) previously left the highlight stuck.
     document.addEventListener('dragend', () => {
         draggedIndex = -1; isDragging = false; document.body.style.cursor = '';
@@ -773,10 +1065,105 @@ export function setupPlaylistHandlers(): void {
     const ctxRemove = document.getElementById('ctxRemove');
     const ctxMoveUp = document.getElementById('ctxMoveUp');
     const ctxMoveDown = document.getElementById('ctxMoveDown');
-    const ctxPlay = document.getElementById('ctxPlay');
+    const ctxSelectAll = document.getElementById('ctxSelectAll');
+    const ctxFocusPlaying = document.getElementById('ctxFocusPlaying');
+    const ctxLoadToSampler = document.getElementById('ctxLoadToSampler');
+    const ctxAnalyzeBPM = document.getElementById('ctxAnalyzeBPM');
+    const ctxTrackInfo = document.getElementById('ctxTrackInfo');
+    const ctxShowInFolder = document.getElementById('ctxShowInFolder');
+    const ctxCopyPath = document.getElementById('ctxCopyPath');
+    const ctxClearPlaylist = document.getElementById('ctxClearPlaylist');
+    const samplerSubmenu = document.getElementById('samplerSubmenu');
+
+    // Submenu hover wiring (dismisses cleanly on leave / outside click / ESC)
+    if (ctxLoadToSampler && samplerSubmenu) {
+        ctxLoadToSampler.addEventListener('mouseenter', () => showSamplerSubmenu());
+        ctxLoadToSampler.addEventListener('mouseleave', () => {
+            if (_submenuHideTimer) clearTimeout(_submenuHideTimer);
+            _submenuHideTimer = setTimeout(() => {
+                try {
+                    if (samplerSubmenu.matches(':hover') || ctxLoadToSampler.matches(':hover')) return;
+                } catch { /* ignore */ }
+                hideSamplerSubmenu();
+            }, 150);
+        });
+        samplerSubmenu.addEventListener('mouseenter', () => {
+            if (_submenuHideTimer) { clearTimeout(_submenuHideTimer); _submenuHideTimer = null; }
+        });
+        samplerSubmenu.addEventListener('mouseleave', () => hideSamplerSubmenu());
+    }
+
+    if (ctxFocusPlaying) ctxFocusPlaying.addEventListener('click', () => {
+        focusPlayingTrack();
+    });
+
+    if (ctxAnalyzeBPM) ctxAnalyzeBPM.addEventListener('click', () => {
+        const target = getContextTargetIndex();
+        const indices = state.selectedIndices.length ? [...state.selectedIndices] : (target >= 0 ? [target] : []);
+        if (!indices.length) {
+            try { toast.info('NOTHING TO ANALYZE'); } catch { /* ignore */ }
+            return;
+        }
+        reanalyzeTracks(indices);
+    });
+
+    if (ctxTrackInfo) ctxTrackInfo.addEventListener('click', () => {
+        const target = getContextTargetIndex();
+        const track = state.playlist[target] ?? state.playlist[state.selectedIndices[0]];
+        if (!track) {
+            try { toast.info('NO TRACK SELECTED'); } catch { /* ignore */ }
+            return;
+        }
+        void import('./track-info').then((m) => m.openTrackInfo(track)).catch(() => undefined);
+    });
+
+    if (ctxShowInFolder) ctxShowInFolder.addEventListener('click', () => {
+        const target = getContextTargetIndex();
+        const track = state.playlist[target] ?? state.playlist[state.selectedIndices[0]];
+        if (!track) return;
+        const show = window.fileSystem?.showItemInFolder;
+        if (typeof show !== 'function') {
+            try { toast.error('NOT AVAILABLE IN THIS ENVIRONMENT'); } catch { /* ignore */ }
+            return;
+        }
+        void show(track.path).then((ok) => {
+            if (!ok) try { toast.error('COULD NOT OPEN FILE LOCATION'); } catch { /* ignore */ }
+        }).catch(() => {
+            try { toast.error('COULD NOT OPEN FILE LOCATION'); } catch { /* ignore */ }
+        });
+    });
+
+    if (ctxCopyPath) ctxCopyPath.addEventListener('click', () => {
+        const target = getContextTargetIndex();
+        const track = state.playlist[target] ?? state.playlist[state.selectedIndices[0]];
+        if (!track) return;
+        const done = () => { try { toast.success('FILE PATH COPIED'); } catch { /* ignore */ } };
+        const fail = () => { try { toast.error('COPY FAILED'); } catch { /* ignore */ } };
+        try {
+            if (navigator.clipboard?.writeText) {
+                navigator.clipboard.writeText(track.path).then(done, fail);
+            } else {
+                const ta = document.createElement('textarea');
+                ta.value = track.path;
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand('copy');
+                document.body.removeChild(ta);
+                done();
+            }
+        } catch { fail(); }
+    });
+
+    if (ctxClearPlaylist) ctxClearPlaylist.addEventListener('click', () => {
+        clearPlaylist();
+    });
 
     if (ctxRemove) ctxRemove.addEventListener('click', () => {
         removeSelectedTracks();
+    });
+
+    if (ctxSelectAll) ctxSelectAll.addEventListener('click', () => {
+        selectAllTracks();
     });
 
     if (ctxMoveUp) ctxMoveUp.addEventListener('click', () => {
@@ -833,23 +1220,5 @@ export function setupPlaylistHandlers(): void {
             selectedIndices: [...sel],
             ...(newCur !== state.currentTrackIndex ? { currentTrackIndex: newCur } : {}),
         });
-    });
-
-    if (ctxPlay) ctxPlay.addEventListener('click', () => {
-         if (contextMenu) {
-             const idxStr = contextMenu.dataset.ctxIndex;
-             if (idxStr) {
-                 const idx = parseInt(idxStr);
-                 if (!isNaN(idx) && idx >= 0 && idx < state.playlist.length) {
-                     if (loadTrackFn) {
-                         const gen = ++_uiLoadGen;
-                         loadTrackFn(idx).then(() => {
-                             if (gen !== _uiLoadGen) return;
-                             if (playTrackFn) playTrackFn();
-                         }).catch(() => undefined);
-                     }
-                 }
-             }
-         }
     });
 }

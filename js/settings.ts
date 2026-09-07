@@ -92,6 +92,8 @@ export function initSettings(deps: { setAutoMixEnabled: (enabled: boolean) => vo
         if (e.target === helpModal && helpModal) closeModal(helpModal);
         const consoleModal = document.getElementById('consoleModal');
         if (e.target === consoleModal && consoleModal) closeModal(consoleModal);
+        const trackInfoModal = document.getElementById('trackInfoModal');
+        if (e.target === trackInfoModal && trackInfoModal) closeModal(trackInfoModal);
     });
 
     setupSettingsHandlers();

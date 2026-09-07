@@ -27,6 +27,7 @@ import { HighFidelityRecorder } from './recorder-client';
 
 import { saveSession, loadSession, purgeLegacySessionKey } from './session';
 import { initCrashRecovery, checkAndRestore } from './crash-recovery';
+import { initTrackInfo } from './track-info';
 import { NUM_PADS } from './constants';
 
 import './types';
@@ -293,13 +294,15 @@ function setupGlobalKeyboardShortcuts() {
                 import('./modals').then(({ closeModal }) => closeModal(activeModal as HTMLElement));
                 return;
             }
-            // Fallback: hide any visible context menus
-            const visibleMenus = document.querySelectorAll('.context-menu:not(.hidden)');
+            // Fallback: hide any visible context menus (incl. sampler submenu)
+            const visibleMenus = document.querySelectorAll('.context-menu:not(.hidden), .context-submenu:not(.hidden)');
             if (visibleMenus.length > 0) {
                 visibleMenus.forEach(menu => {
                     (menu as HTMLElement).classList.add('hidden');
                     menu.setAttribute('aria-hidden', 'true');
                 });
+                const samplerParent = document.getElementById('ctxLoadToSampler');
+                if (samplerParent) samplerParent.setAttribute('aria-expanded', 'false');
             }
             return;
         }
@@ -345,12 +348,22 @@ function setupGlobalKeyboardShortcuts() {
             }
         }
         
-        // Playlist Navigation — only when focus is not inside an
-        // interactive control (buttons/inputs/selects), otherwise Delete or
-        // arrows hijack the focused control's native behavior.
-        if (['ArrowUp', 'ArrowDown', 'Delete', 'Backspace'].includes(e.key)) {
-            if (tag === 'INPUT' || tag === 'BUTTON' || tag === 'SELECT' || tag === 'TEXTAREA') return;
-            if (target?.isContentEditable) return;
+        // Playlist Navigation — blocked only inside genuine text-editing
+        // contexts. Buttons/sliders must NOT block Delete (Delete has no
+        // native behavior there, and the old blanket block is why Delete
+        // "did nothing" after clicking any control). Whether the playlist
+        // reacts at all is decided by its own focus flag (clicking elsewhere
+        // in the GUI defocuses it).
+        const isTextEdit = tag === 'TEXTAREA' || tag === 'SELECT'
+            || (target?.isContentEditable ?? false)
+            || (tag === 'INPUT' && ['text', 'search', 'number', 'password', 'url', 'email', 'tel'].includes(inputType));
+        if ((e.ctrlKey || e.metaKey) && (e.key === 'a' || e.key === 'A')) {
+            if (isTextEdit) return;
+            handlePlaylistNavigation(e);
+        } else if (['ArrowUp', 'ArrowDown', 'Delete', 'Backspace'].includes(e.key)) {
+            if (isTextEdit) return;
+            if (tag === 'INPUT' && inputType === 'range' && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) return;
+            if (tag === 'SELECT' && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) return;
             handlePlaylistNavigation(e);
         }
     });
@@ -478,6 +491,9 @@ async function initApp() {
     } catch { /* Sonetra bridge unavailable — non-fatal */ }
 
     initSettings({ setAutoMixEnabled });
+
+    // Track Info modal (playlist context menu) — focus trap + ESC via shared helpers
+    initTrackInfo();
 
     // Initialize UI components
     // NOTE: createPadGrid() is already called inside initSampler() — do NOT call it again here
@@ -643,6 +659,13 @@ async function initApp() {
             playlistCtxMenu.classList.add('hidden');
             playlistCtxMenu.setAttribute('aria-hidden', 'true');
         }
+        const samplerSub = document.getElementById('samplerSubmenu');
+        if (samplerSub) {
+            samplerSub.classList.add('hidden');
+            samplerSub.setAttribute('aria-hidden', 'true');
+        }
+        const samplerParent = document.getElementById('ctxLoadToSampler');
+        if (samplerParent) samplerParent.setAttribute('aria-expanded', 'false');
         if (padContextMenuEl) {
             padContextMenuEl.classList.add('hidden');
             padContextMenuEl.setAttribute('aria-hidden', 'true');

@@ -24,6 +24,7 @@ export interface FileSystemAPI {
     readFile(filePath: string): Promise<Uint8Array | null>;
     saveFile(filePath: string, data: Uint8Array): Promise<boolean>;
     saveRecording(buffer: ArrayBuffer, filename: string): Promise<string | null>;
+    showItemInFolder(filePath: string): Promise<boolean>;
     appendLog(level: string, message: string): Promise<void>;
     getLogPath(): Promise<string>;
     ensureRecordingsDir(): Promise<string>;
@@ -77,6 +78,7 @@ export type IpcChannels =
     | 'fs:read-file'
     | 'fs:ensure-recordings-dir'
     | 'fs:save-recording'
+    | 'fs:show-item-in-folder'
     | 'fs:append-log'
     | 'fs:get-log-path'
     | 'sonetra:start-server'

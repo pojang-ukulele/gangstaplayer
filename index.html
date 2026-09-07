@@ -245,7 +245,7 @@
                     <div class="automix-option-row">
                         <!-- Sonetra AI OFF by default -->
                         <input type="checkbox" id="mixOptEnableAI" class="gangsta-check">
-                        <label for="mixOptEnableAI" class="automix-checkbox-label">AI Auto-Mix (Sonetra)</label>
+<label for="mixOptEnableAI" class="automix-checkbox-label">AI Auto-Mix (Sonetra)</label>
                     </div>
 
                     <!-- FADE SLIDERS -->
@@ -272,13 +272,98 @@
         </div>
     </div>
 
+    <!-- TRACK INFO / EDIT TAGS MODAL -->
+    <div id="trackInfoModal" class="modal" role="dialog" aria-modal="true" aria-label="Track Info">
+        <div class="modal-content modal-trackinfo">
+            <div class="modal-header">
+                <h2>TRACK INFO</h2>
+                <span class="close-modal" id="closeTrackInfo" aria-label="Close track info">&times;</span>
+            </div>
+            <div class="modal-body">
+                <div class="trackinfo-section">
+                    <div class="info-row">
+                        <span class="info-label">FILENAME:</span>
+                        <span class="info-value" id="infoFilename"></span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">DURATION:</span>
+                        <span class="info-value" id="infoDuration"></span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">FORMAT:</span>
+                        <span class="info-value" id="infoFormat"></span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">SAMPLE RATE:</span>
+                        <span class="info-value" id="infoSampleRate"></span>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">BPM:</span>
+                        <span class="info-value" id="infoBPM"></span>
+                    </div>
+                </div>
+                <hr class="trackinfo-separator">
+                <div class="tags-edit-section">
+                    <div class="tag-field-row">
+                        <label class="tag-label">TITLE:</label>
+                        <input type="text" class="tag-input" id="tagTitle" placeholder="Song Title">
+                    </div>
+                    <div class="tag-field-row">
+                        <label class="tag-label">ARTIST:</label>
+                        <input type="text" class="tag-input" id="tagArtist" placeholder="Artist">
+                    </div>
+                    <div class="tag-field-row">
+                        <label class="tag-label">ALBUM:</label>
+                        <input type="text" class="tag-input" id="tagAlbum" placeholder="Album">
+                    </div>
+                    <div class="tag-field-row">
+                        <label class="tag-label">GENRE:</label>
+                        <input type="text" class="tag-input" id="tagGenre" placeholder="Genre">
+                    </div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button id="btnSaveTags" class="btn btn-primary">SAVE TAGS</button>
+                <button id="btnCloseTrackInfo" class="btn automix-btn-full">CLOSE</button>
+            </div>
+        </div>
+    </div>
+
     <!-- NEW: Custom Context Menu -->
     <div id="contextMenu" class="context-menu hidden" role="menu" aria-hidden="true" aria-label="Playlist Context Menu">
-        <div class="context-item" id="ctxPlay" role="menuitem" tabindex="-1">PLAY</div>
+        <div class="context-section-label">PLAYBACK & QUEUE</div>
+        <div class="context-item" id="ctxFocusPlaying" role="menuitem" tabindex="-1">FOCUS TO PLAYING TRACK</div>
+        <div class="context-divider"></div>
+
+        <div class="context-section-label">SAMPLER INTEGRATION</div>
+        <div class="context-item has-submenu" id="ctxLoadToSampler" role="menuitem" aria-haspopup="true" aria-expanded="false" tabindex="-1">
+            LOAD TO SAMPLER PAD ▶
+            <div class="context-submenu hidden" id="samplerSubmenu" role="menu" aria-hidden="true" aria-label="Load to Sampler Pad">
+                <!-- Sampler pads will be dynamically inserted here -->
+            </div>
+        </div>
+        <div class="context-divider"></div>
+
+        <div class="context-section-label">ANALYSIS & METADATA</div>
+        <div class="context-item" id="ctxAnalyzeBPM" role="menuitem" tabindex="-1">ANALYZE BPM / KEY</div>
+        <div class="context-item" id="ctxTrackInfo" role="menuitem" tabindex="-1">TRACK INFO / EDIT TAGS</div>
+        <div class="context-divider"></div>
+
+        <div class="context-section-label">FILE SYSTEM ACTIONS</div>
+        <div class="context-item" id="ctxShowInFolder" role="menuitem" tabindex="-1">SHOW IN FILE EXPLORER / FINDER</div>
+        <div class="context-item" id="ctxCopyPath" role="menuitem" tabindex="-1">COPY FILE PATH</div>
+        <div class="context-divider"></div>
+
+        <div class="context-section-label">SELECTION & REMOVAL</div>
         <div class="context-item" id="ctxMoveUp" role="menuitem" tabindex="-1">MOVE UP</div>
         <div class="context-item" id="ctxMoveDown" role="menuitem" tabindex="-1">MOVE DOWN</div>
-        <div class="context-divider" role="separator"></div>
-        <div class="context-item" id="ctxRemove" role="menuitem" tabindex="-1">REMOVE FROM PLAYLIST</div>
+        <div class="context-item" id="ctxSelectAll" role="menuitem" tabindex="-1">SELECT ALL</div>
+        <div class="context-item" id="ctxRemove" role="menuitem" tabindex="-1">REMOVE SELECTED</div>
+        <div class="context-divider"></div>
+
+        <div class="context-section-label danger-zone">DANGER ZONE</div>
+        <div class="context-item context-item-danger" id="ctxClearPlaylist" role="menuitem" tabindex="-1">CLEAR PLAYLIST</div>
+
     </div>
 
     <!-- NEW: Pad Context Menu -->

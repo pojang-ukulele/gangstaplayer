@@ -453,6 +453,50 @@ function registerIpcHandlers(): void {
     }
   });
 
+  ipcMain.handle('fs:show-item-in-folder', async (_event, pathStr: string) => {
+    if (rateLimited('fs:show-item-in-folder', 500)) return false;
+    const validated = validatePath(pathStr);
+    if (!validated) {
+      logToDisk('ERROR', `Security: Blocked illegal show-item attempt for ${pathStr}`);
+      return false;
+    }
+    // Restrict to media/kit files so a compromised renderer can't probe
+    // arbitrary paths via Explorer/Finder side channels.
+    if (!isReadPathAllowed(validated)) {
+      logToDisk('ERROR', `Security: Blocked show-item for non-media file ${validated}`);
+      return false;
+    }
+    try {
+      let realPath: string;
+      try {
+        realPath = fs.realpathSync.native(validated);
+      } catch {
+        realPath = fs.realpathSync(validated);
+      }
+      if (realPath !== validated && !isReadPathAllowed(realPath)) {
+        logToDisk('ERROR', `Security: Blocked show-item symlink ${validated} -> ${realPath}`);
+        return false;
+      }
+      const checkPath = realPath || validated;
+      let stat: fs.Stats;
+      try {
+        stat = await fs.promises.stat(checkPath);
+      } catch {
+        logToDisk('ERROR', `Security: Blocked show-item for non-existent path ${validated}`);
+        return false;
+      }
+      if (!stat.isFile()) {
+        logToDisk('ERROR', `Security: Blocked show-item for non-file path ${validated}`);
+        return false;
+      }
+      shell.showItemInFolder(checkPath);
+      return true;
+    } catch (err) {
+      logToDisk('ERROR', `Security: show-item failed for ${validated}: ${err}`);
+      return false;
+    }
+  });
+
   // Persistent Logging Handlers
   ipcMain.handle('fs:append-log', async (_event, level: string, message: string) => {
     if (rateLimited('fs:append-log', 50)) return false;

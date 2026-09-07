@@ -21,6 +21,7 @@ contextBridge.exposeInMainWorld('fileSystem', {
   readFile: (path: string) => ipcRenderer.invoke('fs:read-file', path),
   ensureRecordingsDir: () => ipcRenderer.invoke('fs:ensure-recordings-dir'),
   saveRecording: (buffer: ArrayBuffer, filename: string) => ipcRenderer.invoke('fs:save-recording', buffer, filename),
+  showItemInFolder: (path: string) => ipcRenderer.invoke('fs:show-item-in-folder', path),
   appendLog: (level: string, message: string) => ipcRenderer.invoke('fs:append-log', level, message),
   getLogPath: () => ipcRenderer.invoke('fs:get-log-path')
 });
