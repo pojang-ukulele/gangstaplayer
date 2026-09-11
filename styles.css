@@ -996,22 +996,19 @@ input[type=range].progress-slider:hover::-webkit-slider-thumb {
     z-index: 0;
 }
 
-/* Empty Pad Hover Tooltip */
-.pad:not(.loaded):not(.loading):hover::after {
+/* Empty-pad hint swap: hovering an unloaded pad turns the centered EMPTY
+ * strip text into CLICK TO LOAD (same style/size/color), reverting on
+ * leave. Replaces the old floating ::after tooltip badge. */
+.pad:not(.loaded):not(.loading):hover .pad-empty {
+    font-size: 0;
+}
+.pad:not(.loaded):not(.loading):hover .pad-empty::after {
     content: 'CLICK TO LOAD';
-    position: absolute;
-    top: 50%;
-    left: 50%;
-    transform: translate(-50%, -50%);
-    width: max-content;
-    font-size: 0.8rem;
-    color: #666;
-    background: rgba(0,0,0,0.8);
-    padding: 2px 5px;
-    border-radius: 4px;
-    line-height: 1.1;
+    font-size: 0.68rem;
+    letter-spacing: 2px;
+    color: rgba(255, 255, 255, 0.28);
     pointer-events: none;
-    text-shadow: none;
+    user-select: none;
 }
 
 /* Loading Pad State */
@@ -1100,7 +1097,8 @@ input[type=range].progress-slider:hover::-webkit-slider-thumb {
     background: #111;
     border: 1px solid #444;
     box-shadow: 0 4px 10px rgba(0,0,0,0.8);
-    z-index: 2000;
+    /* M32: below modals (3000) so menus never cover dialogs. */
+    z-index: 1500;
     min-width: 180px;
     max-width: calc(100vw - 16px);
     max-height: calc(100vh - 16px);
@@ -1156,7 +1154,8 @@ input[type=range].progress-slider:hover::-webkit-slider-thumb {
 /* NEW: Custom Context Menu */
 .context-menu {
     position: fixed;
-    z-index: 2000;
+    /* M32: below modals (3000). */
+    z-index: 1500;
     background: #050505;
     border: 1px solid var(--neon-green);
     box-shadow: 0 0 10px var(--neon-green);
@@ -1248,6 +1247,25 @@ input[type=range].progress-slider:hover::-webkit-slider-thumb {
     transform: scale(1.1);
 }
 
+.rec-btn.loaded {
+    background: radial-gradient(circle at 30% 30%, #ff6b6b, #a01010);
+    border-color: #5a1111;
+    box-shadow:
+        0 0 0 1px #444,
+        0 0 6px rgba(255, 49, 49, 0.55),
+        inset 0 0 3px rgba(255, 255, 255, 0.25);
+}
+
+.rec-btn.playing {
+    background: radial-gradient(circle at 30% 30%, #ff9a9a, #ff2020);
+    border-color: #700;
+    box-shadow:
+        0 0 0 1px #666,
+        0 0 12px #ff3131,
+        0 0 24px rgba(255, 49, 49, 0.8),
+        inset 0 0 5px #fff;
+}
+
 .rec-btn.recording {
     background: #ff0000;
     border-color: #500;
@@ -1306,7 +1324,8 @@ input[type=range].progress-slider:hover::-webkit-slider-thumb {
 .modal {
     display: none;
     position: fixed;
-    z-index: 100;
+    /* M32: modals sit ABOVE context menus (menus 1500/submenu 1600). */
+    z-index: 3000;
     left: 0;
     top: 0;
     width: 100%;
@@ -1499,9 +1518,12 @@ input[type=range].volume-slider::-webkit-slider-thumb {
     position: absolute;
     top: 50%;
     transform: translate(-50%, -50%); /* Centered on position */
-    left: 100%; /* Default to max */
+    /* Knob is 45px wide: park its center 24.5px from the right edge at
+       100% so the full knob stays inside the track (matches JS). */
+    left: calc(100% - 24.5px); /* Default to max, kept inside */
     width: 45px;
     height: 20px;
+    box-sizing: border-box;
     background: linear-gradient(180deg, #333, #111);
     border: 1px solid #555;
     border-top: 1px solid #888;
@@ -1518,10 +1540,10 @@ input[type=range].volume-slider::-webkit-slider-thumb {
     text-shadow: 0 0 5px rgba(57, 255, 20, 0.4);
     box-shadow: 0 4px 8px rgba(0,0,0,0.6), inset 0 1px 0 rgba(255,255,255,0.1);
     pointer-events: none;
-    pointer-events: none;
     z-index: 10;
     -webkit-user-select: none;
     user-select: none;
+    will-change: left;
 }
 
 /* AUTO MIX Button - AI Mixer Toggle */
@@ -1729,6 +1751,11 @@ input[type=range]:focus-visible {
     height: 23px;
     display: flex;
     align-items: center;
+    box-sizing: border-box;
+    min-width: 0;
+    margin-right: 2px;
+    overflow: visible;
+    padding: 0;
 }
 
 /* Hidden file input */
@@ -2021,6 +2048,9 @@ input[type=range]:focus-visible {
     border: none;
     outline: none;
     margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+    min-width: 0;
     position: absolute;
     top: 0;
     left: 0;
@@ -2029,10 +2059,31 @@ input[type=range]:focus-visible {
     box-shadow: none;
 }
 
+#masterVol::-webkit-slider-runnable-track {
+    background: transparent;
+    border: none;
+    height: 100%;
+}
+
 #masterVol::-webkit-slider-thumb {
     -webkit-appearance: none;
     appearance: none;
     width: 45px; /* Match knob width for drag area */
+    height: 23px;
+    background: transparent;
+    cursor: pointer;
+    border: none;
+    box-shadow: none;
+}
+
+#masterVol::-moz-range-track {
+    background: transparent;
+    border: none;
+    height: 100%;
+}
+
+#masterVol::-moz-range-thumb {
+    width: 45px;
     height: 23px;
     background: transparent;
     cursor: pointer;
@@ -2057,7 +2108,7 @@ input[type=range]:focus-visible {
 
 /* Fix: Ensure Help Modal is above Settings Modal */
 #helpModal {
-    z-index: 200;
+    z-index: 3100;
 }
 
 #helpModal .modal-content {
@@ -2184,7 +2235,8 @@ input[type=range]:focus-visible {
     box-shadow: 0 0 10px var(--neon-purple, #bc13fe);
     border-radius: 4px;
     padding: 5px 0;
-    z-index: 2100;
+    /* M32: above parent menu but still below modals. */
+    z-index: 1600;
 }
 .context-submenu.hidden {
     display: none;
@@ -2319,4 +2371,293 @@ input[type=range]:focus-visible {
 .btn-primary:hover {
     background: #000;
     color: var(--neon-yellow, #ffcc00);
+}
+
+/* === SAMPLER PAD REDESIGN: numbered strip layout (idea pic) === */
+:root {
+    --pad-wave-bg: #0c330c;
+    --pad-wave-ink: #ff5c39;
+    --pad-wave-ink-edge: #c93a1e;
+    --pad-wave-sel: rgba(188, 19, 254, 0.35);
+    --pad-wave-playhead: #ffcc00;
+}
+
+/* Stack number row / waveform strip / sample name inside the pad */
+.pad {
+    flex-direction: column;
+    justify-content: flex-start;
+    align-items: stretch;
+    padding: 6px 6px 5px 6px;
+    gap: 4px;
+}
+
+/* Top row: pad number (always visible) + key/sync/midi badges */
+.pad-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding-left: 20px; /* clear the record LED */
+    min-height: 16px;
+    position: relative;
+    z-index: 3;
+}
+
+.pad-num {
+    font-size: 0.95rem;
+    font-weight: bold;
+    letter-spacing: 1px;
+    line-height: 1;
+    color: rgba(0, 0, 0, 0.75);
+    text-shadow: 0 1px 0 rgba(255, 255, 255, 0.15);
+}
+
+.pad:not(.loaded) .pad-num {
+    color: rgba(57, 255, 20, 0.55);
+    text-shadow: none;
+}
+
+.pad.active .pad-num {
+    color: #000;
+}
+
+.pad-badges {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.pad-key {
+    font-size: 0.7rem;
+    line-height: 1;
+    padding: 1px 4px;
+    border: 1px solid rgba(0, 0, 0, 0.5);
+    border-radius: 2px;
+    background: rgba(0, 0, 0, 0.35);
+    color: #ffe6cc;
+}
+
+.pad-sync {
+    font-size: 0.65rem;
+    line-height: 1;
+    font-weight: bold;
+    letter-spacing: 1px;
+    color: #ff5a5a;
+    text-shadow: 0 0 6px #ff3131;
+}
+
+.pad-midi {
+    font-size: 0.65rem;
+    line-height: 1;
+    font-weight: bold;
+    letter-spacing: 1px;
+    color: var(--neon-cyan);
+    text-shadow: 0 0 6px var(--neon-cyan);
+}
+
+/* Compact waveform strip: own green background, ember-red filled wave ink */
+.pad-wave {
+    position: relative;
+    height: 34px;
+    flex-shrink: 0;
+    background: var(--pad-wave-bg);
+    border: 1px solid #000;
+    border-radius: 3px;
+    overflow: hidden;
+    cursor: crosshair;
+    touch-action: none;
+    box-shadow: inset 0 0 10px rgba(0, 0, 0, 0.85);
+    z-index: 2;
+}
+
+.pad:not(.loaded) .pad-wave {
+    background: rgba(0, 0, 0, 0.35);
+    border-style: dashed;
+    border-color: rgba(255, 255, 255, 0.12);
+    cursor: default;
+}
+
+.pad.active .pad-wave {
+    box-shadow: inset 0 0 10px rgba(0, 0, 0, 0.85), 0 0 8px rgba(57, 255, 20, 0.6);
+}
+
+.pad-wave .pad-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
+}
+
+/* EMPTY hint centered in the strip until a sample loads (hidden after). */
+.pad-empty {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.68rem;
+    letter-spacing: 2px;
+    color: rgba(255, 255, 255, 0.28);
+    pointer-events: none;
+    user-select: none;
+}
+
+.pad-selection {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    background: var(--pad-wave-sel);
+    border-left: 1px solid var(--neon-purple);
+    border-right: 1px solid var(--neon-purple);
+    pointer-events: none;
+}
+
+.pad-playhead {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    margin-left: -1px;
+    background: var(--pad-wave-playhead);
+    box-shadow: 0 0 6px var(--pad-wave-playhead);
+    pointer-events: none;
+}
+
+/* Sample name below the strip, truncated with ellipsis */
+.pad-name {
+    display: block;
+    text-align: center;
+    font-size: 0.72rem;
+    line-height: 1.1;
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: rgba(0, 0, 0, 0.85);
+    text-shadow: 0 1px 0 rgba(255, 255, 255, 0.12);
+    position: relative;
+    z-index: 2;
+    min-height: 12px;
+}
+
+.pad:not(.loaded) .pad-name {
+    color: rgba(0, 0, 0, 0.55);
+}
+
+/* === PAD TRIGGER MOVE: LED + number + MIDI up top, square key button centered below strip === */
+.pad-top {
+    padding-left: 0;
+    gap: 6px;
+}
+
+.pad-top .rec-btn {
+    position: static;
+    flex-shrink: 0;
+}
+
+.pad-top .pad-num {
+    flex: 1;
+    text-align: left;
+}
+
+/* Slim key chip, centered under the waveform strip.
+   The outer .pad div keeps all trigger/long-press/menu listeners
+   (button clicks bubble up), so this is purely the visual hit-target. */
+.pad-trigger {
+    align-self: center;
+    width: auto;
+    min-width: 30px;
+    height: 20px;
+    padding: 0 9px;
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    border-radius: 10px;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    font-family: 'VT323', 'Courier New', monospace;
+    background: rgba(0, 0, 0, 0.35);
+    color: rgba(57, 255, 20, 0.75);
+    box-shadow:
+        inset 0 1px 2px rgba(0, 0, 0, 0.6),
+        0 1px 0 rgba(255, 255, 255, 0.08);
+    transition: transform 0.05s, background-color 0.1s, box-shadow 0.1s, border-color 0.1s, color 0.1s;
+}
+
+.pad-trigger:hover {
+    transform: translateY(-1px);
+    border-color: rgba(57, 255, 20, 0.45);
+    color: var(--neon-green);
+    box-shadow:
+        inset 0 1px 2px rgba(0, 0, 0, 0.6),
+        0 1px 0 rgba(255, 255, 255, 0.08),
+        0 0 8px rgba(57, 255, 20, 0.25);
+}
+
+.pad-trigger:active {
+    transform: translateY(1px);
+    background: rgba(0, 0, 0, 0.5);
+    box-shadow:
+        inset 0 2px 4px rgba(0, 0, 0, 0.7);
+}
+
+.pad-trigger .pad-key {
+    font-size: 0.85rem;
+    line-height: 1;
+    letter-spacing: 1px;
+    padding: 0;
+    border: none;
+    border-radius: 0;
+    background: transparent;
+    color: inherit;
+}
+
+.pad:not(.loaded) .pad-trigger {
+    color: rgba(57, 255, 20, 0.75);
+}
+
+/* Unloaded pads show a bigger key letter/number, like the empty-state mock. */
+.pad:not(.loaded):not(.loading) .pad-trigger .pad-key {
+    font-size: 1.3rem;
+}
+
+.pad.loaded .pad-trigger {
+    background: rgba(0, 0, 0, 0.28);
+    border-color: rgba(0, 0, 0, 0.4);
+    color: rgba(0, 0, 0, 0.8);
+    box-shadow:
+        inset 0 1px 2px rgba(0, 0, 0, 0.4),
+        0 1px 0 rgba(255, 255, 255, 0.2);
+}
+
+.pad.loaded .pad-trigger:hover {
+    background: rgba(0, 0, 0, 0.38);
+    border-color: rgba(0, 0, 0, 0.55);
+    color: #000;
+    box-shadow:
+        inset 0 1px 2px rgba(0, 0, 0, 0.4),
+        0 1px 0 rgba(255, 255, 255, 0.2),
+        0 0 8px rgba(0, 0, 0, 0.3);
+}
+
+.pad.active .pad-trigger {
+    transform: translateY(1px);
+    background: rgba(0, 0, 0, 0.45);
+    border-color: rgba(0, 0, 0, 0.6);
+    box-shadow:
+        inset 0 1px 3px rgba(0, 0, 0, 0.7),
+        0 0 12px rgba(57, 255, 20, 0.5);
+    color: #fff;
+}
+
+.pad-trigger:focus {
+    outline: none;
+}
+
+.pad-trigger:focus-visible {
+    outline: none;
+    border-color: var(--neon-green);
+    box-shadow: 0 0 10px rgba(57, 255, 20, 0.5), inset 0 0 6px rgba(57, 255, 20, 0.3);
 }

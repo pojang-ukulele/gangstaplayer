@@ -43,11 +43,31 @@ function canonicalize(value: unknown): string {
     const keys = Object.keys(value as Record<string, unknown>).filter(k => k !== 'signature').sort();
     return `{${keys.map(k => `${JSON.stringify(k)}:${canonicalize((value as Record<string, unknown>)[k])}`).join(',')}}`;
 }
+/** FNV-1a fallback for file:// / non-secure contexts without crypto.subtle. */
+function fallbackHashHex(data: string): string {
+    let h1 = 0x811c9dc5;
+    let h2 = 0x01000193;
+    for (let i = 0; i < data.length; i++) {
+        const c = data.charCodeAt(i);
+        h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
+        h2 = Math.imul(h2 ^ (c + (i & 0xff)), 0x01000193) >>> 0;
+    }
+    const mix = (n: number): string => (n >>> 0).toString(16).padStart(8, '0');
+    // 64 hex chars to match SHA-256 shape (corruption-evidence only).
+    return (mix(h1) + mix(h2) + mix(h1 ^ h2) + mix(h1 + h2) + mix(h1 ^ 0x9e3779b9) + mix(h2 ^ 0x85ebca6b) + mix(h1 + h2 + 1) + mix(h2 + h1 + 2)).slice(0, 64);
+}
 async function sha256Hex(data: string): Promise<string> {
-    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(data));
-    return Array.from(new Uint8Array(digest))
-        .map(b => b.toString(16).padStart(2, '0'))
-        .join('');
+    try {
+        const subtle = (typeof crypto !== 'undefined' ? (crypto as Crypto).subtle : undefined);
+        // M29: crypto.subtle is undefined in non-secure contexts (file://).
+        if (!subtle || typeof subtle.digest !== 'function') return fallbackHashHex(data);
+        const digest = await subtle.digest('SHA-256', new TextEncoder().encode(data));
+        return Array.from(new Uint8Array(digest))
+            .map(b => b.toString(16).padStart(2, '0'))
+            .join('');
+    } catch {
+        return fallbackHashHex(data);
+    }
 }
 
 async function verifyChecksum(data: string, expected: string): Promise<boolean> {
@@ -100,6 +120,7 @@ interface SessionData {
             bpmSync: boolean;
             trackDuration: number;
             btnDuration: number;
+            enableAI?: boolean;
         };
     };
     ui: {
@@ -165,6 +186,7 @@ export async function saveSession(): Promise<void> {
                     bpmSync: settings.autoMix.bpmSync,
                     trackDuration: settings.autoMix.trackDuration,
                     btnDuration: settings.autoMix.btnDuration,
+                    enableAI: settings.autoMix.enableAI,
                 },
             },
             ui: {
@@ -200,6 +222,18 @@ export async function saveSession(): Promise<void> {
 
 // === Load ===
 
+/** Bumps on every loadSession start AND on rollback — stale per-pad awaits check it. */
+let sessionLoadGen = 0;
+
+function readSliderNumber(id: string): number | null {
+    try {
+        const el = document.getElementById(id) as HTMLInputElement | null;
+        if (!el) return null;
+        const v = Number(el.value);
+        return Number.isFinite(v) ? v : null;
+    } catch { return null; }
+}
+
 export async function loadSession(): Promise<void> {
     let rollback: {
         playlist: Track[];
@@ -210,10 +244,20 @@ export async function loadSession(): Promise<void> {
         masterBPM: number;
         isAutoMixEnabled: boolean;
         blendingIndex: number;
+        autoMix: { eqCrossfade: boolean; filterSweep: boolean; hpfSweep: boolean; bpmSync: boolean; trackDuration: number; btnDuration: number; enableAI: boolean };
+        masterVolume: number | null;
+        tempoValue: number | null;
         pads: Array<{ buf: AudioBuffer | undefined; path: string; vol: number; bpm: number; sync: boolean; ls: number; le: number }>;
     } | null = null;
+    // Generation guard: per-pad loads that time out keep running in the
+    // background (no abort). Without this their late resolve overwrites the
+    // pad — or the rollback — minutes later (ghost sample).
+    const loadGen = ++sessionLoadGen;
     const restoreRollback = () => {
         if (!rollback) return;
+        // Invalidate in-flight per-pad loads so their late resolves skip
+        // post-await writes (ghost samples over the restored kit).
+        sessionLoadGen++;
         try {
             state.update({
                 playlist: rollback.playlist,
@@ -228,6 +272,7 @@ export async function loadSession(): Promise<void> {
             });
             rollback.pads.forEach((p, i) => {
                 if (p.buf) padBuffers[i] = p.buf;
+                else padBuffers[i] = undefined!;
                 padPaths[i] = p.path;
                 padVolumes[i] = p.vol;
                 padBPMs[i] = p.bpm;
@@ -235,6 +280,37 @@ export async function loadSession(): Promise<void> {
                 padLoopStart[i] = p.ls;
                 padLoopEnd[i] = p.le;
             });
+            // Rollback previously restored playlist+pads but left the restored
+            // EQ/fade/volume/tempo in place — a mixed old/new desync.
+            try {
+                updateAutoMix({ ...rollback.autoMix });
+                applySettingsToUI();
+            } catch { /* ignore */ }
+            try {
+                if (rollback.masterVolume !== null) {
+                    const volSlider = document.getElementById('masterVol') as HTMLInputElement | null;
+                    if (volSlider) {
+                        volSlider.value = String(rollback.masterVolume);
+                        volSlider.dispatchEvent(new Event('input'));
+                    }
+                }
+                if (rollback.tempoValue !== null) {
+                    const tempo = document.getElementById('tempoSlider') as HTMLInputElement | null;
+                    if (tempo) {
+                        tempo.value = String(rollback.tempoValue);
+                        tempo.dispatchEvent(new Event('input'));
+                    }
+                }
+            } catch { /* ignore */ }
+            // Pad UI previously kept showing the failed-load empties while the
+            // toast claimed PREVIOUS STATE RESTORED — re-sync sliders.
+            try {
+                const grid = document.getElementById('padGrid');
+                rollback.pads.forEach((p, i) => {
+                    const slider = grid?.children[i]?.querySelector('.pad-slider') as HTMLInputElement | null;
+                    if (slider) slider.value = String(p.vol);
+                });
+            } catch { /* ignore */ }
         } catch { /* best-effort */ }
     };
     try {
@@ -277,8 +353,12 @@ export async function loadSession(): Promise<void> {
             logger.warn('[Session] No checksum found - loading legacy session (no integrity check)');
         }
 
+        // M28: unknown schema must fail loudly — warn-only let future
+        // versions silently load into a mismatched shape and corrupt state.
         if (session.version !== SESSION_VERSION) {
-            logger.warn(`[Session] Version mismatch: expected ${SESSION_VERSION}, got ${session.version}`);
+            logger.error(`[Session] Unsupported version ${session.version} (expected ${SESSION_VERSION}) — load aborted`);
+            toast.error('UNSUPPORTED SESSION VERSION — LOAD ABORTED');
+            return;
         }
 
         // 1. Snapshot current state first — a failed kit restore must not
@@ -301,17 +381,39 @@ export async function loadSession(): Promise<void> {
             masterBPM: state.masterBPM,
             isAutoMixEnabled: state.isAutoMixEnabled,
             blendingIndex: state.blendingIndex,
+            autoMix: { ...settings.autoMix },
+            masterVolume: readSliderNumber('masterVol'),
+            tempoValue: readSliderNumber('tempoSlider'),
             pads: padSnap,
         };
         try {
             const { clearAnalysisQueue } = await import('./playlist');
             clearAnalysisQueue();
         } catch { /* ignore */ }
+        // Stop the live deck BEFORE swapping the list (C18/M18) — otherwise
+        // the old audio keeps playing while the index points into the new
+        // list, and a stale finishCrossfade timer can promote mid-restore.
+        try {
+            const { abortCrossfade } = await import('./player');
+            abortCrossfade();
+        } catch { /* ignore */ }
+        try {
+            const { engine } = await import('./audio-engine');
+            try { engine.main.audio.pause(); } catch { /* ignore */ }
+            try { engine.main.audio.removeAttribute('src'); engine.main.audio.load(); }
+            catch { try { engine.main.audio.src = ''; } catch { /* ignore */ } }
+            try { engine.crossfade.audio.pause(); } catch { /* ignore */ }
+            try { engine.crossfade.audio.removeAttribute('src'); engine.crossfade.audio.load(); }
+            catch { try { engine.crossfade.audio.src = ''; } catch { /* ignore */ } }
+        } catch { /* ignore */ }
         state.update({
             playlist: [],
             selectedIndices: [],
             currentTrackIndex: -1,
             isPlaying: false,
+            isCrossfadeInProgress: false,
+            blendingIndex: -1,
+            masterBPM: 0,
         });
 
         // 2. Load playlist (validated, bounded — crafted files must not OOM)
@@ -324,6 +426,16 @@ export async function loadSession(): Promise<void> {
                 bpm: t.bpm === undefined ? undefined : clampNum(t.bpm, 0, 300, 0),
             }));
             state.update({ playlist: clean });
+            // BPM-less tracks get no analysis otherwise — the queue was
+            // cleared above and nothing re-enqueues on this path (C18).
+            try {
+                const { reanalyzeTracks } = await import('./playlist');
+                const missing = clean
+                    .map((t, i) => ({ t, i }))
+                    .filter(({ t }) => !(t.bpm !== undefined && t.bpm > 0))
+                    .map(({ i }) => i);
+                if (missing.length) reanalyzeTracks(missing);
+            } catch { /* analysis is best-effort */ }
         }
 
         // 3. Load kit
@@ -347,8 +459,29 @@ export async function loadSession(): Promise<void> {
                 const idx = Number((p as SessionPad)?.index);
                 const ppath = typeof (p as SessionPad)?.path === 'string' ? (p as SessionPad).path.slice(0, 32760) : '';
                 if (!ppath || !Number.isInteger(idx) || idx < 0 || idx >= NUM_PADS) continue;
+                if (loadGen !== sessionLoadGen) break; // rolled back mid-loop — stop writing
+                const orig = loadSampleFromPath(ppath, idx);
+                // Late-resolve guard: the timed-out load keeps decoding in the
+                // background; if it lands after a rollback/newer load, undo the
+                // ghost commit for this pad.
+                void orig.then(() => {
+                    if (loadGen !== sessionLoadGen && rollback) {
+                        try {
+                            const snap = rollback.pads[idx];
+                            if (snap) {
+                                if (snap.buf) padBuffers[idx] = snap.buf;
+                                else padBuffers[idx] = undefined!;
+                                padPaths[idx] = snap.path;
+                                padVolumes[idx] = snap.vol;
+                                padBPMs[idx] = snap.bpm;
+                                padSyncState[idx] = snap.sync;
+                            }
+                        } catch { /* ignore */ }
+                    }
+                }).catch(() => undefined);
                 try {
-                    await withTimeout(loadSampleFromPath(ppath, idx), 20000);
+                    await withTimeout(orig, 20000);
+                    if (loadGen !== sessionLoadGen) break; // stale — skip post-await writes
                     const vol = (p as SessionPad).vol;
                     if (typeof vol === 'number' && Number.isFinite(vol)) padVolumes[idx] = Math.min(1, Math.max(0, vol));
                     const bpm = (p as SessionPad).bpm;
@@ -361,13 +494,22 @@ export async function loadSession(): Promise<void> {
 
                     // Update the volume slider UI
                     const grid = document.getElementById('padGrid');
+                    if (!grid) {
+                        // Load-before-grid previously desync'd padVolumes from
+                        // sliders with zero signal.
+                        logger.warn(`[Session] Pad ${idx} slider skipped (pad grid not built)`);
+                    }
                     const slider = grid?.children[idx]?.querySelector('.pad-slider') as HTMLInputElement;
                     if (slider) slider.value = padVolumes[idx].toString();
                     try {
                         const { renderWaveform } = await import('./sampler');
                         renderWaveform(idx);
                     } catch { /* ignore */ }
-                } catch { /* per-pad failure is non-fatal */ }
+                } catch (e) {
+                    // Per-pad failure is non-fatal for the loop, but silent
+                    // before — 16 missing files printed SUCCESS on an empty kit.
+                    logger.warn(`[Session] Pad ${idx} restore failed (${ppath})`, e);
+                }
             }
         }
 
@@ -376,7 +518,7 @@ export async function loadSession(): Promise<void> {
         // reads the DOM checkboxes, and stale checkboxes were overwriting the
         // restored values immediately after load.
         if (session.settings?.autoMix) {
-            const { eqCrossfade, filterSweep, hpfSweep, bpmSync, trackDuration, btnDuration } = session.settings.autoMix;
+            const { eqCrossfade, filterSweep, hpfSweep, bpmSync, trackDuration, btnDuration, enableAI } = session.settings.autoMix;
             const bool = (v: unknown, fb: boolean): boolean => typeof v === 'boolean' ? v : fb;
             updateAutoMix({
                 eqCrossfade: bool(eqCrossfade, true),
@@ -385,6 +527,7 @@ export async function loadSession(): Promise<void> {
                 bpmSync: bool(bpmSync, false),
                 trackDuration: clampNum(trackDuration, 0.5, 60, 10),
                 btnDuration: clampNum(btnDuration, 0.5, 30, 4),
+                enableAI: bool(enableAI, false),
             });
             applySettingsToUI();
         }
@@ -422,6 +565,13 @@ export async function loadSession(): Promise<void> {
             const { renderPlaylist } = await import('./playlist');
             renderPlaylist();
         } catch { /* playlist UI refresh is best-effort */ }
+        // A manual load supersedes the auto-snapshot: leaving it behind
+        // previously re-prompted "Restore unsaved session?" on the next boot
+        // for pre-load state, inviting a double-restore clobber.
+        try {
+            const { clearSnapshots } = await import('./crash-recovery');
+            clearSnapshots();
+        } catch { /* ignore */ }
         toast.success("SESSION LOADED");
         logger.info(`[Session] Loaded from ${filePath}`);
     } catch (err) {

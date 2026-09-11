@@ -42,6 +42,7 @@ class GangstaProcessor extends GBaseProcessor {
   private smoothCutoff = 20000;
   private smoothDrive = 0;
   private smoothBitDepth = 16;
+  private smoothResonance = 0.1;
   private smoothingFactor = 0.05; 
 
   private resetStates(): void {
@@ -49,6 +50,21 @@ class GangstaProcessor extends GBaseProcessor {
     this.stateR = [0, 0, 0, 0];
     this.prevL = 0;
     this.prevR = 0;
+  }
+
+  /** Passthrough the unprocessed tail so a mid-block reset degrades to dry
+   * instead of leaving stale/zero samples (click). */
+  private passthroughFrom(inputs: Float32Array[][], outputs: Float32Array[][], from: number): void {
+    try {
+      const count = inputs[0]?.length ?? 0;
+      for (let channel = 0; channel < inputs.length; channel++) {
+        const chanIn = inputs[channel];
+        const chanOut = outputs[channel];
+        if (!chanIn || !chanOut) continue;
+        const m = Math.min(chanIn.length, chanOut.length, count);
+        for (let i = from; i < m; i++) chanOut[i] = chanIn[i];
+      }
+    } catch { /* ignore */ }
   }
 
   process(inputs: Float32Array[][], outputs: Float32Array[][], parameters: Record<string, Float32Array>) {
@@ -62,12 +78,12 @@ class GangstaProcessor extends GBaseProcessor {
     const targetBitDepth = parameters.bitDepth?.[0] ?? 16;
     const targetDrive = parameters.drive?.[0] ?? 0;
     const targetCutoff = parameters.filterCutoff?.[0] ?? 20000;
-    const resonance = parameters.filterResonance?.[0] ?? 0.1;
+    const targetResonance = parameters.filterResonance?.[0] ?? 0.1;
 
     // Bypass: defaults mean bitcrusher/drive/filter are all no-ops. Running
     // 2x oversample + ladder per sample anyway wastes CPU on every quantum.
     const isBypass = targetBitDepth >= 15.5 && targetDrive <= 0.001
-        && targetCutoff >= 19900 && resonance <= 0.11
+        && targetCutoff >= 19900 && targetResonance <= 0.11
         && this.smoothBitDepth >= 15.5 && this.smoothDrive <= 0.001 && this.smoothCutoff >= 19900;
     if (isBypass) {
         for (let channel = 0; channel < input.length; channel++) {
@@ -84,14 +100,16 @@ class GangstaProcessor extends GBaseProcessor {
 
     // OVERSAMPLING CONSTANTS
     const osRate = sampleRate * 2;
-    // Clamp feedback: r up to 4.0 previously latched Infinity/NaN forever.
-    const r = Math.min(3.0, Math.max(0, resonance * 4.0));
 
     for (let i = 0; i < n; i++) {
-      // 1. Parameter Smoothing (per-sample)
+      // 1. Parameter Smoothing (per-sample) — resonance included: a CC sweep
+      // previously stepped per 128-block while everything else slewed.
       this.smoothCutoff += (targetCutoff - this.smoothCutoff) * this.smoothingFactor;
       this.smoothDrive += (targetDrive - this.smoothDrive) * this.smoothingFactor;
       this.smoothBitDepth += (targetBitDepth - this.smoothBitDepth) * this.smoothingFactor;
+      this.smoothResonance += (targetResonance - this.smoothResonance) * this.smoothingFactor;
+      // Clamp feedback: r up to 4.0 previously latched Infinity/NaN forever.
+      const r = Math.min(3.0, Math.max(0, this.smoothResonance * 4.0));
 
       // Filter Coeffs calculated for OVERSAMPLED rate
       const f = (this.smoothCutoff / osRate) * 2;
@@ -131,7 +149,7 @@ class GangstaProcessor extends GBaseProcessor {
             // D. 24dB LADDER FILTER (At high rate)
             // Stability is much higher at 2x rate
             let y = x - r * lpState[3];
-            if (!Number.isFinite(y)) { this.resetStates(); return true; }
+            if (!Number.isFinite(y)) { this.resetStates(); this.passthroughFrom(inputs, outputs, i); return true; }
 
             lpState[0] = lpState[0] + f * (y - lpState[0]);
             lpState[1] = lpState[1] + f * (lpState[0] - lpState[1]);
@@ -139,6 +157,7 @@ class GangstaProcessor extends GBaseProcessor {
             lpState[3] = lpState[3] + f * (lpState[2] - lpState[3]);
             if (!Number.isFinite(lpState[0] + lpState[1] + lpState[2] + lpState[3])) {
                 this.resetStates();
+                this.passthroughFrom(inputs, outputs, i);
                 return true;
             }
             // Saturate state so extremes can't accumulate into silence.

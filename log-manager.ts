@@ -55,11 +55,13 @@ class LogManager {
         }
     }
 
-    private flushBuffer(): void {
+    private flushBuffer(keepBuffer = false): void {
         if (this.buffer.length === 0) return;
         const batch = this.buffer.join('');
-        this.buffer = [];
-        this.currentBufferSize = 0;
+        if (!keepBuffer) {
+            this.buffer = [];
+            this.currentBufferSize = 0;
+        }
         this.flushEntryToDisk(batch);
     }
 
@@ -76,16 +78,25 @@ class LogManager {
         }
     }
 
+    private _lastRotationCheck = 0;
+    private readonly ROTATION_CHECK_MS = 30_000;
+
     private flushEntryToDisk(entry: string) {
         try {
-            // Rotation: unbounded gangsta_log.txt was a renderer-spammable disk-fill.
-            try {
-                const st = fs.statSync(this.logFilePath);
-                if (st.size > this.MAX_LOG_FILE_BYTES) {
-                    const backup = `${this.logFilePath}.1`;
-                    try { fs.renameSync(this.logFilePath, backup); } catch { /* ignore */ }
-                }
-            } catch { /* file may not exist yet */ }
+            // Rotation check throttled (H7): two sync stats per ERROR/WARN
+            // stalled the main thread under renderer log spam. Size moves
+            // slowly — recheck at most every 30s; the byte cap stays exact.
+            const now = Date.now();
+            if (now - this._lastRotationCheck >= this.ROTATION_CHECK_MS) {
+                this._lastRotationCheck = now;
+                try {
+                    const st = fs.statSync(this.logFilePath);
+                    if (st.size > this.MAX_LOG_FILE_BYTES) {
+                        const backup = `${this.logFilePath}.1`;
+                        try { fs.renameSync(this.logFilePath, backup); } catch { /* ignore */ }
+                    }
+                } catch { /* file may not exist yet */ }
+            }
             fs.appendFileSync(this.logFilePath, entry);
         } catch (e) {
             console.error('Failed to flush log entry to disk', e);
@@ -95,12 +106,30 @@ class LogManager {
     public info(msg: string) { this.log('INFO', 'MAIN', msg); }
     public error(msg: string) { this.log('ERROR', 'MAIN', msg); }
 
-    public close(): void {
+    /**
+     * Move the log file into the ready userData dir. The constructor runs
+     * pre-whenReady (tmpdir fallback) while post-mortems use userData — logs
+     * and reports were split across dirs with tmp world-readable. Call once
+     * from app.whenReady(); the ring buffer is untouched, only future
+     * flushes go to the new path.
+     */
+    public relocateToUserData(): void {
+        try {
+            const userDataPath = app.getPath('userData');
+            try { fs.mkdirSync(userDataPath, { recursive: true }); } catch { /* ignore */ }
+            const next = path.join(userDataPath, 'gangsta_log.txt');
+            if (next === this.logFilePath) return;
+            this.logFilePath = next;
+            this._lastRotationCheck = 0;
+        } catch { /* keep current path */ }
+    }
+
+    public close(keepBuffer = false): void {
         if (this.flushTimer) {
             clearInterval(this.flushTimer);
             this.flushTimer = null;
         }
-        this.flushBuffer();
+        this.flushBuffer(keepBuffer);
     }
 
     public getBufferContents(): string {
@@ -115,7 +144,13 @@ class LogManager {
      * Generates a Post-Mortem Report Bundle
      */
     public async generatePostMortem(stateSnapshot: any = {}): Promise<string> {
-        const userDataPath = app.getPath('userData');
+        let userDataPath: string;
+        try {
+            userDataPath = app.getPath('userData');
+        } catch {
+            userDataPath = path.join(os.tmpdir(), 'gangsta-player');
+            try { fs.mkdirSync(userDataPath, { recursive: true }); } catch { /* ignore */ }
+        }
         // Unique filename — same-ms parallel calls previously collided/overwrote.
         const reportId = `${Date.now()}_${process.pid}_${Math.floor(Math.random() * 1e6)}`;
         const reportPath = path.join(userDataPath, `crash_report_${reportId}.json`);
@@ -162,15 +197,43 @@ class LogManager {
             }
         };
 
+        let logs = '';
+        try {
+            logs = this.getBufferContents().slice(-512 * 1024);
+        } catch { logs = ''; }
+        if (!logs) {
+            try {
+                const fd = fs.openSync(this.logFilePath, 'r');
+                try {
+                    const st = fs.fstatSync(fd);
+                    const tail = Math.min(st.size, 512 * 1024);
+                    const buf = Buffer.alloc(tail);
+                    fs.readSync(fd, buf, 0, tail, Math.max(0, st.size - tail));
+                    logs = buf.toString('utf8');
+                } finally {
+                    try { fs.closeSync(fd); } catch { /* ignore */ }
+                }
+            } catch { /* no disk tail available */ }
+        }
         const report = {
             timestamp: new Date().toISOString(),
             systemSpecs,
             appState: snapshotJson,
-            logs: this.getBufferContents().slice(-512 * 1024)
+            logs
         };
 
-        fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
-        
+        try {
+            fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
+        } catch (e) {
+            const fallback = path.join(os.tmpdir(), `gangsta_crash_${Date.now()}_${process.pid}_${Math.floor(Math.random() * 1e6)}.json`);
+            try {
+                fs.writeFileSync(fallback, JSON.stringify(report, null, 2));
+                return fallback;
+            } catch {
+                throw e instanceof Error ? e : new Error(String(e));
+            }
+        }
+
         // Return path for UI/User to find
         return reportPath;
     }

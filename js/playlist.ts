@@ -2,9 +2,9 @@ import { audioCtx, ensureAudio } from './audio';
 import { detectBPMWorker } from './worker-client';
 import { state, Track } from './state';
 import { VirtualScroller } from './reactive/ui';
-import { normalizeToArrayBuffer, validateAudioSignature } from './utils';
+import { validateAudioSignature } from './utils';
 import { engine } from './audio-engine';
-import { abortCrossfade } from './player';
+import { abortCrossfade, cacheDroppedAudio, getDroppedAudioFile, readAudioBytesForPath } from './player';
 import { showConfirm } from './modals';
 import { toast } from './toast';
 import { logger } from './logger';
@@ -27,9 +27,19 @@ let pressIndex = -1;
 let pressWasSelected = false;
 let selectDragging = false;
 let suppressClick = false;
-// Playlist keyboard focus: cleared when the user clicks anywhere outside the
-// playlist so arrows/Delete stop driving it. Set on any press inside.
-let playlistFocused = true;
+// Playlist keyboard focus: default UNfocused so arrows/Delete never drive it
+// until the user presses inside. Cleared on modal open, restored on close.
+let playlistFocused = false;
+// Window hook so js/modals.ts can clear/restore focus without a static
+// import cycle (playlist -> modals -> playlist).
+try {
+    const w = window as unknown as {
+        __ugSetPlaylistFocused?: (v: boolean) => void;
+        __ugGetPlaylistFocused?: () => boolean;
+    };
+    w.__ugSetPlaylistFocused = (v: boolean) => { playlistFocused = !!v; };
+    w.__ugGetPlaylistFocused = () => playlistFocused;
+} catch { /* non-browser boot — hook unavailable */ }
 
 let playlistEl: HTMLElement | null = null;
 let playlistInput: HTMLInputElement | null = null;
@@ -40,9 +50,18 @@ let playTrackFn: (() => void) | null = null;
 let _uiLoadGen = 0;
 let vScroller: VirtualScroller<Track> | null = null;
 let _playlistUnsubs: (() => void)[] | null = null;
+// M17: separate generations — DB-load and search must not share a counter.
+// The old alias (_dbLoadGen = searchGen) let a stale search resolve clobber
+// the initial list and vice versa.
 let _dbLoadGen = 0;
+let _searchGen = 0;
 let _isFiltering = false;
 let _focusWired = false;
+// H26: filtered search shows a view over the stable playing list.
+// state.playlist is never swapped by the filter — the scroller renders
+// _filteredView while currentTrackIndex keeps pointing into the full list.
+let _filteredView: Track[] | null = null;
+let _filterQuery = '';
 const ITEM_HEIGHT = 26; // Pixels — compact single-line row
 
 let _playlistInit = false;
@@ -67,7 +86,8 @@ export function initPlaylist(deps: PlaylistDeps): void {
     if (db && !deps.skipDbLoad) {
         const loadGen = ++_dbLoadGen;
         db.getAllTracks().then((tracks: Track[]) => {
-            if (loadGen !== _dbLoadGen) return; // superseded by newer load/filter
+            if (loadGen !== _dbLoadGen) return; // superseded by newer DB load
+            if (_isFiltering) return; // a search view is active — never clobber it
             // Don't clobber tracks the user added while the DB read was in flight.
             if (state.playlist.length > 0) return;
             if (tracks && tracks.length > 0) {
@@ -79,62 +99,90 @@ export function initPlaylist(deps: PlaylistDeps): void {
         }).catch(() => { /* DB failure must not break the playlist UI */ });
     }
 
-    let fullPlaylistBackup: Track[] | null = null;
     const setFiltering = (v: boolean) => { _isFiltering = v; };
 
     if (searchInput) {
-        let searchGen = 0;
-        searchInput.addEventListener('input', async () => {
-            const myGen = ++searchGen;
-            _dbLoadGen = myGen; // invalidate any in-flight initial DB load
+        let searchDebounce: ReturnType<typeof setTimeout> | null = null;
+        searchInput.addEventListener('input', () => {
+            // Debounce: every keystroke previously fired an IPC search with
+            // last-wins only — rapid typing spawned N concurrent main-thread
+            // LIKE scans. 150ms coalesces bursts into one query.
+            if (searchDebounce) clearTimeout(searchDebounce);
+            searchDebounce = setTimeout(() => {
+                searchDebounce = null;
+                void runSearch();
+            }, 150);
+        });
+        const runSearch = async (): Promise<void> => {
+            const myGen = ++_searchGen;
             const query = searchInput.value;
             try {
                 if (query.length > 0) {
-                    // Stash the real queue once — filtering must never destroy it.
-                    if (fullPlaylistBackup === null) fullPlaylistBackup = [...state.playlist];
+                    // H26: never swap state.playlist for a filter view. The
+                    // playing list stays stable; currentTrackIndex keeps
+                    // pointing into the full list (no id->filtered remap).
+                    const q = query.slice(0, 256);
+                    const qLower = q.toLowerCase();
                     setFiltering(true);
-                    const results = db ? await db.searchTracks(query.slice(0, 256)) : state.playlist;
-                    if (myGen !== searchGen) return; // stale keystroke, drop
-                    const list = Array.isArray(results) ? results : [];
-                    const curId = fullPlaylistBackup[state.currentTrackIndex]?.id
-                        ?? state.playlist[state.currentTrackIndex]?.id;
-                    const newCur = curId ? list.findIndex(t => t?.id === curId) : -1;
-                    state.update({
-                        playlist: list,
-                        selectedIndices: [],
-                        ...(newCur !== state.currentTrackIndex ? { currentTrackIndex: newCur } : {}),
-                    });
-                } else {
-                    if (myGen !== searchGen) return;
-                    // Restore the stashed queue, merging tracks added while
-                    // filtered (they went to the visible list, backup stale).
-                    if (fullPlaylistBackup !== null) {
-                        const restored = fullPlaylistBackup;
-                        fullPlaylistBackup = null;
-                        setFiltering(false);
-                        const liveIds = new Set(restored.map(t => t.id));
-                        for (const t of state.playlist) {
-                            if (t && t.id && !liveIds.has(t.id)) { restored.push(t); liveIds.add(t.id); }
+                    _filterQuery = qLower;
+                    let list: Track[];
+                    try {
+                        if (db) {
+                            const results = await db.searchTracks(q);
+                            if (myGen !== _searchGen) return; // stale keystroke, drop
+                            list = Array.isArray(results) ? [...results] : [];
+                        } else {
+                            // No-DB fallback must still filter — previously it
+                            // showed the full unfiltered list, ignoring query.
+                            if (myGen !== _searchGen) return;
+                            list = state.playlist.filter(t => {
+                                const name = (t?.name || '').toLowerCase();
+                                const p = (t?.path || '').toLowerCase();
+                                return name.includes(qLower) || p.includes(qLower);
+                            }).map(t => ({ ...t }));
                         }
-                        const curId = state.playlist[state.currentTrackIndex]?.id;
-                        const newCur = curId ? restored.findIndex(t => t?.id === curId) : state.currentTrackIndex;
-                        state.update({
-                            playlist: restored,
-                            selectedIndices: [],
-                            ...(newCur !== state.currentTrackIndex && newCur >= -1 ? { currentTrackIndex: newCur } : {}),
-                        });
-                    } else if (db) {
-                        const all = await db.getAllTracks();
-                        if (myGen !== searchGen) return;
-                        state.update({ playlist: Array.isArray(all) ? all : [], selectedIndices: [] });
+                        if (myGen !== _searchGen) return;
+                    } catch {
+                        if (myGen !== _searchGen) return;
+                        list = [];
                     }
+                    if (myGen !== _searchGen) return;
+                    // H27: merge in-memory tracks the DB missed (just added
+                    // while filtered / not indexed yet) so they are not lost.
+                    // Preserve full-list order for the merged tail.
+                    const full = state.playlist;
+                    const ids = new Set(list.map(t => t?.id));
+                    for (const t of full) {
+                        if (!t || !t.id || ids.has(t.id)) continue;
+                        const name = (t.name || '').toLowerCase();
+                        const p = (t.path || '').toLowerCase();
+                        if (name.includes(qLower) || p.includes(qLower)) {
+                            list.push({ ...t });
+                            ids.add(t.id);
+                        }
+                    }
+                    _filteredView = list;
+                    // Selection is view-relative; clear it. Do NOT touch
+                    // playlist or currentTrackIndex.
+                    state.update({ selectedIndices: [] });
+                    if (vScroller) vScroller.updateItems([...list]);
+                } else {
+                    if (myGen !== _searchGen) return;
+                    // Clear the view and reveal the untouched full list.
+                    // Tracks added while filtered already went to the full
+                    // list (H27) — nothing to merge, order preserved.
+                    setFiltering(false);
+                    _filterQuery = '';
+                    _filteredView = null;
+                    state.update({ selectedIndices: [] });
+                    if (vScroller) vScroller.updateItems(state.playlist);
                 }
             } catch {
                 return; // DB error must not wipe the visible list
             }
             anchorIndex = -1;
             pivotIndex = -1;
-        });
+        };
     }
 
     // === REACTIVE SUBSCRIPTIONS ===
@@ -146,7 +194,40 @@ export function initPlaylist(deps: PlaylistDeps): void {
     if (_playlistUnsubs) { _playlistUnsubs.forEach(fn => { try { fn(); } catch { /* ignore */ } }); }
     _playlistUnsubs = [
     state.subscribe('playlist', (playlist) => {
-        if (vScroller) vScroller.updateItems(playlist);
+        if (!vScroller) return;
+        if (_isFiltering && _filteredView) {
+            // H26/H27: full-list writes (adds, BPM analysis) must not clobber
+            // the filter view. Propagate fresh fields into visible rows by id
+            // and append newly added matches; never swap the playing list.
+            const byId = new Map(playlist.map(t => [t.id, t]));
+            let dirty = false;
+            for (let i = 0; i < _filteredView.length; i++) {
+                const fresh = byId.get(_filteredView[i].id);
+                if (!fresh) continue;
+                const cur = _filteredView[i];
+                if (fresh.bpm !== cur.bpm || fresh.duration !== cur.duration ||
+                    fresh.name !== cur.name || fresh.path !== cur.path) {
+                    _filteredView[i] = { ...fresh };
+                    dirty = true;
+                }
+            }
+            if (_filterQuery) {
+                const viewIds = new Set(_filteredView.map(t => t.id));
+                for (const t of playlist) {
+                    if (!t || viewIds.has(t.id)) continue;
+                    const name = (t.name || '').toLowerCase();
+                    const p = (t.path || '').toLowerCase();
+                    if (name.includes(_filterQuery) || p.includes(_filterQuery)) {
+                        _filteredView.push({ ...t });
+                        viewIds.add(t.id);
+                        dirty = true;
+                    }
+                }
+            }
+            if (dirty) vScroller.updateItems([..._filteredView]);
+            return;
+        }
+        vScroller.updateItems(playlist);
     }),
     
     state.subscribe('selectedIndices', refreshSelection),
@@ -178,16 +259,42 @@ export function setBlendingIndex(index: number): void {
 const _analysisQueue: Track[] = [];
 let _analysisActive = 0;
 const MAX_CONCURRENT_ANALYSIS = 2;
+// In-flight ids (M16): reanalyze-all / bulk re-adds previously queued the
+// same track N times and burned N full decodes for one last-writer-wins.
+const _analysisIds = new Set<string>();
 
+let _analysisDropToastAt = 0;
 function enqueueAnalysis(track: Track): void {
     // Bounded queue — bulk imports previously queued N unbounded decodes.
-    if (_analysisQueue.length >= 256) return;
+    if (_analysisQueue.length >= 256) {
+        // Silent drop previously left the tail showing "[...] analyzing"
+        // forever with no toast. Mark unknown + notify (throttled).
+        try {
+            const idx = state.playlist.findIndex(t => t.id === track.id);
+            if (idx >= 0) {
+                const next = [...state.playlist];
+                next[idx] = { ...next[idx], bpm: 0 };
+                state.update({ playlist: next });
+            }
+        } catch { /* ignore */ }
+        try {
+            const now = Date.now();
+            if (now - _analysisDropToastAt > 10000) {
+                _analysisDropToastAt = now;
+                toast.info('ANALYSIS QUEUE FULL — SOME BPM SKIPPED');
+            }
+        } catch { /* ignore */ }
+        return;
+    }
+    if (!track || !track.id || _analysisIds.has(track.id)) return;
+    _analysisIds.add(track.id);
     _analysisQueue.push(track);
     pumpAnalysisQueue();
 }
 
 export function clearAnalysisQueue(): void {
     _analysisQueue.length = 0;
+    _analysisIds.clear();
 }
 
 function pumpAnalysisQueue(): void {
@@ -196,6 +303,7 @@ function pumpAnalysisQueue(): void {
         if (!next) break;
         _analysisActive++;
         analyzeTrackInBackground(next).finally(() => {
+            _analysisIds.delete(next.id);
             _analysisActive--;
             pumpAnalysisQueue();
         });
@@ -218,16 +326,30 @@ async function analyzeTrackInBackground(track: Track): Promise<void> {
             }
         }
 
-        const rawData = await window.fileSystem.readFile(track.path);
+        const rawData = await readAudioBytesForPath(track.path, track.id);
         if (!rawData) {
             console.warn(`[Playlist] Analysis skipped for ${track.name} (File unreadable)`);
             return;
         }
 
 
-        const arrayBuffer = normalizeToArrayBuffer(rawData);
+        const arrayBuffer = rawData;
         if (arrayBuffer.byteLength === 0 || arrayBuffer.byteLength > MAX_FILE_SIZE_BYTES) {
             return; // oversized drops previously OOMed the renderer
+        }
+        // Analysis decode bound (M16): decodeAudioData expands compressed
+        // audio ~10-30x in RAM, so a near-100MB file can OOM the renderer
+        // before BPM ever runs. Playback streams from disk and is unaffected;
+        // analysis marks the track unknown instead of crashing the tab.
+        if (arrayBuffer.byteLength > 64 * 1024 * 1024) {
+            console.warn(`[Playlist] Analysis skipped for ${track.name} (too large to decode safely)`);
+            const bigIdx = state.playlist.findIndex(t => t.id === track.id);
+            if (bigIdx >= 0) {
+                const bigNext = [...state.playlist];
+                bigNext[bigIdx] = { ...bigNext[bigIdx], bpm: 0 };
+                state.update({ playlist: bigNext });
+            }
+            return;
         }
         // Drop doomed work: track deleted/cleared while queued.
         if (!state.playlist.some(t => t.id === track.id)) return;
@@ -246,18 +368,27 @@ async function analyzeTrackInBackground(track: Track): Promise<void> {
             return;
         }
 
-        // Use native decoder (decoder pool workers are unreliable)
+        // Use native decoder (decoder pool workers are unreliable).
+        // Bounded: a hung decode previously occupied one of the 2 slots
+        // forever, halving throughput for the rest of the session.
         if (!ensureAudio() || !audioCtx) return;
-        const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+        const audioBuffer = await Promise.race([
+            audioCtx.decodeAudioData(arrayBuffer),
+            new Promise<never>((_, reject) => {
+                const t = setTimeout(() => reject(new Error('decode timeout')), 30000);
+                (t as any)?.unref?.();
+            }),
+        ]);
 
         const bpm = await detectBPMWorker(audioBuffer);
         
-        const idx = state.playlist.findIndex(t => t.id === track.id);
-        const next = [...state.playlist];
-        if (idx >= 0) next[idx] = { ...next[idx], bpm, duration: audioBuffer.duration };
-        else { track.bpm = bpm; track.duration = audioBuffer.duration; }
+        // Drop stale work: track cleared/deleted/replaced while decoding.
+        // Verify against the live list (id + path) before any write.
+        const preIdx = state.playlist.findIndex(t => t.id === track.id);
+        if (preIdx < 0) return;
+        if (state.playlist[preIdx].path !== track.path) return;
 
-        // 2. Persist to DB
+        // 2. Persist to DB with fresh analysis values
         if (db) {
             await db.upsertTrack({
                 id: track.id,
@@ -268,10 +399,12 @@ async function analyzeTrackInBackground(track: Track): Promise<void> {
             });
         }
 
-        // Drop stale work: track cleared/deleted while DB persist was in flight.
-        // Re-resolve against the live list instead of pushing the pre-await snapshot.
+        // Drop stale work: track cleared/deleted/replaced while DB persist
+        // was in flight. Re-resolve against the live list instead of pushing
+        // a pre-await snapshot.
         const liveIdx = state.playlist.findIndex(t => t.id === track.id);
         if (liveIdx < 0) return;
+        if (state.playlist[liveIdx].path !== track.path) return;
         const live = [...state.playlist];
         live[liveIdx] = { ...live[liveIdx], bpm, duration: audioBuffer.duration };
         state.update({ playlist: live });
@@ -287,9 +420,19 @@ async function analyzeTrackInBackground(track: Track): Promise<void> {
 }
 
 export function addTracksToPlaylist(files: File[]): void {
-    const currentPlaylist = [...state.playlist];
-    const existingPaths = new Set(currentPlaylist.map(t => t.path));
-    const startIdx = currentPlaylist.length;
+    const basePlaylist = [...state.playlist];
+    // Case/separator-normalized dedupe: Windows `C:\MUSIC\A.mp3` vs
+    // `c:/music/a.mp3` previously slipped past the raw-string Set as dupes.
+    const normPath = (p: string): string => {
+        try {
+            let k = String(p ?? '').replace(/\\/g, '/').replace(/\/+/g, '/');
+            if (k.length > 1 && k.endsWith('/')) k = k.slice(0, -1);
+            return k.toLowerCase();
+        } catch { return String(p ?? '').toLowerCase(); }
+    };
+    const existingPaths = new Set(basePlaylist.map(t => normPath(t.path)));
+    const wasEmpty = basePlaylist.length === 0;
+    const added: Track[] = [];
     const uuid = (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function')
         ? () => crypto.randomUUID()
         : () => `id-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
@@ -297,13 +440,22 @@ export function addTracksToPlaylist(files: File[]): void {
     let rejected = 0;
     let dupes = 0;
     files.forEach((file) => {
-        const fullPath = window.electronAPI.getPathForFile(file);
+        let fullPath = '';
+        try {
+            fullPath = window.electronAPI.getPathForFile(file);
+        } catch { fullPath = ''; }
+        if (!fullPath) {
+            try { fullPath = (file as unknown as { path?: unknown }).path as string || ''; } catch { fullPath = ''; }
+        }
         if (!fullPath) { rejected++; return; }
         if (fullPath.length > 32760) { rejected++; return; }
         const ext = fullPath.split('.').pop()?.toLowerCase() ?? '';
         if (!AUDIO_EXTS.has(ext)) { rejected++; return; }
-        if (existingPaths.has(fullPath)) { dupes++; return; }
-        existingPaths.add(fullPath);
+        if (existingPaths.has(normPath(fullPath))) { dupes++; return; }
+        existingPaths.add(normPath(fullPath));
+        // Keep the user-gesture File bytes so decode/playback/BPM never need
+        // an IPC re-read that fail-closed allowlists would deny. Also register
+        // per-file consent so later disk reads (Sonetra, post-restart) pass.
         const track: Track = {
             id: uuid(),
             name: String(file.name).slice(0, 512),
@@ -311,8 +463,17 @@ export function addTracksToPlaylist(files: File[]): void {
             duration: 0,
             bpm: undefined
         };
-        currentPlaylist.push(track);
-        
+        // Keyed by canonical path AND track.id so later lookups hit even
+        // when the stored path string differs in case/separators.
+        try { cacheDroppedAudio(fullPath, file, track.id); } catch { /* ignore */ }
+        try {
+            const fsApi = window.fileSystem as unknown as { consentFile?: (p: string) => Promise<boolean> };
+            if (fsApi && typeof fsApi.consentFile === 'function') {
+                fsApi.consentFile(fullPath).catch(() => undefined);
+            }
+        } catch { /* consent is best-effort; cached bytes still play */ }
+        added.push(track);
+
         // Instant DB Indexing (metadata comes later via analysis)
         const db = window.database;
         if (db) {
@@ -328,12 +489,59 @@ export function addTracksToPlaylist(files: File[]): void {
         enqueueAnalysis(track);
     });
 
-    state.update({ playlist: currentPlaylist });
+    // Rebase onto the live list (C16): two rapid adds (dialog + drop,
+    // double-drop) used to snapshot the same base and the second overwrote
+    // the first. New tracks merge over whatever landed meanwhile.
+    const fresh = state.playlist;
+    const freshPaths = new Set(fresh.map(t => normPath(t.path)));
+    const merged = [...fresh];
+    for (const t of added) {
+        if (!freshPaths.has(normPath(t.path))) {
+            freshPaths.add(normPath(t.path));
+            merged.push(t);
+        }
+    }
+    state.update({ playlist: merged });
     if (rejected > 0) { try { toast.info(`${rejected} FILE(S) SKIPPED (UNSUPPORTED TYPE)`); } catch { /* ignore */ } }
     else if (dupes > 0) { try { toast.info(`${dupes} DUPLICATE(S) SKIPPED`); } catch { /* ignore */ } }
 
-    if (startIdx === 0 && state.playlist.length > 0 && loadTrackFn) {
-        loadTrackFn(0);
+    if (wasEmpty && merged.length > 0 && loadTrackFn) {
+        const first = merged[0];
+        // Resolve by id at fire time — a concurrent add may have shifted
+        // positions between the merge and the async consent handshake.
+        const firstId = first.id;
+        const autoLoad = loadTrackFn;
+        // Await per-file consent before the first auto-load so an
+        // allowlisted re-read can't silently fail and stall the deck
+        // with no toast/error. Cached DnD bytes still play regardless.
+        void (async () => {
+            try {
+                // Bounded consent: a hung main process previously stalled the
+                // first-track auto-load forever. 5s cap, then load anyway
+                // (cached DnD bytes play regardless of consent).
+                const consentCall = typeof window.fileSystem?.consentFile === 'function'
+                    ? window.fileSystem.consentFile(first.path)
+                    : Promise.resolve(true);
+                const consent = await Promise.race([
+                    consentCall,
+                    new Promise<boolean>((resolve) => {
+                        const t = setTimeout(() => resolve(true), 5000);
+                        (t as any)?.unref?.();
+                    }),
+                ]);
+                if (consent === false) {
+                    logger.warn(`[Playlist] consent denied for auto-load: ${first.path}`);
+                }
+            } catch (e) {
+                logger.warn(`[Playlist] consent check failed for auto-load: ${first.path}`, e);
+            }
+            try {
+                const atFire = state.playlist.findIndex(t => t.id === firstId);
+                if (atFire >= 0) await autoLoad(atFire);
+            } catch (e) {
+                logger.warn(`[Playlist] auto-load failed for ${first.path}`, e);
+            }
+        })();
         // Auto select first
         state.update({
             selectedIndices: [0]
@@ -341,6 +549,14 @@ export function addTracksToPlaylist(files: File[]): void {
         anchorIndex = 0;
         pivotIndex = 0;
     }
+}
+
+/** Map a visible (possibly filtered) row index to the full-list index by id. */
+function viewIndexToFullIndex(viewIdx: number): number {
+    if (!_isFiltering || !_filteredView) return viewIdx;
+    const t = _filteredView[viewIdx];
+    if (!t) return -1;
+    return state.playlist.findIndex(x => x.id === t.id);
 }
 
 function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HTMLElement {
@@ -354,7 +570,14 @@ function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HT
     let blendSuffix = "";
     li.classList.remove('blending', 'selected', 'playing');
 
-    if (index === state.blendingIndex) {
+    // H26: while filtered, view indices differ from full-list indices —
+    // resolve playing/blending by track id, not by filtered position.
+    const playingId = state.playlist[state.currentTrackIndex]?.id;
+    const blendingId = state.blendingIndex >= 0 ? state.playlist[state.blendingIndex]?.id : undefined;
+    const isBlendingRow = _isFiltering
+        ? (blendingId !== undefined && track.id === blendingId)
+        : (index === state.blendingIndex);
+    if (isBlendingRow) {
         blendSuffix = " [MIXING IN...]";
         li.classList.add('blending');
     }
@@ -368,9 +591,12 @@ function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HT
         li.appendChild(titleSpan);
     }
     titleSpan.textContent = fullText;
-    
+
     if (state.selectedIndices.includes(index)) li.classList.add('selected');
-    if (index === state.currentTrackIndex) li.classList.add('playing');
+    const isPlayingRow = _isFiltering
+        ? (playingId !== undefined && track.id === playingId)
+        : (index === state.currentTrackIndex);
+    if (isPlayingRow) li.classList.add('playing');
     
     // Only add listeners if it's a new element
     if (!existing) {
@@ -454,7 +680,17 @@ function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HT
 
         li.addEventListener('dblclick', (e) => {
             e.stopPropagation();
-            const idx = parseInt(li.dataset.index || "0");
+            const viewIdx = parseInt(li.dataset.index || "0");
+            // H26: filtered rows are positions in the view — resolve to the
+            // full-list index by id so the correct track loads.
+            const idx = viewIndexToFullIndex(viewIdx);
+            if (idx < 0) return;
+            // Mid-blend dblclick previously called loadTrack (silently refused)
+            // then playTrack() — playing the OLD deck under a new highlight.
+            if (state.isCrossfadeInProgress) {
+                try { toast.info('MIXING — WAIT FOR BLEND TO FINISH'); } catch { /* ignore */ }
+                return;
+            }
             if (loadTrackFn) {
                 const gen = ++_uiLoadGen;
                 loadTrackFn(idx).then(() => {
@@ -550,19 +786,24 @@ function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HT
             e.preventDefault();
             e.stopPropagation();
             playlistFocused = true;
-            const idx = parseInt(li.dataset.index || "0");
-            if (!state.selectedIndices.includes(idx)) {
-                state.update({ selectedIndices: [idx] });
-                anchorIndex = idx;
-                pivotIndex = idx;
+            const viewIdx = parseInt(li.dataset.index || "0");
+            // View-relative selection stays as-is (cleared on filter change);
+            // the stored context target is the full-list index by id.
+            const fullIdx = viewIndexToFullIndex(viewIdx);
+            const ctxIdx = fullIdx >= 0 ? fullIdx : viewIdx;
+            if (!state.selectedIndices.includes(viewIdx)) {
+                state.update({ selectedIndices: [viewIdx] });
+                anchorIndex = viewIdx;
+                pivotIndex = viewIdx;
             }
             const menu = document.getElementById('contextMenu');
             if (menu) {
                 menu.classList.remove('hidden');
                 menu.style.display = 'block';
-                menu.style.zIndex = '9999';
+                // M32: menus stay BELOW modals (modal z-index 3000).
+                menu.style.zIndex = '1500';
                 hideSamplerSubmenu();
-                void buildSamplerSubmenu(idx);
+                void buildSamplerSubmenu(ctxIdx);
 
                 // Viewport clamp measured from the live menu (position:fixed +
                 // max-height scroll). clientX/Y are viewport-relative, matching
@@ -576,7 +817,7 @@ function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HT
                 if (rect.bottom > window.innerHeight) y = Math.max(4, window.innerHeight - rect.height - 4);
                 menu.style.left = x + 'px';
                 menu.style.top = y + 'px';
-                menu.dataset.ctxIndex = idx.toString(); 
+                menu.dataset.ctxIndex = ctxIdx.toString();
             }
         });
     }
@@ -593,7 +834,8 @@ export function isPlaylistFocused(): boolean { return playlistFocused; }
 export function setPlaylistFocused(v: boolean): void { playlistFocused = v; }
 
 export function selectAllTracks(): void {
-    const n = state.playlist.length;
+    // H26: select the visible view while filtered, full list otherwise.
+    const n = (_isFiltering && _filteredView) ? _filteredView.length : state.playlist.length;
     if (n <= 0) return;
     playlistFocused = true;
     anchorIndex = n - 1;
@@ -619,6 +861,21 @@ export function focusPlayingTrack(): void {
         return;
     }
     playlistFocused = true;
+    // H26: when filtered, select/scroll the view position of the playing
+    // track (by id), not the full-list index.
+    if (_isFiltering && _filteredView) {
+        const playingId = state.playlist[idx]?.id;
+        const viewIdx = playingId !== undefined ? _filteredView.findIndex(t => t.id === playingId) : -1;
+        if (viewIdx < 0) {
+            try { toast.info('PLAYING TRACK HIDDEN BY FILTER'); } catch { /* ignore */ }
+            return;
+        }
+        anchorIndex = viewIdx;
+        pivotIndex = viewIdx;
+        state.update({ selectedIndices: [viewIdx] });
+        if (vScroller) vScroller.scrollTo(viewIdx);
+        return;
+    }
     anchorIndex = idx;
     pivotIndex = idx;
     state.update({ selectedIndices: [idx] });
@@ -757,7 +1014,16 @@ async function loadTrackToPad(trackIdx: number, padIdx: number): Promise<void> {
     if (!track) return;
     try {
         const sampler = await import('./sampler');
-        await sampler.loadSampleFromPath(track.path, padIdx);
+        // Dropped/imported files often have no on-disk consent path — IPC-only
+        // loading previously failed them while they played fine in the deck.
+        // Prefer the cached File bytes when available.
+        let dropped: File | undefined;
+        try { dropped = getDroppedAudioFile(track.path, track.id); } catch { dropped = undefined; }
+        if (dropped) {
+            await sampler.loadSampleFile(dropped, padIdx);
+        } else {
+            await sampler.loadSampleFromPath(track.path, padIdx);
+        }
         try { toast.success(`LOADED TO PAD ${padIdx + 1}`); } catch { /* ignore */ }
     } catch (e) {
         logger.warn(`[Playlist] Load to pad ${padIdx} failed`, e);
@@ -804,8 +1070,9 @@ function reorderPlaylist(fromIndex: number, toIndex: number, insertAfter: boolea
         }
         // Adjust indices that shifted
         if (fromIndex < target) {
-            // Item moved forward: indices between fromIndex and target-1 shift left
-            if (idx > fromIndex && idx < target) return idx - 1;
+            // M19: forward move shifts (fromIndex, target] left by one —
+            // the old `< target` left the occupant of `target` stranded.
+            if (idx > fromIndex && idx <= target) return idx - 1;
         } else {
             // Item moved backward: indices between target and fromIndex-1 shift right
             if (idx >= target && idx < fromIndex) return idx + 1;
@@ -815,11 +1082,11 @@ function reorderPlaylist(fromIndex: number, toIndex: number, insertAfter: boolea
 
     // Adjust anchor/pivot
     if (anchorIndex === fromIndex) anchorIndex = target;
-    else if (fromIndex < target && anchorIndex > fromIndex && anchorIndex < target) anchorIndex--;
+    else if (fromIndex < target && anchorIndex > fromIndex && anchorIndex <= target) anchorIndex--;
     else if (fromIndex > target && anchorIndex >= target && anchorIndex < fromIndex) anchorIndex++;
 
     if (pivotIndex === fromIndex) pivotIndex = target;
-    else if (fromIndex < target && pivotIndex > fromIndex && pivotIndex < target) pivotIndex--;
+    else if (fromIndex < target && pivotIndex > fromIndex && pivotIndex <= target) pivotIndex--;
     else if (fromIndex > target && pivotIndex >= target && pivotIndex < fromIndex) pivotIndex++;
 
     // The playing indicator must follow its track through the reorder,
@@ -843,10 +1110,18 @@ function reorderPlaylist(fromIndex: number, toIndex: number, insertAfter: boolea
 
 // === NEW: KEYBOARD NAVIGATION ===
 export function handlePlaylistNavigation(e: KeyboardEvent): void {
-    if (!state.playlist.length) return;
+    const viewLen = (_isFiltering && _filteredView) ? _filteredView.length : state.playlist.length;
+    if (!viewLen) return;
     // Keyboard only drives the playlist while it has focus — clicking
     // elsewhere in the GUI defocuses it (see setupPlaylistHandlers).
     if (!playlistFocused) return;
+    // Mutations against a filtered view would corrupt the real queue —
+    // Delete while filtered requires clearing the search first.
+    if (_isFiltering && (e.key === 'Delete' || e.key === 'Backspace')) {
+        e.preventDefault();
+        try { toast.info('CLEAR SEARCH BEFORE REMOVING'); } catch { /* ignore */ }
+        return;
+    }
 
     // Ctrl/Cmd+A selects everything in the current (possibly filtered) view.
     if ((e.ctrlKey || e.metaKey) && (e.key === 'a' || e.key === 'A')) {
@@ -866,7 +1141,7 @@ export function handlePlaylistNavigation(e: KeyboardEvent): void {
         newAnchor = Math.max(0, anchorIndex - 1);
     } else if (e.key === 'ArrowDown') {
         e.preventDefault();
-        newAnchor = Math.min(state.playlist.length - 1, anchorIndex + 1);
+        newAnchor = Math.min(viewLen - 1, anchorIndex + 1);
     } else if (e.key === 'Delete' || e.key === 'Backspace') {
          if (state.selectedIndices.length > 0) {
              e.preventDefault();
@@ -948,23 +1223,16 @@ export function removeSelectedTracks(): void {
         if (newIndex >= currentPlaylist.length) newIndex = currentPlaylist.length - 1;
     }
     
-    let newAnchor = Math.min(anchorIndex, currentPlaylist.length - 1);
-    let newPivot = newAnchor; 
+    let newAnchor = currentPlaylist.length > 0
+        ? Math.min(Math.max(anchorIndex, 0), currentPlaylist.length - 1)
+        : -1;
+    let newPivot = newAnchor;
 
+    // M18: never force-select a survivor. Removal clears the selection;
+    // the clamped anchor/pivot is kept only as the next keyboard origin.
     const newSelected: number[] = [];
-    if (newAnchor >= 0 && currentPlaylist.length > 0) {
-        newSelected.push(newAnchor);
-    } else if (currentPlaylist.length > 0) {
-        newAnchor = 0;
-        newPivot = 0;
-        newSelected.push(0);
-    } else {
-        newAnchor = -1;
-        newPivot = -1;
-    }
-    
-    anchorIndex = newAnchor;
-    pivotIndex = newPivot;
+    anchorIndex = currentPlaylist.length > 0 ? newAnchor : -1;
+    pivotIndex = currentPlaylist.length > 0 ? newPivot : -1;
     state.update({ 
         playlist: currentPlaylist, 
         selectedIndices: newSelected,
@@ -972,7 +1240,12 @@ export function removeSelectedTracks(): void {
     });
 }
 
+let _handlersWired = false;
 export function setupPlaylistHandlers(): void {
+    // Idempotent (C15): initPlaylist may re-run after the restore prompt
+    // resolves, and every call otherwise stacked duplicate listeners.
+    if (_handlersWired) return;
+    _handlersWired = true;
     if (playlistInput) {
         playlistInput.addEventListener('change', (e) => {
             const target = e.target as HTMLInputElement;
@@ -1099,7 +1372,19 @@ export function setupPlaylistHandlers(): void {
 
     if (ctxAnalyzeBPM) ctxAnalyzeBPM.addEventListener('click', () => {
         const target = getContextTargetIndex();
-        const indices = state.selectedIndices.length ? [...state.selectedIndices] : (target >= 0 ? [target] : []);
+        let indices = state.selectedIndices.length ? [...state.selectedIndices] : (target >= 0 ? [target] : []);
+        // H26: selection is view-relative while filtered — resolve to full
+        // indices by id before reanalyzing the real queue.
+        if (_isFiltering && _filteredView) {
+            indices = indices
+                .map(vi => {
+                    const t = _filteredView![vi];
+                    if (!t) return -1;
+                    return state.playlist.findIndex(x => x.id === t.id);
+                })
+                .filter(i => i >= 0);
+            if (target >= 0 && !indices.includes(target)) indices.push(target);
+        }
         if (!indices.length) {
             try { toast.info('NOTHING TO ANALYZE'); } catch { /* ignore */ }
             return;
@@ -1109,7 +1394,14 @@ export function setupPlaylistHandlers(): void {
 
     if (ctxTrackInfo) ctxTrackInfo.addEventListener('click', () => {
         const target = getContextTargetIndex();
-        const track = state.playlist[target] ?? state.playlist[state.selectedIndices[0]];
+        // H26: selectedIndices are view-relative while filtered; prefer the
+        // full-list context target, else resolve the view selection by id.
+        let selTrack: Track | undefined;
+        if (_isFiltering && _filteredView && state.selectedIndices.length) {
+            const vt = _filteredView[state.selectedIndices[0]];
+            if (vt) selTrack = state.playlist.find(x => x.id === vt.id);
+        }
+        const track = state.playlist[target] ?? selTrack ?? state.playlist[state.selectedIndices[0]];
         if (!track) {
             try { toast.info('NO TRACK SELECTED'); } catch { /* ignore */ }
             return;
@@ -1119,7 +1411,12 @@ export function setupPlaylistHandlers(): void {
 
     if (ctxShowInFolder) ctxShowInFolder.addEventListener('click', () => {
         const target = getContextTargetIndex();
-        const track = state.playlist[target] ?? state.playlist[state.selectedIndices[0]];
+        let selTrack2: Track | undefined;
+        if (_isFiltering && _filteredView && state.selectedIndices.length) {
+            const vt = _filteredView[state.selectedIndices[0]];
+            if (vt) selTrack2 = state.playlist.find(x => x.id === vt.id);
+        }
+        const track = state.playlist[target] ?? selTrack2 ?? state.playlist[state.selectedIndices[0]];
         if (!track) return;
         const show = window.fileSystem?.showItemInFolder;
         if (typeof show !== 'function') {
@@ -1135,7 +1432,12 @@ export function setupPlaylistHandlers(): void {
 
     if (ctxCopyPath) ctxCopyPath.addEventListener('click', () => {
         const target = getContextTargetIndex();
-        const track = state.playlist[target] ?? state.playlist[state.selectedIndices[0]];
+        let selTrack3: Track | undefined;
+        if (_isFiltering && _filteredView && state.selectedIndices.length) {
+            const vt = _filteredView[state.selectedIndices[0]];
+            if (vt) selTrack3 = state.playlist.find(x => x.id === vt.id);
+        }
+        const track = state.playlist[target] ?? selTrack3 ?? state.playlist[state.selectedIndices[0]];
         if (!track) return;
         const done = () => { try { toast.success('FILE PATH COPIED'); } catch { /* ignore */ } };
         const fail = () => { try { toast.error('COPY FAILED'); } catch { /* ignore */ } };
@@ -1168,7 +1470,7 @@ export function setupPlaylistHandlers(): void {
 
     if (ctxMoveUp) ctxMoveUp.addEventListener('click', () => {
         if (!state.selectedIndices.length) return;
-        if (state.isCrossfadeInProgress) return;
+        if (state.isCrossfadeInProgress) { try { toast.info('MIXING — WAIT FOR BLEND TO FINISH'); } catch { /* ignore */ } return; }
         if (_isFiltering) { try { toast.info('CLEAR SEARCH BEFORE MOVING'); } catch { /* ignore */ } return; }
         const list = [...state.playlist];
         // Drop stale/OOB selections — previously wrote undefined into the list.
@@ -1197,7 +1499,7 @@ export function setupPlaylistHandlers(): void {
 
     if (ctxMoveDown) ctxMoveDown.addEventListener('click', () => {
         if (!state.selectedIndices.length) return;
-        if (state.isCrossfadeInProgress) return;
+        if (state.isCrossfadeInProgress) { try { toast.info('MIXING — WAIT FOR BLEND TO FINISH'); } catch { /* ignore */ } return; }
         if (_isFiltering) { try { toast.info('CLEAR SEARCH BEFORE MOVING'); } catch { /* ignore */ } return; }
         const list = [...state.playlist];
         const sel = new Set(

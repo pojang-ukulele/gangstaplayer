@@ -141,18 +141,35 @@ class ReactiveStore implements AppStateData {
      * is INVISIBLE here (same element refs => shallowEqual true => no notify).
      * Always replace the element with a new object (see replaceTrackInPlaylist).
      */
-    update(patch: Partial<AppStateData>): void {
+    update(patch: Partial<AppStateData>): boolean {
         const changedKeys: Array<keyof AppStateData> = [];
+        let rejected = false;
 
         for (const [key, value] of Object.entries(patch)) {
             const k = key as keyof AppStateData;
 
             // Runtime validation for enums/numbers — invalid writes previously
-            // flowed straight into player logic.
-            if (k === 'loopMode' && value !== 'off' && value !== 'one' && value !== 'all') { console.warn(`[State] rejected invalid loopMode`); continue; }
-            if (k === 'playbackMode' && value !== 'continuous' && value !== 'single') { console.warn(`[State] rejected invalid playbackMode`); continue; }
-            if (k === 'currentTrackIndex' && (typeof value !== 'number' || !Number.isInteger(value as number))) { console.warn(`[State] rejected invalid currentTrackIndex`); continue; }
-            if ((k === 'masterBPM' || k === 'blendingIndex') && (typeof value !== 'number' || !Number.isFinite(value as number))) { console.warn(`[State] rejected invalid ${String(k)}`); continue; }
+            // flowed straight into player logic. Reject loudly (return false)
+            // so callers know the patch was not (fully) applied.
+            if (k === 'loopMode' && value !== 'off' && value !== 'one' && value !== 'all') { console.warn(`[State] rejected invalid loopMode`, value); rejected = true; continue; }
+            if (k === 'playbackMode' && value !== 'continuous' && value !== 'single') { console.warn(`[State] rejected invalid playbackMode`, value); rejected = true; continue; }
+            if (k === 'currentTrackIndex' && (typeof value !== 'number' || !Number.isInteger(value as number))) { console.warn(`[State] rejected invalid currentTrackIndex`, value); rejected = true; continue; }
+            if ((k === 'masterBPM' || k === 'blendingIndex') && (typeof value !== 'number' || !Number.isFinite(value as number))) { console.warn(`[State] rejected invalid ${String(k)}`, value); rejected = true; continue; }
+            // Collections must stay arrays — update({playlist:"junk"}) previously
+            // flowed into .map/.length and crashed player/playlist render.
+            if ((k === 'playlist' || k === 'selectedIndices' || k === 'padKeyMap') && !Array.isArray(value)) { console.warn(`[State] rejected invalid ${String(k)}`, value); rejected = true; continue; }
+            if (k === 'playlist' && (value as unknown[]).length > 10000) { console.warn(`[State] rejected oversized playlist`, (value as unknown[]).length); rejected = true; continue; }
+            // Flags must stay booleans — truthy-string drift broke strict checks.
+            if ((k === 'isPlaying' || k === 'isAutoMixEnabled' || k === 'isCrossfadeInProgress' || k === 'isMidiActive' || k === 'isLearningMidi' || k === 'isLearningKey') && typeof value !== 'boolean') { console.warn(`[State] rejected invalid ${String(k)}`, value); rejected = true; continue; }
+            // Maps must stay plain objects — null/array broke MIDI lookups.
+            if ((k === 'padMidiMap' || k === 'controlMidiMap') && (value === null || typeof value !== 'object' || Array.isArray(value))) { console.warn(`[State] rejected invalid ${String(k)}`, value); rejected = true; continue; }
+            if (k === 'midiLearnTarget' && value !== null) {
+                const t = value as { type?: unknown; id?: unknown };
+                if (typeof t !== 'object' || (t.type !== 'pad' && t.type !== 'control')) { console.warn(`[State] rejected invalid midiLearnTarget`, value); rejected = true; continue; }
+                if (t.type === 'pad' && (!Number.isInteger(t.id as number) || (t.id as number) < 0 || (t.id as number) > 15)) { console.warn(`[State] rejected invalid midiLearnTarget`, value); rejected = true; continue; }
+                if (t.type === 'control' && (typeof t.id !== 'string' || !(t.id as string) || (t.id as string).length > 256)) { console.warn(`[State] rejected invalid midiLearnTarget`, value); rejected = true; continue; }
+            }
+            if (k === 'keyLearnTargetPad' && value !== null && (!Number.isInteger(value as number) || (value as number) < 0 || (value as number) > 15)) { console.warn(`[State] rejected invalid keyLearnTargetPad`, value); rejected = true; continue; }
 
             // Shallow comparison for arrays AND plain objects (pad maps, learn
             // targets) — previously identical-content objects spuriously notified.
@@ -162,7 +179,13 @@ class ReactiveStore implements AppStateData {
                 : cur !== value;
 
             if (isDifferent) {
-                (this._data as any)[k] = value;
+                // Clone on store: callers must not retain a live ref into
+                // _data via update({playlist:myArr}); myArr.push() would
+                // otherwise mutate live state with zero notify.
+                const stored = Array.isArray(value)
+                    ? [...(value as unknown[])]
+                    : (value !== null && typeof value === 'object' ? { ...(value as object) } : value);
+                (this._data as any)[k] = stored;
                 changedKeys.push(k);
             }
         }
@@ -184,13 +207,15 @@ class ReactiveStore implements AppStateData {
                 try { fn(this.getSnapshot()); } catch (e) { console.error('[State] global listener threw', e); }
             });
         }
+
+        return !rejected;
     }
 
     /** Plain cloneable snapshot (no Maps/Sets/functions) for IPC/crash reports. */
     getSnapshot(): AppStateData {
         return {
             ...this._data,
-            playlist: [...this._data.playlist],
+            playlist: this._data.playlist.map(t => ({ ...t })),
             selectedIndices: [...this._data.selectedIndices],
             padMidiMap: { ...this._data.padMidiMap },
             padKeyMap: [...this._data.padKeyMap],

@@ -27,7 +27,23 @@ let lastScannerUpdate = 0;
 
 let _rafHandle: number | null = null;
 let _visualsInit = false;
+let _visibilityWired = false;
 let lastLedPush = 0;
+/** Idle bars already parked at 5% — skip the 16 DOM writes/frame while idle. */
+let _idleBarsSet = false;
+
+function onVisibilityChange(): void {
+    if (document.hidden) {
+        // Pause the loop entirely while hidden — no rAF churn, no analyser
+        // reads, no DOM writes. Resume on visible.
+        if (_rafHandle !== null) {
+            try { cancelAnimationFrame(_rafHandle); } catch { /* ignore */ }
+            _rafHandle = null;
+        }
+    } else if (_visualsInit && _rafHandle === null) {
+        masterLoop();
+    }
+}
 
 export function initVisuals(): void {
     // Second init previously orphaned 16 nodes and grew the array forever.
@@ -53,6 +69,11 @@ export function initVisuals(): void {
     
     setupScrews();
 
+    if (!_visibilityWired) {
+        _visibilityWired = true;
+        document.addEventListener('visibilitychange', onVisibilityChange);
+    }
+    if (document.hidden) return;
     masterLoop();
 }
 
@@ -60,6 +81,10 @@ export function destroyVisuals(): void {
     if (_rafHandle !== null) {
         try { cancelAnimationFrame(_rafHandle); } catch { /* ignore */ }
         _rafHandle = null;
+    }
+    if (_visibilityWired) {
+        try { document.removeEventListener('visibilitychange', onVisibilityChange); } catch { /* ignore */ }
+        _visibilityWired = false;
     }
     _visualsInit = false;
 }
@@ -134,8 +159,8 @@ const updateLEDs = throttle((dataArray: Uint8Array, leds: HTMLElement[]) => {
 
 function masterLoop(): void {
     _rafHandle = requestAnimationFrame(masterLoop);
-    // Skip expensive processing when tab is hidden (still reschedules, but
-    // does no analyser reads, DOM writes, or allocations).
+    // Hidden case is handled by onVisibilityChange (loop paused); this guard
+    // covers the race where the tab hides between scheduling and execution.
     if (document.hidden) return;
     const an = analyser;
     const buf = ensureDataArray();
@@ -155,10 +180,17 @@ function masterLoop(): void {
     const isAudioActive = totalAvg > AVG_THRESHOLD || state.isCrossfadeInProgress;
     
     if (isAudioActive && dataArray && visualizerBars.length > 0) {
-        // Only update visualizer bars every frame
-        const step = Math.floor(dataArray.length / 16);
-        for (let i = 0; i < 16; i++) {
-            const value = dataArray[i * step];
+        _idleBarsSet = false;
+        // M30: average bins per bar across the full spectrum — single-bin
+        // sampling aliased and left most of the FFT unused.
+        const n = dataArray.length;
+        const bars = Math.min(16, visualizerBars.length);
+        for (let i = 0; i < bars; i++) {
+            const start = Math.floor((i * n) / bars);
+            const end = Math.max(start + 1, Math.floor(((i + 1) * n) / bars));
+            let sum = 0;
+            for (let j = start; j < end; j++) sum += dataArray[j];
+            const value = sum / (end - start);
             if (visualizerBars[i]) {
                 visualizerBars[i].style.height = Math.max(5, (value / 255) * 100) + '%';
             }
@@ -174,7 +206,11 @@ function masterLoop(): void {
             updateLEDs(dataArray.slice() as Uint8Array, leds);
         }
     } else {
-        visualizerBars.forEach(bar => bar.style.height = '5%');
+        // Idle: park bars once instead of writing 16 heights every frame.
+        if (!_idleBarsSet) {
+            visualizerBars.forEach(bar => bar.style.height = '5%');
+            _idleBarsSet = true;
+        }
         const now = performance.now();
         if (now - lastScannerUpdate > SCANNER_INTERVAL_MS) {
             leds.forEach(l => l.classList.remove('lit'));
@@ -219,6 +255,14 @@ export function playStartupSound(): void {
                 gain.gain.value = STARTUP_SOUND_VOLUME * masterVol;
                 source.connect(gain);
                 gain.connect(masterGain);
+                // One-shot nodes previously stayed connected forever (leak per
+                // boot). Release on end.
+                try {
+                    source.onended = () => {
+                        try { source.disconnect(); } catch { /* ignore */ }
+                        try { gain.disconnect(); } catch { /* ignore */ }
+                    };
+                } catch { /* ignore */ }
                 source.start(0);
                 logger.info("[Visuals] Startup sound playback started.");
             })

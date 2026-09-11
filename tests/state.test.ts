@@ -1,7 +1,8 @@
 /**
  * Unit tests for ReactiveStore (js/state.ts)
  */
-import { state, ReactiveStore, AppStateData, PlaybackMode, LoopMode, Track } from '../js/state';
+import { state } from '../js/state';
+import type { PlaybackMode, LoopMode } from '../js/state';
 
 // We import the singleton `state` for integration-style tests,
 // but create fresh stores for isolated unit tests via constructor access.

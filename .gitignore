@@ -77,3 +77,6 @@ coverage/
 
 # === Local scripts (not for sharing) ===
 run-app.bat
+
+# === Deepwork session state (git-local) ===
+.slim/deepwork/

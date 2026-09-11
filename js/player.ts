@@ -28,6 +28,145 @@ let mainBlobUrl: string = "";
 let crossfadeBlobUrl: string = "";
 
 /**
+ * Dropped-file bytes cache (DnD regression fix).
+ * A File dropped from an arbitrary folder (Downloads/Desktop) carries its own
+ * user-consent gesture, so playback/decode/BPM use file.arrayBuffer()
+ * directly instead of an IPC re-read that fail-closed allowlists deny.
+ * Keyed by the resolved disk path from getPathForFile; bounded LRU.
+ */
+const droppedAudioFiles = new Map<string, File>();
+const droppedAudioById = new Map<string, File>();
+const MAX_DROPPED_FILES = 100;
+// L8: 100 files x 100MB = up to 10GB pinned. Budget total bytes too.
+const MAX_DROPPED_BYTES = 500 * 1024 * 1024;
+let _droppedBytes = 0;
+
+/** Load-step timeout: a hung IPC read or decode must surface, never stall silent. */
+const LOAD_READ_TIMEOUT_MS = 15000;
+const LOAD_DECODE_TIMEOUT_MS = 15000;
+
+class LoadStepTimeoutError extends Error {
+    constructor(step: string) {
+        super(`[Player] ${step} timed out`);
+        this.name = 'LoadStepTimeoutError';
+    }
+}
+
+function withLoadStepTimeout<T>(promise: Promise<T>, ms: number, step: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    return new Promise<T>((resolve, reject) => {
+        timer = setTimeout(() => {
+            timer = null;
+            reject(new LoadStepTimeoutError(step));
+        }, ms);
+        promise.then(
+            (v) => { if (timer) clearTimeout(timer); resolve(v); },
+            (e) => { if (timer) clearTimeout(timer); reject(e); }
+        );
+    });
+}
+
+/**
+ * Fade duration sanitized against corrupt persisted settings. settings.autoMix
+ * comes from localStorage JSON — NaN/undefined/Infinity previously flowed into
+ * linearRampToValueAtTime(NaN) (throws mid-blend) and setTimeout(NaN) (instant
+ * swap). Always returns a finite clamped value.
+ */
+function safeFadeSeconds(customDuration: number | null = null): number {
+    const DEFAULT_FADE = 10;
+    const raw = customDuration !== null ? customDuration : (settings as any)?.autoMix?.trackDuration;
+    if (typeof raw !== 'number' || !Number.isFinite(raw)) return DEFAULT_FADE;
+    return Math.min(60, Math.max(0.5, raw));
+}
+
+/**
+ * Renderer mirror of main-process canonicalReadKey (main.ts): resolve-ish
+ * normalization + case-fold. No node:path here — slash-normalize and
+ * lowercase so `C:\Music\A.mp3` hits the same entry as `c:/music/a.mp3`.
+ */
+function canonicalDroppedKey(p: string): string {
+    try {
+        let k = String(p ?? '').replace(/\\/g, '/').replace(/\/+/g, '/');
+        if (k.length > 1 && k.endsWith('/')) k = k.slice(0, -1);
+        return k.toLowerCase();
+    } catch {
+        return String(p ?? '').toLowerCase();
+    }
+}
+
+function evictOldest(m: Map<string, File>): void {
+    const oldest = m.keys().next().value;
+    if (oldest !== undefined) m.delete(oldest);
+}
+
+export function cacheDroppedAudio(filePath: string, file: File, trackId?: string): void {
+    try {
+        if (!filePath || !file) return;
+        const key = canonicalDroppedKey(filePath);
+        const prev = droppedAudioFiles.get(key);
+        if (prev) _droppedBytes -= prev.size || 0;
+        if (droppedAudioFiles.has(key)) droppedAudioFiles.delete(key);
+        droppedAudioFiles.set(key, file);
+        _droppedBytes += file.size || 0;
+        const evictPath = (): void => {
+            const oldest = droppedAudioFiles.keys().next().value;
+            if (oldest === undefined) return;
+            const f = droppedAudioFiles.get(oldest);
+            if (f) _droppedBytes -= f.size || 0;
+            droppedAudioFiles.delete(oldest);
+        };
+        while ((droppedAudioFiles.size > MAX_DROPPED_FILES || _droppedBytes > MAX_DROPPED_BYTES) && droppedAudioFiles.size > 0) evictPath();
+        // Accounting drift (unknown sizes) must never pin the counter high.
+        if (droppedAudioFiles.size === 0) _droppedBytes = 0;
+        if (_droppedBytes < 0) _droppedBytes = 0;
+        if (trackId) {
+            if (droppedAudioById.has(trackId)) droppedAudioById.delete(trackId);
+            droppedAudioById.set(trackId, file);
+            while (droppedAudioById.size > MAX_DROPPED_FILES) evictOldest(droppedAudioById);
+        }
+    } catch { /* ignore */ }
+}
+
+export function getDroppedAudioFile(filePath: string, trackId?: string): File | undefined {
+    try {
+        if (trackId) {
+            const byId = droppedAudioById.get(trackId);
+            if (byId) return byId;
+        }
+        const hit = droppedAudioFiles.get(canonicalDroppedKey(filePath));
+        if (hit) return hit;
+        return droppedAudioFiles.get(filePath);
+    } catch { return undefined; }
+}
+
+/**
+ * Read audio bytes for a track path: dropped File first, IPC fallback.
+ * Returns a detached ArrayBuffer or null when unreadable.
+ */
+export async function readAudioBytesForPath(filePath: string, trackId?: string): Promise<ArrayBuffer | null> {
+    const dropped = getDroppedAudioFile(filePath, trackId);
+    if (dropped) {
+        try {
+            if (typeof dropped.size === 'number') {
+                if (dropped.size === 0 || dropped.size > MAX_FILE_SIZE_BYTES) return null;
+            }
+            const buf = await dropped.arrayBuffer();
+            if (!buf || buf.byteLength === 0 || buf.byteLength > MAX_FILE_SIZE_BYTES) return null;
+            // Fresh exclusive buffer — no extra slice (C11: the old slice(0)
+            // doubled every dropped-file load for nothing).
+            return buf;
+        } catch { /* fall through to IPC */ }
+    }
+    try {
+        const rawData = await window.fileSystem.readFile(filePath);
+        if (!rawData) return null;
+        return normalizeToArrayBuffer(rawData);
+    } catch {
+        return null;
+    }
+}
+
+/**
  * Revokes a Blob URL after a delay to ensure the browser has finished buffering.
  * Prevents "Source Error" when skipping tracks rapidly.
  */
@@ -54,19 +193,23 @@ function trackBlobUrl(url: string, isMain: boolean): string {
     return url;
 }
 
-async function getSafeUrl(filePath: string, isMain: boolean, verifyDecode = false): Promise<string> {
+async function getSafeUrl(filePath: string, isMain: boolean, verifyDecode = false, trackId?: string): Promise<string> {
     try {
-        const rawData = await window.fileSystem.readFile(filePath);
-        if (!rawData) {
+        // trackId threads through so dropped-file bytes resolve by id exactly
+        // like loadTrack — previously the crossfade path dropped it and
+        // re-read via IPC, diverging from loadTrack validation (M11).
+        const arrayBuffer = await readAudioBytesForPath(filePath, trackId);
+        if (!arrayBuffer) {
             logger.warn(`[SafeURL] File unreadable: ${filePath}`);
             return "";
         }
-        const arrayBuffer = normalizeToArrayBuffer(rawData);
         if (arrayBuffer.byteLength === 0 || arrayBuffer.byteLength > MAX_FILE_SIZE_BYTES) {
             logger.warn(`[SafeURL] Rejected bad size (${arrayBuffer.byteLength}): ${filePath}`);
             return "";
         }
-        const sigErr = validateAudioSignature(arrayBuffer);
+        // L6: pass the file name so the validator can apply extension-aware
+        // judgments (ID3-wrapped FLAC, header/extension mismatches).
+        const sigErr = validateAudioSignature(arrayBuffer, filePath.split(/[\\/]/).pop());
         if (sigErr) {
             logger.warn(`[SafeURL] Rejected non-audio file: ${filePath} (${sigErr})`);
             return "";
@@ -78,6 +221,9 @@ async function getSafeUrl(filePath: string, isMain: boolean, verifyDecode = fals
                 return "";
             }
         }
+        // Blob wraps the ORIGINAL buffer — the old extra slice(0) tripled
+        // peak RAM (read + verify copy + blob copy). decodeAudioData detaches
+        // only the verify copy, so the original stays intact here.
         const blob = new Blob([arrayBuffer], { type: 'audio/mpeg' });
         return trackBlobUrl(URL.createObjectURL(blob), isMain);
     } catch (e) {
@@ -111,6 +257,11 @@ let _loadTrackId = 0;
 export function setPlaybackMode(mode: PlaybackMode): void { state.update({ playbackMode: mode }); }
 export function getPlaybackMode(): PlaybackMode { return state.playbackMode; }
 export function setLoopMode(mode: LoopMode): void {
+    // LOOP ONE and AutoMix fight over track endings (H11) — setting one
+    // directly must clear the other, mirroring setAutoMixEnabled.
+    if (mode === 'one' && state.isAutoMixEnabled) {
+        state.update({ isAutoMixEnabled: false });
+    }
     state.update({ loopMode: mode });
     // Apply to both channels: after a swap the promoted element must inherit
     // the flag or LOOP ONE silently dies post-crossfade.
@@ -185,8 +336,16 @@ export function getPlayerAudio(): HTMLAudioElement { return engine.main.audio; }
 
 /** Immediately revoke tracked blob URLs (called on app teardown). */
 export function disposePlayerUrls(): void {
+    // Detach first: revoking a URL still assigned to a live <audio> src
+    // kills in-flight playback with a source error. Only revoke once no
+    // element references the URL.
+    try { engine.main.audio.removeAttribute('src'); } catch { /* ignore */ }
+    try { engine.main.audio.load(); } catch { /* ignore */ }
+    try { engine.crossfade.audio.removeAttribute('src'); } catch { /* ignore */ }
+    try { engine.crossfade.audio.load(); } catch { /* ignore */ }
     for (const url of [mainBlobUrl, crossfadeBlobUrl]) {
         if (url && url.startsWith('blob:')) {
+            if (engine.main.audio.src === url || engine.crossfade.audio.src === url) continue;
             try { URL.revokeObjectURL(url); } catch { /* ignore */ }
         }
     }
@@ -203,9 +362,9 @@ export async function loadTrack(index: number): Promise<void> {
     const track = playlist[index];
     // Claim the generation BEFORE any await so overlapping calls can't both
     // assign audio.src — stale resolutions are discarded below.
+    // Index commits only after the file proves loadable (C10) — failures
+    // leave highlight + index on the previous live track.
     const loadId = ++_loadTrackId;
-    state.update({ currentTrackIndex: index });
-    if (renderPlaylistFn) renderPlaylistFn();
     
     engine.main.reset();
     logger.info(`[Player] Loading track: ${track.name} [ID: ${track.id}]`);
@@ -213,13 +372,20 @@ export async function loadTrack(index: number): Promise<void> {
     // read the file twice (2x I/O, 2x RAM, TOCTOU). decodeAudioData detaches
     // its input, so the blob gets a copy.
     let sharedBuffer: ArrayBuffer | null = null;
+    logger.debug(`[Player] loadId=${loadId} read start: ${track.path}`);
     try {
-        const rawData = await window.fileSystem.readFile(track.path);
-        if (rawData) sharedBuffer = normalizeToArrayBuffer(rawData);
+        sharedBuffer = await withLoadStepTimeout(readAudioBytesForPath(track.path, track.id), LOAD_READ_TIMEOUT_MS, 'read');
     } catch (e) {
+        if (e instanceof LoadStepTimeoutError) {
+            logger.warn(`[Player] Load read timed out loadId=${loadId} path=${track.path}`);
+            toast.error("TRACK LOAD TIMED OUT — KEPT PREVIOUS TRACK");
+            hideSpinnerIfCurrent(loadId);
+            return;
+        }
         logger.warn(`[Player] Read failed for ${track.path}`, e);
     }
-    if (loadId !== _loadTrackId) return;
+    logger.debug(`[Player] loadId=${loadId} read done bytes=${sharedBuffer?.byteLength ?? 'null'}`);
+    if (loadId !== _loadTrackId) { logger.debug(`[Player] loadId=${loadId} superseded after read`); return; }
     if (!sharedBuffer) {
         toast.error("TRACK UNREADABLE — KEPT PREVIOUS TRACK");
         hideSpinnerIfCurrent(loadId);
@@ -230,7 +396,7 @@ export async function loadTrack(index: number): Promise<void> {
         hideSpinnerIfCurrent(loadId);
         return;
     }
-    const sigErr = validateAudioSignature(sharedBuffer);
+    const sigErr = validateAudioSignature(sharedBuffer, track.name);
     if (sigErr) {
         toast.error("INVALID AUDIO FILE — KEPT PREVIOUS TRACK");
         logger.warn(`[Player] Rejected non-audio: ${track.path} (${sigErr})`);
@@ -244,24 +410,51 @@ export async function loadTrack(index: number): Promise<void> {
     // Verify decodability BEFORE touching the live deck. Uses a detached copy
     // so sharedBuffer stays intact for the playback blob.
     let verifiedBuffer: AudioBuffer | null = null;
+    logger.debug(`[Player] loadId=${loadId} decode start: ${track.path}`);
     try {
         if (ensureAudio() && audioCtx && sharedBuffer) {
             const verifyCopy = sharedBuffer.slice(0);
-            verifiedBuffer = await audioCtx.decodeAudioData(verifyCopy);
+            verifiedBuffer = await withLoadStepTimeout(audioCtx.decodeAudioData(verifyCopy), LOAD_DECODE_TIMEOUT_MS, 'decode');
         }
     } catch (decErr) {
+        if (decErr instanceof LoadStepTimeoutError) {
+            logger.warn(`[Player] Load decode timed out loadId=${loadId} path=${track.path}`);
+            toast.error("TRACK DECODE TIMED OUT — KEPT PREVIOUS TRACK");
+            hideSpinnerIfCurrent(loadId);
+            return;
+        }
         logger.warn(`[Player] Decode verification failed for ${track.path}`, decErr);
         toast.error("TRACK UNDECODABLE — KEPT PREVIOUS TRACK");
         hideSpinnerIfCurrent(loadId);
         return;
     }
-    if (loadId !== _loadTrackId) { hideSpinnerIfCurrent(loadId); return; }
+    logger.debug(`[Player] loadId=${loadId} decode done`);
+    if (loadId !== _loadTrackId) { logger.debug(`[Player] loadId=${loadId} superseded after decode`); hideSpinnerIfCurrent(loadId); return; }
     const live = state.playlist;
-    if (index < 0 || index >= live.length || live[index]?.id !== track.id) { hideSpinnerIfCurrent(loadId); return; }
-    const blobCopy = sharedBuffer.slice(0);
-    const safeUrl = trackBlobUrl(URL.createObjectURL(new Blob([blobCopy], { type: 'audio/mpeg' })), true);
-    engine.main.load(safeUrl);
-    engine.main.audio.playbackRate = tempoSlider ? parseFloat(tempoSlider.value) : 1;
+    if (index < 0 || index >= live.length || live[index]?.id !== track.id) { logger.debug(`[Player] loadId=${loadId} cancelled: playlist changed`); hideSpinnerIfCurrent(loadId); return; }
+    // Blob wraps the ORIGINAL sharedBuffer (C11) — the old slice(0) kept a
+    // third full-size copy alive next to the read buffer + verify copy.
+    const safeUrl = trackBlobUrl(URL.createObjectURL(new Blob([sharedBuffer], { type: 'audio/mpeg' })), true);
+    // Handshake before trusting the deck (C13): bare src assignment while a
+    // previous load is buffering aborts it with a media error.
+    const loadOk = await engine.main.loadAsync(safeUrl);
+    if (loadId !== _loadTrackId) { logger.debug(`[Player] loadId=${loadId} superseded during handshake`); return; }
+    if (!loadOk) {
+        logger.warn(`[Player] Load handshake failed for ${track.path}`);
+        toast.error("TRACK FAILED TO LOAD — KEPT PREVIOUS TRACK");
+        hideSpinnerIfCurrent(loadId);
+        return;
+    }
+    // Commit the index only now — read, signature, decode, and handshake
+    // all passed, so highlight + index + audio agree (C10).
+    state.update({ currentTrackIndex: index });
+    if (renderPlaylistFn) renderPlaylistFn();
+    try {
+        const r = tempoSlider ? parseFloat(tempoSlider.value) : 1;
+        // NaN rate previously poisoned the element and threw inside the
+        // loadTrack().then(playTrack) chain as an unhandled rejection (H12).
+        engine.main.audio.playbackRate = Number.isFinite(r) ? Math.min(4, Math.max(0.25, r)) : 1;
+    } catch { /* ignore */ }
 
     const hasBpm = track.bpm !== null && track.bpm !== undefined && track.bpm > 0;
     state.update({ masterBPM: hasBpm ? (track.bpm as number) : 0 });
@@ -323,10 +516,24 @@ export async function loadTrack(index: number): Promise<void> {
 
 let crossfadeTimer: ReturnType<typeof setTimeout> | null = null;
 let crossfadeGen = 0;
+/**
+ * Incoming/main rate ratio established at blend start. Tempo-slider moves
+ * mid-blend scale both decks by it so the BPM match survives (H9) instead
+ * of the slider clobbering the incoming rate.
+ */
+let crossfadeRateRatio = 1;
+/** Cached sampler module for per-tick tempo fan-out (H12: no import() per event). */
+let _samplerMod: typeof import('./sampler') | null = null;
+
+/** Element-safe tempo clamp — match ratios legitimately reach 0.25–4. */
+function clampTempoRate(r: number): number {
+    return Number.isFinite(r) ? Math.min(4, Math.max(0.25, r)) : 1;
+}
 
 /** Abort any armed blend so delete/stop can't be resurrected by a stale timer. */
 export function abortCrossfade(): void {
     crossfadeGen++;
+    crossfadeRateRatio = 1;
     if (crossfadeTimer) { clearTimeout(crossfadeTimer); crossfadeTimer = null; }
     try { engine.crossfade.audio.pause(); } catch { /* ignore */ }
     // Reclaim the incoming blob URL — removeSelectedTracks clears src but the
@@ -407,7 +614,7 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
     if (autoMixBtn) autoMixBtn.classList.add('blending');
 
     engine.crossfade.reset();
-    const safeUrl = await getSafeUrl(playlist[nextIdx].path, false, true);
+    const safeUrl = await getSafeUrl(playlist[nextIdx].path, false, true, playlist[nextIdx].id);
     if (myGen !== crossfadeGen || !state.isCrossfadeInProgress) return;
     if (!safeUrl) {
         state.update({ isCrossfadeInProgress: false });
@@ -422,7 +629,18 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
         abortCrossfade();
         return;
     }
-    engine.crossfade.load(safeUrl);
+    // Handshake the incoming deck before automating it (C13) — a dead
+    // source must abort the blend, not ride silent under automation.
+    const incomingOk = await engine.crossfade.loadAsync(safeUrl);
+    if (myGen !== crossfadeGen || !state.isCrossfadeInProgress) return;
+    if (!incomingOk) {
+        state.update({ isCrossfadeInProgress: false });
+        updateControlsLock(false);
+        if (setBlendingIndexFn) setBlendingIndexFn(-1);
+        if (autoMixBtn) autoMixBtn.classList.remove('blending');
+        toast.error("NEXT TRACK UNPLAYABLE — CROSSFADE ABORTED");
+        return;
+    }
 
     // Sonetra AI: pre-warm only. Cached AI transitions are generated in the
     // background for future mixes; live AI-stem playback is NOT implemented
@@ -448,20 +666,32 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
         }
     }
 
-    cross.lowEQ.gain.value = settings.autoMix.eqCrossfade ? -24 : 0;
-    cross.midEQ.gain.value = settings.autoMix.eqCrossfade ? -6 : 0;
+    // Mirror the outgoing ramp depths (H10): incoming starts exactly where
+    // outgoing ends so the blend has no mid hole. Uses constants, not magic.
+    cross.lowEQ.gain.value = settings.autoMix.eqCrossfade ? CROSSFADE_RAMP_LOW_DB : 0;
+    cross.midEQ.gain.value = settings.autoMix.eqCrossfade ? CROSSFADE_RAMP_MID_DB : 0;
     cross.gain.gain.value = 0.001;
-    cross.audio.playbackRate = engine.main.audio.playbackRate;
+    try {
+        const mainRate = engine.main.audio.playbackRate;
+        cross.audio.playbackRate = clampTempoRate(mainRate);
+    } catch { /* ignore */ }
     // BPM Sync (was a dead checkbox): tempo-match incoming to outgoing.
+    // matched = mainRate * cur/nxt, clamped to element range 0.25–4 (H9) —
+    // the old 0.5–1.5 clamp corrupted genuine 2:1 tempo matches.
     if (settings.autoMix.bpmSync) {
         const curBpm = playlist[state.currentTrackIndex]?.bpm ?? 0;
         const nxtBpm = playlist[nextIdx]?.bpm ?? 0;
         if (curBpm > 0 && nxtBpm > 0) {
-            const matched = engine.main.audio.playbackRate * (curBpm / nxtBpm);
-            cross.audio.playbackRate = Math.min(1.5, Math.max(0.5, matched));
+            const matched = clampTempoRate(engine.main.audio.playbackRate * (curBpm / nxtBpm));
+            cross.audio.playbackRate = matched;
             logger.info(`[AutoMix] BPM sync ${curBpm}->${nxtBpm} rate=${cross.audio.playbackRate.toFixed(3)}`);
         }
     }
+    try {
+        const base = engine.main.audio.playbackRate || 1;
+        crossfadeRateRatio = cross.audio.playbackRate / base;
+        if (!Number.isFinite(crossfadeRateRatio) || crossfadeRateRatio <= 0) crossfadeRateRatio = 1;
+    } catch { crossfadeRateRatio = 1; }
 
     try {
         await engine.crossfade.audio.play();
@@ -481,16 +711,26 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
     }
 
     const rawDuration = customDuration !== null ? customDuration : settings.autoMix.trackDuration;
-    const duration = Number.isFinite(rawDuration) ? Math.min(60, Math.max(0.5, rawDuration)) : settings.autoMix.trackDuration;
+    let duration = safeFadeSeconds(rawDuration);
+    // A 60s blend on a 70s track never completes (H11): the timeupdate gate
+    // needs duration*2 of runway. Cap the blend at half the outgoing length.
+    try {
+        const mainLen = engine.main.audio.duration;
+        if (Number.isFinite(mainLen) && mainLen > 0) {
+            duration = Math.min(duration, Math.max(0.5, mainLen / 2 - 0.25));
+        }
+    } catch { /* unknown length — keep requested duration */ }
     const now = audioCtx.currentTime;
 
     // --- AUTOMATION: OUTGOING (Main) ---
+    // Explicit start values, never param.value-after-cancel (H10): .value
+    // reads back stale intrinsics once automation is cancelled.
     if (settings.autoMix.eqCrossfade) {
         main.lowEQ.gain.cancelScheduledValues(now);
         main.lowEQ.gain.setValueAtTime(0, now);
         main.lowEQ.gain.linearRampToValueAtTime(CROSSFADE_RAMP_LOW_DB, now + duration * 0.8);
         main.midEQ.gain.cancelScheduledValues(now);
-        main.midEQ.gain.setValueAtTime(main.midEQ.gain.value, now);
+        main.midEQ.gain.setValueAtTime(0, now);
         main.midEQ.gain.linearRampToValueAtTime(CROSSFADE_RAMP_MID_DB, now + duration);
     }
     if (settings.autoMix.filterSweep) {
@@ -499,7 +739,7 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
         main.lpFilter.frequency.exponentialRampToValueAtTime(CROSSFADE_LP_SWEEP_HZ, now + duration);
     }
     main.gain.gain.cancelScheduledValues(now);
-    main.gain.gain.setValueAtTime(main.gain.gain.value, now);
+    main.gain.gain.setValueAtTime(1, now);
     main.gain.gain.linearRampToValueAtTime(0.001, now + duration);
 
     // --- AUTOMATION: INCOMING (Crossfade) ---
@@ -508,7 +748,7 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
         cross.lowEQ.gain.setValueAtTime(CROSSFADE_RAMP_LOW_DB, now);
         cross.lowEQ.gain.linearRampToValueAtTime(0, now + duration * 0.8);
         cross.midEQ.gain.cancelScheduledValues(now);
-        cross.midEQ.gain.setValueAtTime(cross.midEQ.gain.value, now);
+        cross.midEQ.gain.setValueAtTime(CROSSFADE_RAMP_MID_DB, now);
         cross.midEQ.gain.linearRampToValueAtTime(0, now + duration);
     }
     if (settings.autoMix.hpfSweep) {
@@ -560,7 +800,15 @@ function finishCrossfade(nextIndex: number, expectedId?: string): void {
     // Nuking the old main only after it's definitely stopped and a new one is playing.
     if (oldMainUrl) revokeLater(oldMainUrl, BLOB_REVOKE_CROSSFADE_MS);
 
-    state.update({ currentTrackIndex: nextIndex, isCrossfadeInProgress: false });
+    // Master BPM follows the PROMOTED track (H8) — tempo display, SYNC
+    // rate, and BPM-sync math all keyed off the outgoing BPM before.
+    const promotedBpm = state.playlist[nextIndex]?.bpm ?? 0;
+    state.update({
+        currentTrackIndex: nextIndex,
+        isCrossfadeInProgress: false,
+        masterBPM: promotedBpm > 0 ? promotedBpm : 0,
+    });
+    crossfadeRateRatio = 1;
     updateControlsLock(false);
 
     if (setBlendingIndexFn) setBlendingIndexFn(-1);
@@ -587,11 +835,35 @@ export function playTrack(): void {
         toast.error("Audio not available. Please refresh the page.");
         return;
     }
-    resumeAudioContext();
-    engine.main.audio.play().then(() => {
+    void playTrackAsync().catch(() => undefined);
+}
+
+async function playTrackAsync(): Promise<void> {
+    if (state.isCrossfadeInProgress || !state.playlist.length || !engine.main.audio) return;
+    // A closed-context rebuild swaps in an empty <audio> element (C7) — the
+    // old blob: URL is gone, so re-load the current track instead of playing
+    // silence while the UI claims playback.
+    if (engine.main.needsReload) {
+        const idx = state.currentTrackIndex;
+        if (idx >= 0 && idx < state.playlist.length) {
+            logger.warn('[Player] Deck rebuilt — re-loading current track');
+            void loadTrack(idx).then(() => playTrack()).catch(() => undefined);
+        } else {
+            toast.error("AUDIO DEVICE CHANGED — RELOAD A TRACK");
+        }
+        return;
+    }
+    // Chain play() after the resume attempt (H12): firing play() into a
+    // suspended context rejects and leaves the UI claiming playback.
+    try { await resumeAudioContext(); } catch { /* play attempt still runs below */ }
+    if (state.isCrossfadeInProgress) return;
+    try {
+        await engine.main.audio.play();
         state.update({ isPlaying: true });
         updateControlsLock(false);
-    }).catch((e) => logger.error(e));
+    } catch (e) {
+        logger.error('[Player] play() failed', e);
+    }
 }
 
 export function pauseTrack(): void {
@@ -606,10 +878,10 @@ export function stopPlayback(): void {
     _loadTrackId++;
     crossfadeGen++;
     if (crossfadeTimer) { clearTimeout(crossfadeTimer); crossfadeTimer = null; }
-    engine.main.audio.pause();
-    engine.main.audio.currentTime = 0;
-    engine.crossfade.audio.pause();
-    engine.crossfade.audio.src = "";
+    try { engine.main.audio.pause(); } catch { /* ignore */ }
+    try { engine.main.audio.currentTime = 0; } catch { /* sourceless element — ignore (M9) */ }
+    try { engine.crossfade.audio.pause(); } catch { /* ignore */ }
+    try { engine.crossfade.audio.src = ""; } catch { /* ignore */ }
 
     // Cancel any in-flight crossfade automation — otherwise scheduled gain/EQ
     // ramps keep running and the next replay starts muted or swept.
@@ -624,6 +896,10 @@ export function stopPlayback(): void {
 
     state.update({ isPlaying: false, isCrossfadeInProgress: false });
     updateControlsLock(false);
+    // stopPlayback invalidates in-flight loadTrack generations, which makes
+    // hideSpinnerIfCurrent(loadId) a no-op for the superseded load — the
+    // spinner would stick forever on stop-during-slow-load. Hide directly.
+    try { trackSpinner?.classList.remove('active'); } catch { /* ignore */ }
 
     if (progressBar) progressBar.value = "0";
     if (setBlendingIndexFn) setBlendingIndexFn(-1);
@@ -649,14 +925,26 @@ function wireChannelHandlers(el: HTMLAudioElement): void {
 
     const isCurrentMain = () => engine.main.audio === el;
 
+    // Element-driven truth (H12): external pauses (device loss, auto-pause)
+    // and stall-then-start must reflect in state, not just play()/pause().
+    el.addEventListener('pause', () => {
+        if (!isCurrentMain()) return;
+        if (state.isPlaying) state.update({ isPlaying: false });
+    });
+    el.addEventListener('playing', () => {
+        if (!isCurrentMain()) return;
+        if (!state.isPlaying) state.update({ isPlaying: true });
+    });
+
     el.addEventListener('timeupdate', () => {
         if (!isCurrentMain()) return;
         if (!isDraggingProgress && el.duration) {
             const progress = (el.currentTime / el.duration) * 100;
             if (progressBar) progressBar.value = progress.toString();
             if (timeDisplay) timeDisplay.innerText = formatTime(el.currentTime);
-            if (state.isAutoMixEnabled && !state.isCrossfadeInProgress && el.duration > settings.autoMix.trackDuration * 2) {
-                if (el.currentTime >= el.duration - settings.autoMix.trackDuration) {
+            const fadeSecs = safeFadeSeconds();
+            if (state.isAutoMixEnabled && !state.isCrossfadeInProgress && el.duration > fadeSecs * 2) {
+                if (el.currentTime >= el.duration - fadeSecs) {
                     void startCrossfade().catch(() => undefined);
                 }
             }
@@ -679,7 +967,7 @@ function wireChannelHandlers(el: HTMLAudioElement): void {
                 if (state.loopMode === 'all') nextIndex = 0;
                 else { stopPlayback(); return; }
             }
-            loadTrack(nextIndex).then(() => playTrack());
+            loadTrack(nextIndex).then(() => playTrack()).catch(() => undefined);
             return;
         }
         if (!state.isAutoMixEnabled && !state.isCrossfadeInProgress) {
@@ -696,7 +984,7 @@ function wireChannelHandlers(el: HTMLAudioElement): void {
                     if (state.loopMode === 'all') nextIndex = 0;
                     else { stopPlayback(); return; }
                 }
-                loadTrack(nextIndex).then(() => playTrack());
+                loadTrack(nextIndex).then(() => playTrack()).catch(() => undefined);
             }
         }
     });
@@ -739,10 +1027,10 @@ function setupTransportHandlers(): void {
     if (nextBtn) {
         nextBtn.onclick = () => {
             if (state.isCrossfadeInProgress || !state.playlist.length) return;
-            if (state.isAutoMixEnabled) startCrossfade(null, settings.autoMix.btnDuration);
+            if (state.isAutoMixEnabled) void startCrossfade(null, settings.autoMix.btnDuration).catch(() => undefined);
             else {
                 const nextIdx = (state.currentTrackIndex + 1) % state.playlist.length;
-                loadTrack(nextIdx).then(playTrack);
+                loadTrack(nextIdx).then(playTrack).catch(() => undefined);
             }
         };
     }
@@ -751,10 +1039,10 @@ function setupTransportHandlers(): void {
     if (prevBtn) {
         prevBtn.onclick = () => {
             if (state.isCrossfadeInProgress || !state.playlist.length) return;
-            if (state.isAutoMixEnabled) startCrossfade((state.currentTrackIndex - 1 + state.playlist.length) % state.playlist.length, settings.autoMix.btnDuration);
+            if (state.isAutoMixEnabled) void startCrossfade((state.currentTrackIndex - 1 + state.playlist.length) % state.playlist.length, settings.autoMix.btnDuration).catch(() => undefined);
             else {
                 const prevIdx = (state.currentTrackIndex - 1 + state.playlist.length) % state.playlist.length;
-                loadTrack(prevIdx).then(playTrack);
+                loadTrack(prevIdx).then(playTrack).catch(() => undefined);
             }
         };
     }
@@ -768,18 +1056,43 @@ function setupTransportHandlers(): void {
             val = Math.min(1.5, Math.max(0.5, val));
             if (Math.abs(val - 1.0) < SLIDER_SNAP_THRESHOLD) { val = 1.0; slider.value = "1.0"; }
             try { engine.main.audio.playbackRate = val; } catch { /* ignore */ }
-            // Keep the incoming deck in sync mid-blend — previously only main moved.
+            // Mid-blend the incoming deck follows at the blend-start ratio so
+            // slider moves scale the whole mix without breaking the BPM match
+            // (H9) — the old absolute assignment destroyed the match.
             try {
-                if (state.isCrossfadeInProgress) engine.crossfade.audio.playbackRate = val;
+                if (state.isCrossfadeInProgress) {
+                    engine.crossfade.audio.playbackRate = clampTempoRate(val * crossfadeRateRatio);
+                }
             } catch { /* ignore */ }
+            // Cached module: the old void import() per input event re-fetched
+            // the chunk on every tempo tick (H12).
             try {
-                void import('./sampler').then(m => {
+                const applyTempo = (m: typeof import('./sampler')): void => {
                     for (const [k, v] of Object.entries(m.activeVoices)) {
                         if (!v?.source) continue;
-                        if ((m.padSyncState as any)[Number(k)]) continue;
-                        try { v.source.playbackRate.value = val; } catch { /* ignore */ }
+                        // SYNC voices were previously skipped here, freezing
+                        // them at the old tempo while everything else moved
+                        // (desync — the opposite of SYNC's intent). Recompute
+                        // their BPM-matched rate from the new slider value.
+                        try {
+                            if ((m.padSyncState as unknown as Record<number, boolean>)[Number(k)]) {
+                                const pb = (m.padBPMs as unknown as Record<number, number>)[Number(k)] ?? 0;
+                                const mb = state.masterBPM ?? 0;
+                                const r = (pb > 0 && mb > 0) ? val * (mb / pb) : val;
+                                v.source.playbackRate.value = clampTempoRate(r);
+                            } else {
+                                v.source.playbackRate.value = val;
+                            }
+                        } catch { /* ignore */ }
                     }
-                }).catch(() => undefined);
+                };
+                if (_samplerMod) applyTempo(_samplerMod);
+                else {
+                    void import('./sampler').then(m => {
+                        _samplerMod = m;
+                        applyTempo(m);
+                    }).catch(() => undefined);
+                }
             } catch { /* ignore */ }
             if (tempoVal) {
                 const displayBpm = state.masterBPM > 0 ? Math.round(state.masterBPM * val) : "---";
@@ -796,22 +1109,35 @@ function setupTransportHandlers(): void {
     if (autoMixBtn) autoMixBtn.onclick = toggleAutoMix;
 
     if (masterVol) {
+        // Knob is 45px wide and centered via translate(-50%, -50%), so its
+        // center must travel inset: 22.5px at 0%, (100% - 24.5px) at 100%.
+        // NOTE: calc() with `*` is invalid in some browsers and gets dropped,
+        // leaving the knob stuck at its CSS default (overflowing the track).
+        // Solve the multiply in JS and emit a plain `pct% +/- px` calc.
+        const positionVolKnob = (raw: number): void => {
+            if (!volKnob) return;
+            const v = Math.min(1, Math.max(0, Number.isFinite(raw) ? raw : 1));
+            volKnob.innerText = Math.round(v * 100) + '%';
+            const pct = v * 100;
+            const px = 22.5 - 47 * v;
+            volKnob.style.left = px < 0
+                ? `calc(${pct.toFixed(2)}% - ${Math.abs(px).toFixed(2)}px)`
+                : `calc(${pct.toFixed(2)}% + ${px.toFixed(2)}px)`;
+        };
         masterVol.oninput = () => {
             // Master volume belongs ONLY to masterGain — touching the channel
             // gain here would stomp crossfade fade automation.
             const val = parseFloat(masterVol!.value);
             if (masterGain && Number.isFinite(val)) {
                 try {
-                    const t = (window as unknown as { __ugAudioCtx?: AudioContext } | undefined);
-                    void t;
                     masterGain.gain.setTargetAtTime(Math.min(1, Math.max(0, val)), masterGain.context.currentTime, 0.02);
                 } catch { try { masterGain.gain.value = val; } catch { /* ignore */ } }
             }
-            if (volKnob) {
-                volKnob.innerText = Math.round(val * 100) + '%';
-                volKnob.style.left = `calc(22.5px + (100% - 47px) * ${val})`;
-            }
+            positionVolKnob(val);
         };
+        // Sync knob on init so first paint (and session/crash restores that
+        // dispatch `input`) starts inside the track instead of overflowing.
+        positionVolKnob(parseFloat(masterVol.value));
     }
 }
 

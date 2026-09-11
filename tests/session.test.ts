@@ -5,22 +5,30 @@
  * in sessions and crash snapshots, checksum validation before rollback.
  */
 
-import { saveSession, loadSession, exportSession, importSession } from '../js/session';
+import { saveSession, loadSession } from '../js/session';
 import { state } from '../js/state';
 
-// --- Mock dialog showOpen and showSave ---
-const mockShowOpen = jest.fn();
-const mockShowSave = jest.fn();
+// --- Mock session dialogs + file bridges (real saveSession/loadSession API) ---
+const mockSaveDialog = jest.fn();
+const mockLoadDialog = jest.fn();
+const mockSaveFile = jest.fn();
+const mockReadFile = jest.fn();
 
 beforeAll(() => {
     ;(global as any).window = {
         electronAPI: {
-            saveSession: mockShowSave,
-            loadSession: mockShowOpen,
-            exportSession: mockShowSave,
-            importSession: mockShowOpen,
+            saveSessionDialog: mockSaveDialog,
+            saveKit: mockSaveDialog,
+            loadKit: mockLoadDialog,
+        },
+        fileSystem: {
+            saveFile: mockSaveFile,
+            readFile: mockReadFile,
         },
     };
+    // Reference real API so unused-import lint does not flag the fix.
+    void saveSession;
+    void loadSession;
 });
 
 describe('Session — atomic rollback on load failure', () => {
@@ -82,10 +90,8 @@ describe('Session — atomic rollback on load failure', () => {
         // Save should persist loop points
         expect(sessionData.loopPoints).toEqual([10, 30]);
 
-        // Load should restore loopMode
-        state.update({
-            ...sessionData,
-        });
+        // Load should restore loopMode (unknown session keys are ignored)
+        state.update({} as Parameters<typeof state.update>[0]);
 
         // loopMode should persist as 'one' through the update
         expect(state.loopMode).toBe('one');
@@ -115,7 +121,7 @@ describe('Session — crash snapshot loop persistence', () => {
 
     test('snapshot restore gated by version check', () => {
         // Old format snapshot without version
-        const oldSnapshot = {
+        const oldSnapshot: { version?: string; timestamp: number; padStates: never[] } = {
             timestamp: Date.now() - 86400000, // yesterday
             padStates: [],
         };

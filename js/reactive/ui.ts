@@ -3,6 +3,8 @@
  * Optimized for high-frequency audio application updates.
  */
 
+import { Disposable } from '../utils';
+
 /**
  * Virtual Scroller Engine
  * Only renders what is visible.
@@ -16,6 +18,7 @@ export class VirtualScroller<T> {
     private contentEl: HTMLElement;
     private visibleItems: Map<number, HTMLElement> = new Map();
     private resizeObserver: ResizeObserver | null = null;
+    private readonly disposables = new Disposable();
     private _onScroll: () => void;
 
     constructor(options: {
@@ -55,20 +58,27 @@ export class VirtualScroller<T> {
         this.container.appendChild(this.contentEl);
 
         this._onScroll = () => this.refresh();
-        this.container.addEventListener('scroll', this._onScroll);
+        this.disposables.on(this.container, 'scroll', this._onScroll);
 
         // Without this, resizing/maximizing the window leaves stale viewport
         // math and rows go missing until the next scroll event.
         if (typeof ResizeObserver !== 'undefined') {
             this.resizeObserver = new ResizeObserver(() => this.refresh());
-            this.resizeObserver.observe(this.container);
+            const ro = this.resizeObserver;
+            const target = this.container;
+            try { ro.observe(target); } catch { /* ignore */ }
+            this.disposables.add(() => {
+                try { ro.disconnect(); } catch { /* ignore */ }
+            });
         }
 
         this.updateItems(this.items);
     }
 
     public updateItems(newItems: T[]) {
-        this.items = newItems;
+        // Defensive copy: callers mutating the array post-update previously
+        // corrupted scroller length/geometry with a stale blank viewport.
+        this.items = Array.isArray(newItems) ? [...newItems] : [];
         this.overflowEl.style.height = `${this.items.length * this.itemHeight}px`;
         // Clamp scrollTop: a shorter list previously left the viewport blank.
         const maxTop = Math.max(0, this.items.length * this.itemHeight - this.container.clientHeight);
@@ -77,8 +87,16 @@ export class VirtualScroller<T> {
     }
 
     private _refreshing = false;
+    private _refreshQueued = false;
+    private _refreshQueuedForce = false;
     public refresh(force = false) {
-        if (this._refreshing) return;
+        // M33: coalesce re-entrant refreshes instead of silently dropping them
+        // (renderItem -> state.update -> refresh during a refresh lost a frame).
+        if (this._refreshing) {
+            this._refreshQueued = true;
+            if (force) this._refreshQueuedForce = true;
+            return;
+        }
         this._refreshing = true;
         try {
         const scrollTop = this.container.scrollTop;
@@ -97,7 +115,16 @@ export class VirtualScroller<T> {
                 // reorder/resize if the callback doesn't set them.
                 // If the callback returns a NEW node (contract violation),
                 // replace instead of orphaning the new node + leaking the old.
-                const out = this.renderItem(this.items[idx], idx, el);
+                // A throwing renderer previously left half-pruned rows and
+                // recursed into the same throw via the queued refresh.
+                let out: HTMLElement | undefined;
+                try {
+                    out = this.renderItem(this.items[idx], idx, el);
+                } catch {
+                    try { el.remove(); } catch { /* ignore */ }
+                    this.visibleItems.delete(idx);
+                    continue;
+                }
                 const node = out ?? el;
                 if (node !== el) {
                     node.style.position = 'absolute';
@@ -118,7 +145,12 @@ export class VirtualScroller<T> {
         // Add visible items
         for (let i = startIdx; i <= endIdx; i++) {
             if (!this.visibleItems.has(i)) {
-                const el = this.renderItem(this.items[i], i);
+                let el: HTMLElement;
+                try {
+                    el = this.renderItem(this.items[i], i);
+                } catch {
+                    continue; // one bad row must not blank the viewport
+                }
                 el.style.position = 'absolute';
                 el.style.top = `${i * this.itemHeight}px`;
                 el.style.width = '100%';
@@ -128,6 +160,12 @@ export class VirtualScroller<T> {
             }
         }
         } finally { this._refreshing = false; }
+        if (this._refreshQueued) {
+            const f = this._refreshQueuedForce;
+            this._refreshQueued = false;
+            this._refreshQueuedForce = false;
+            this.refresh(f);
+        }
     }
 
     public scrollTo(index: number) {
@@ -138,11 +176,8 @@ export class VirtualScroller<T> {
 
     /** Destroy the scroller — cleans up listeners and DOM. */
     public destroy(): void {
-        this.container.removeEventListener('scroll', this._onScroll);
-        if (this.resizeObserver) {
-            this.resizeObserver.disconnect();
-            this.resizeObserver = null;
-        }
+        this.disposables.dispose();
+        this.resizeObserver = null;
         this.visibleItems.clear();
         this.container.innerHTML = '';
     }

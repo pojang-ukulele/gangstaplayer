@@ -20,7 +20,10 @@ function isSharedArrayBuffer(value: any): boolean {
 }
 
 export function normalizeToArrayBuffer(data: any): ArrayBuffer {
-    // Fast path: already an ArrayBuffer
+    // Always-copy contract (enforced by tests): callers rely on a fresh
+    // exclusive buffer because decodeAudioData detaches its input. Zero-copy
+    // was evaluated and rejected — pooled IPC allocations (byteOffset !== 0)
+    // and detach aliasing make the 1x transient copy the safe price.
     if (isArrayBuffer(data)) {
         return data.slice(0);
     }
@@ -80,6 +83,11 @@ const AUDIO_SIGNATURES: Record<string, { offset: number; bytes: number[] }> = {
     'webm': { offset: 0, bytes: [0x1A, 0x45, 0xDF, 0xA3] },
     // WAV (secondary): verify "WAVE" at offset 8 for RIFF files
     'wave': { offset: 8, bytes: [0x57, 0x41, 0x56, 0x45] }, // "WAVE"
+    // Big-endian WAV (RIFX) + RF64 (recordings >4GB) + AIFF (L6 gaps).
+    'rifx': { offset: 0, bytes: [0x52, 0x49, 0x46, 0x58] }, // "RIFX"
+    'rf64': { offset: 0, bytes: [0x52, 0x46, 0x36, 0x34] }, // "RF64"
+    'aiff': { offset: 0, bytes: [0x46, 0x4F, 0x52, 0x4D] }, // "FORM"
+    'aiffBody': { offset: 8, bytes: [0x41, 0x49, 0x46, 0x46] }, // "AIFF"
 };
 
 /**
@@ -97,10 +105,12 @@ export function validateAudioSignature(
     }
 
     const view = new DataView(buffer);
-    // MP3 frame sync is 11 bits: 0xFF followed by top-3-bits set. Exact-byte
-    // checks (FB/F3/...) miss valid MPEG variants and free-format frames.
-    if (buffer.byteLength >= 2 && view.getUint8(0) === 0xFF && (view.getUint8(1) & 0xE0) === 0xE0) {
-        return null;
+    // MP3 frame sync is 11 bits (0xFF + top-3-bits) AND valid layer bits
+    // (L6): bare 0xFF Ex accepted JPEG APP markers (E0-EF) as MP3. Layer
+    // 00 is reserved in MPEG — real frames always have nonzero layer bits.
+    if (buffer.byteLength >= 2 && view.getUint8(0) === 0xFF) {
+        const b1 = view.getUint8(1);
+        if ((b1 & 0xE0) === 0xE0 && (b1 & 0x06) !== 0x00) return null;
     }
     const matches: string[] = [];
 
@@ -122,18 +132,43 @@ export function validateAudioSignature(
     const hasRiff = matches.includes('wav');
     const hasWave = matches.includes('wave');
     const isRealWav = hasRiff && hasWave;
+    // RIFX/RF64 need the WAVE/ds64 body; AIFF needs FORM+AIFF (L6).
+    const isRifxWav = matches.includes('rifx') && hasWave;
+    const isRf64 = matches.includes('rf64');
+    const isAiff = matches.includes('aiff') && matches.includes('aiffBody');
     const hasId3 = matches.includes('mp3v2');
+    // ID3-wrapped audio (L6): strict offset-0 checks rejected tagged files.
+    // Look past a valid ID3v2 tag for the real stream magic. A bare ID3 tag
+    // alone previously passed (junk with an ID3 header wasted a worker copy +
+    // decode) — so require inner evidence: scan a window past the tag end for
+    // stream magic or an MPEG frame sync (padding between tag and frames is
+    // real, but bounded; 8KB is generous).
+    let id3InnerAudio = false;
     if (hasId3) {
         if (buffer.byteLength < 10) return `File does not contain recognized audio data${fileName ? ` (file: ${fileName})` : ''}`;
         const tagSize = ((view.getUint8(6) & 0x7f) << 21) | ((view.getUint8(7) & 0x7f) << 14) | ((view.getUint8(8) & 0x7f) << 7) | (view.getUint8(9) & 0x7f);
         if (tagSize <= 0 || 10 + tagSize >= buffer.byteLength) return `File does not contain recognized audio data${fileName ? ` (file: ${fileName})` : ''}`;
+        const inner = 10 + tagSize;
+        const scanEnd = Math.min(buffer.byteLength - 4, inner + 8192);
+        for (let p = inner; p <= scanEnd; p++) {
+            const tag = String.fromCharCode(
+                view.getUint8(p), view.getUint8(p + 1),
+                view.getUint8(p + 2), view.getUint8(p + 3));
+            if (tag === 'fLaC' || tag === 'OggS' || tag === 'RIFF' || tag === 'FORM') { id3InnerAudio = true; break; }
+            if (view.getUint8(p) === 0xFF && p + 1 < buffer.byteLength) {
+                const b1 = view.getUint8(p + 1);
+                if ((b1 & 0xE0) === 0xE0 && (b1 & 0x06) !== 0x00) { id3InnerAudio = true; break; }
+            }
+        }
+        if (!id3InnerAudio) return `File does not contain recognized audio data${fileName ? ` (file: ${fileName})` : ''}`;
     }
     const hasAudioSignature = isRealWav ||
+        isRifxWav || isRf64 || isAiff ||
         matches.includes('mp3') ||
         matches.includes('mp3b') ||
         matches.includes('mp3c') ||
         matches.includes('mp3d') ||
-        hasId3 ||
+        id3InnerAudio ||
         matches.includes('ogg') ||
         matches.includes('flac') ||
         matches.includes('m4a') ||
@@ -145,6 +180,56 @@ export function validateAudioSignature(
     }
 
     return null; // null = valid audio
+}
+
+// ==================== DISPOSABLE ====================
+
+/**
+ * Leak-free cleanup helper. Collects teardown callbacks and DOM listeners;
+ * calling dispose() runs them all exactly once (LIFO). Used by
+ * VirtualScroller and other long-lived components.
+ */
+export class Disposable {
+    private cleanups: Array<() => void> = [];
+    private disposed = false;
+
+    /** Register an arbitrary teardown callback. */
+    add(cleanup: () => void): void {
+        if (this.disposed) {
+            try { cleanup(); } catch { /* ignore */ }
+            return;
+        }
+        this.cleanups.push(cleanup);
+    }
+
+    /** Attach a DOM listener that is removed on dispose. */
+    on<K extends keyof HTMLElementEventMap>(
+        el: HTMLElement | Document | Window,
+        event: string,
+        handler: EventListenerOrEventListenerObject,
+        options?: AddEventListenerOptions | boolean
+    ): void {
+        try {
+            el.addEventListener(event, handler, options);
+        } catch {
+            return;
+        }
+        this.add(() => {
+            try { el.removeEventListener(event, handler, options); } catch { /* ignore */ }
+        });
+    }
+
+    /** Run all teardowns exactly once. */
+    dispose(): void {
+        if (this.disposed) return;
+        this.disposed = true;
+        for (let i = this.cleanups.length - 1; i >= 0; i--) {
+            try { this.cleanups[i](); } catch { /* ignore */ }
+        }
+        this.cleanups.length = 0;
+    }
+
+    get isDisposed(): boolean { return this.disposed; }
 }
 
 // ==================== TIMING UTILITIES ====================

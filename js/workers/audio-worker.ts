@@ -55,11 +55,15 @@ self.onmessage = function(e: MessageEvent<WorkerMessage>) {
 // Defaults match js/constants.ts — values are always passed from the main thread
 // but kept here as fallback for standalone worker execution.
 function detectBPM(data: Float32Array, sampleRate: number, threshold = 0.1, minStepSeconds = 0.3): number {
-    const BPM_DETECTION_THRESHOLD = threshold;
-    const BPM_MIN_STEP_SECONDS = minStepSeconds;
-    
+    // Defense in depth (H13): the client clamps these, but a minStepSeconds
+    // of 0 previously meant minStep=0 → i+=0 infinite loop → worker OOM.
+    if (!Number.isFinite(sampleRate) || sampleRate < 3000 || sampleRate > 192000) return -1;
+    if (!data || data.length === 0 || data.length > 32 * 1024 * 1024) return -1;
+    const BPM_DETECTION_THRESHOLD = threshold > 0 && threshold <= 1 ? threshold : 0.1;
+    const BPM_MIN_STEP_SECONDS = minStepSeconds > 0 && minStepSeconds <= 5 ? minStepSeconds : 0.3;
+
     const peaks: number[] = [];
-    const minStep = Math.floor(BPM_MIN_STEP_SECONDS * sampleRate);
+    const minStep = Math.max(1, Math.floor(BPM_MIN_STEP_SECONDS * sampleRate));
     
     for (let i = 0; i < data.length; i++) {
         if (Math.abs(data[i]) > BPM_DETECTION_THRESHOLD) {
@@ -106,6 +110,12 @@ function bufferToWave(abuffer: AudioBufferTransfer, len: number): Blob {
         throw new Error('Invalid length');
     }
     const totalLength = safeLen * numOfChan * 2 + 44;
+    // Product guard: safeLen x 32ch individually valid still multiplies to
+    // ~17GB — previously attempted before any check, risking a worker OOM
+    // that killed every queued BPM job. Recorder caps at ~360MB stereo.
+    if (totalLength > 600 * 1024 * 1024) {
+        throw new Error('Encode too large');
+    }
     const buffer = new ArrayBuffer(totalLength);
     const view = new DataView(buffer);
     const channels = abuffer.channels;

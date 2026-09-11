@@ -44,8 +44,12 @@ class RecorderProcessor extends BaseProcessor {
     if (this.batch.length === 0) return;
     const flat: Float32Array[][] = this.batch;
     this.batch = [];
-    // Flatten batch into per-channel contiguous arrays.
-    const numCh = flat[0].length;
+    // Flatten batch into per-channel contiguous arrays. Channel count comes
+    // from the first well-formed block — a malformed leading block previously
+    // threw away the valid tail.
+    const first = flat.find(b => Array.isArray(b) && b.length > 0);
+    if (!first) return;
+    const numCh = first.length;
     const perChannel: Float32Array[][] = [];
     for (let c = 0; c < numCh; c++) {
       let total = 0;
@@ -71,6 +75,9 @@ class RecorderProcessor extends BaseProcessor {
 
     // Standard block size is 128
     const channels = input.map(ch => new Float32Array(ch));
+    // Zero-length blocks carry no samples — skip so they can't poison the
+    // channel-count scan or produce empty DATA payloads downstream.
+    if (channels.every(c => c.length === 0)) return true;
 
     this.batch.push(channels);
     if (this.batch.length >= this.BATCH_SIZE) this.flush();

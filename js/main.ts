@@ -1,6 +1,6 @@
 // === MAIN ENTRY POINT ===
 // Gangsta Player Pro 3 - Modular Architecture
-import { resumeAudioContext, masterGain, audioCtx, bufferToWave, initWorklets, ensureAudio } from './audio';
+import { resumeAudioContext, masterGain, audioCtx, bufferToWave, initWorklets, ensureAudio, onAudioRebuilt } from './audio';
 import { enableMIDI, initMIDI } from './midi';
 import {
     initSampler, createPadGrid, setupPadKeyboardHandlers, getPadGrid,
@@ -39,6 +39,57 @@ let isRecording = false;
 const bridge = window.electronAPI;
 const fsBridge = window.fileSystem;
 
+// Fail-loud when preload bridges are missing (packaged-only class of bug:
+// renderer boots without contextBridge exposes and every bridge call throws
+// an inscrutable TypeError). Shows a full-screen overlay naming the missing
+// bridges instead of dying on first use.
+function showBridgeFatalOverlay(missing: string[]): void {
+    try {
+        if (document.getElementById('bridgeFatalOverlay')) return;
+        const overlay = document.createElement('div');
+        overlay.id = 'bridgeFatalOverlay';
+        overlay.setAttribute('role', 'alert');
+        overlay.style.cssText = 'position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.92);padding:24px;text-align:center;';
+        const box = document.createElement('div');
+        box.style.cssText = 'max-width:560px;color:#ff5a5a;font-family:monospace;font-size:14px;line-height:1.6;';
+        const title = document.createElement('div');
+        title.textContent = 'FATAL: PRELOAD BRIDGES MISSING';
+        title.style.cssText = 'font-weight:bold;font-size:16px;margin-bottom:12px;';
+        const detail = document.createElement('div');
+        detail.style.color = '#eee';
+        detail.textContent = `Missing: ${missing.join(', ')}. The app was built or packaged without preload.js exposes (run outside Electron, broken build, or blocked preload). Restart the packaged app — if this persists, rebuild.`;
+        box.appendChild(title);
+        box.appendChild(detail);
+        overlay.appendChild(box);
+        document.body.appendChild(overlay);
+    } catch { /* overlay is best-effort — init already aborts */ }
+}
+
+function getMissingBridges(): string[] {
+    const missing: string[] = [];
+    if (!window.electronAPI) missing.push('electronAPI');
+    if (!window.fileSystem) missing.push('fileSystem');
+    if (!window.database) missing.push('database');
+    // L9: sonetra was skipped — AI features silently no-op without it.
+    if (!window.sonetra) missing.push('sonetra');
+    return missing;
+}
+
+/** Hide every context menu (M21): openers previously hid only a subset. */
+function hideAllContextMenus(): void {
+    try {
+        const ids = ['contextMenu', 'samplerSubmenu', 'playContextMenu', 'loopContextMenu'];
+        for (const id of ids) {
+            const m = document.getElementById(id);
+            if (m) { m.classList.add('hidden'); m.setAttribute('aria-hidden', 'true'); }
+        }
+        if (padContextMenuEl) { padContextMenuEl.classList.add('hidden'); padContextMenuEl.setAttribute('aria-hidden', 'true'); }
+        if (controlContextMenuEl) controlContextMenuEl.classList.add('hidden');
+        const samplerParent = document.getElementById('ctxLoadToSampler');
+        if (samplerParent) samplerParent.setAttribute('aria-expanded', 'false');
+    } catch { /* ignore */ }
+}
+
 // Context menu setup functions (extracted from initApp)
 
 // Hoisted so handlers outside setupContextMenus (play/loop menus, global
@@ -65,6 +116,7 @@ function setupContextMenus() {
                 pad.addEventListener('contextmenu', (e) => {
                     e.preventDefault();
                     e.stopPropagation();
+                    hideAllContextMenus();
                     const hasBuffer = !!padBuffers[i];
                     if (hasBuffer) {
                         if (ctxSync) {
@@ -117,7 +169,7 @@ function setupContextMenus() {
                 pad.addEventListener('click', async () => {
                     logger.info(`[Main] Pad ${i} click. bufferExists=${!!padBuffers[i]}`);
                     if (!padBuffers[i]) {
-                        const filePath = await bridge.openSampleDialog();
+                        const filePath = await bridge?.openSampleDialog();
                         logger.info(`[Main] Pad ${i} dialog result: ${filePath}`);
                         if (filePath) await loadSampleFromPath(filePath, i);
                         logger.info(`[Main] Pad ${i} after load. bufferExists=${!!padBuffers[i]}`);
@@ -130,7 +182,7 @@ function setupContextMenus() {
     if (ctxLoadSample && padContextMenu) {
         ctxLoadSample.addEventListener('click', async () => {
             const index = parseInt(padContextMenu.dataset.padIndex || "0");
-            const filePath = await bridge.openSampleDialog();
+            const filePath = await bridge?.openSampleDialog();
             if (filePath) await loadSampleFromPath(filePath, index);
         });
     }
@@ -240,9 +292,8 @@ function setupContextMenus() {
             el.addEventListener('contextmenu', (e) => {
                 e.preventDefault();
                 e.stopPropagation();
-                
-                // Hide other menus
-                document.dispatchEvent(new Event('click'));
+
+                hideAllContextMenus();
 
                 if (ctxControlMidiLearn) ctxControlMidiLearn.classList.toggle('hidden', !state.isMidiActive);
 
@@ -312,9 +363,11 @@ function setupGlobalKeyboardShortcuts() {
 
         // Ignore typing/editing contexts: text inputs, textareas, selects,
         // contenteditable, and range sliders (arrows adjust the slider natively).
+        // M22: password/url/email/tel are editing contexts too — SPACE must
+        // type natively there, not toggle transport.
         if (tag === 'TEXTAREA' || tag === 'SELECT') return;
         if (target?.isContentEditable) return;
-        if (tag === 'INPUT' && (inputType === 'text' || inputType === 'search' || inputType === 'number')) return;
+        if (tag === 'INPUT' && (inputType === 'text' || inputType === 'search' || inputType === 'number' || inputType === 'password' || inputType === 'url' || inputType === 'email' || inputType === 'tel')) return;
         if (tag === 'INPUT' && inputType === 'range' && (e.key === 'ArrowLeft' || e.key === 'ArrowRight' || e.key === 'ArrowUp' || e.key === 'ArrowDown')) return;
         // Focused buttons: Space clicks natively — don't also toggle transport.
         if (tag === 'BUTTON' && e.code === 'Space') return;
@@ -322,10 +375,10 @@ function setupGlobalKeyboardShortcuts() {
         // must not also toggle transport or seek.
         if (tag === 'INPUT' && (inputType === 'checkbox' || inputType === 'range') && e.code === 'Space') return;
 
-        // Transport — blocked during AutoMix blending
+        // Transport — play/pause queue as intent mid-blend (C8), so SPACE
+        // stays live during AutoMix blending instead of blacking out.
         if (e.code === 'Space') {
             e.preventDefault();
-            if (state.isCrossfadeInProgress) return;
             const playerAudio = getPlayerAudio();
             if (playerAudio) {
                 if (!playerAudio.paused) pauseTrack(); else playTrack();
@@ -335,6 +388,12 @@ function setupGlobalKeyboardShortcuts() {
             e.preventDefault();
             stopPlayback();
         } else if (e.code === 'ArrowLeft' || e.code === 'ArrowRight') {
+            // C15: never hijack caret/slider movement in editing contexts —
+            // return BEFORE preventDefault so the caret moves natively.
+            if (tag === 'TEXTAREA' || tag === 'SELECT') return;
+            if (target?.isContentEditable) return;
+            if (tag === 'INPUT') return;
+            try { if ((target as HTMLElement | null)?.closest?.('#playlistSearch')) return; } catch { /* ignore */ }
             // Seek ±5s — documented in the help modal but never implemented
             e.preventDefault();
             if (state.isCrossfadeInProgress) return;
@@ -348,20 +407,23 @@ function setupGlobalKeyboardShortcuts() {
             }
         }
         
-        // Playlist Navigation — blocked only inside genuine text-editing
-        // contexts. Buttons/sliders must NOT block Delete (Delete has no
-        // native behavior there, and the old blanket block is why Delete
-        // "did nothing" after clicking any control). Whether the playlist
-        // reacts at all is decided by its own focus flag (clicking elsewhere
-        // in the GUI defocuses it).
+        // Playlist Navigation — H32: forward to the playlist ONLY when it
+        // has focus AND the key target is not a transport control. Delete
+        // has no native behavior on buttons/sliders, but forwarding it there
+        // deletes tracks while the user operates transport — the old blanket
+        // forward is why Delete felt dangerous after clicking any control.
         const isTextEdit = tag === 'TEXTAREA' || tag === 'SELECT'
             || (target?.isContentEditable ?? false)
             || (tag === 'INPUT' && ['text', 'search', 'number', 'password', 'url', 'email', 'tel'].includes(inputType));
+        const onTransportControl = tag === 'BUTTON'
+            || (tag === 'INPUT' && ['range', 'checkbox', 'radio', 'button', 'submit', 'color'].includes(inputType));
         if ((e.ctrlKey || e.metaKey) && (e.key === 'a' || e.key === 'A')) {
             if (isTextEdit) return;
+            if (onTransportControl) return;
             handlePlaylistNavigation(e);
         } else if (['ArrowUp', 'ArrowDown', 'Delete', 'Backspace'].includes(e.key)) {
             if (isTextEdit) return;
+            if (onTransportControl) return;
             if (tag === 'INPUT' && inputType === 'range' && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) return;
             if (tag === 'SELECT' && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) return;
             handlePlaylistNavigation(e);
@@ -382,7 +444,9 @@ function setupMasterRecording() {
                             toast.error("AUDIO NOT READY");
                             return;
                         }
-                        hiFiRecorder = new HighFidelityRecorder(masterGain);
+                        // Provider, not the node: a fixed masterGain goes dead
+                        // on context rebuild and the tap records silence (C7).
+                        hiFiRecorder = new HighFidelityRecorder(() => masterGain);
                         await hiFiRecorder.init();
                     }
                    
@@ -406,12 +470,12 @@ function setupMasterRecording() {
                             return;
                         }
 
-                        const path = await bridge.saveAudioDialog();
+                        const path = await bridge?.saveAudioDialog();
                         if (path) {
                              const uint8 = new Uint8Array(wavBuffer);
                              // IPC Buffer Alignment Fix
                              const safeBuffer = uint8.buffer.slice(uint8.byteOffset, uint8.byteOffset + uint8.byteLength);
-                             const success = await fsBridge.saveFile(path, new Uint8Array(safeBuffer));
+                             const success = await fsBridge?.saveFile(path, new Uint8Array(safeBuffer));
                              if (success) toast.success("HI-FI RECORDING SAVED");
                              else toast.error("FAILED TO SAVE HI-FI RECORDING");
                         } else {
@@ -435,20 +499,41 @@ function setupMasterRecording() {
 
 async function initApp() {
     logger.info('[MAIN] Initializing Gangsta Player Pro 3 Core...');
+    // Renderer assumes preload bridges exist — fail loud here so a packaged
+    // build with broken preload shows WHAT is missing instead of throwing
+    // an inscrutable TypeError on first bridge use.
+    const missingBridges = getMissingBridges();
+    if (missingBridges.length > 0) {
+        logger.error(`[MAIN] Preload bridges missing: ${missingBridges.join(', ')} — aborting init.`);
+        showBridgeFatalOverlay(missingBridges);
+        return;
+    }
     purgeLegacySessionKey();
     applyPlatformStyles();
     
     // Initialize Worklets first
     await initWorklets();
     engine.initWorklets();
+
+    // Closed-context rebuilds (device switch / suspend) kill worklet modules,
+    // deck chains, and the recorder tap. Re-attach everything centrally —
+    // engine channels self-heal their nodes via ensureNodes, worklets need
+    // module re-registration + node re-injection, the recorder needs a retap.
+    onAudioRebuilt(() => {
+        logger.warn('[MAIN] AudioContext rebuilt — re-attaching worklets + recorder tap');
+        void initWorklets()
+            .catch(() => undefined)
+            .then(() => { try { engine.initWorklets(); } catch { /* ignore */ } });
+        try { hiFiRecorder?.retap(); } catch { /* ignore */ }
+    });
     
     // Window Controls
     const minBtn = document.getElementById('minBtn');
     const maxBtn = document.getElementById('maxBtn');
     const closeBtn = document.getElementById('closeBtn');
-    if (minBtn) minBtn.addEventListener('click', () => bridge.minimize());
-    if (maxBtn) maxBtn.addEventListener('click', () => bridge.maximize());
-    if (closeBtn) closeBtn.addEventListener('click', () => bridge.close());
+    if (minBtn) minBtn.addEventListener('click', () => bridge?.minimize());
+    if (maxBtn) maxBtn.addEventListener('click', () => bridge?.maximize());
+    if (closeBtn) closeBtn.addEventListener('click', () => bridge?.close());
 
     // ORDER MATTERS: initPlayer caches tempoSlider in the DOM. initSampler
     // captures getTempoSlider() — running the sampler first handed it a
@@ -462,15 +547,26 @@ async function initApp() {
         tempoSliderRef: getTempoSlider() as HTMLInputElement
     });
 
-    // Crash-recovery prompt must resolve BEFORE the playlist loads from DB —
-    // otherwise the async DB read races the restore and clobbers it.
-    checkAndRestore().then((restored) => {
-        initPlaylist({
-            loadTrack, playTrack,
-            skipDbLoad: restored
-        });
-        // Depends on DOM refs cached by initPlaylist — run after, not before
-        setupPlaylistHandlers();
+    // Playlist UI wires up immediately (C15): gating init + handlers behind
+    // the crash-restore prompt left file-input/DnD/context-menu dead whenever
+    // the user never answered it. The DB load still waits for the prompt so a
+    // late async read can't clobber a restore; declined/absent prompts trigger
+    // the DB load afterwards, restored snapshots skip it as before.
+    initPlaylist({ loadTrack, playTrack, skipDbLoad: true });
+    setupPlaylistHandlers();
+    // Bounded prompt wait: an unanswered modal previously pended forever and
+    // the library DB load behind it never ran (empty-looking app). 60s of
+    // silence counts as decline; a later YES still overwrites (DB-load guards
+    // yield to non-empty/restored playlists).
+    const restoreWait = checkAndRestore();
+    const restoreTimeout = new Promise<boolean>((resolve) => {
+        const t = setTimeout(() => resolve(false), 60000);
+        (t as any)?.unref?.();
+    });
+    void Promise.race([restoreWait, restoreTimeout]).then((restored) => {
+        if (!restored) initPlaylist({ loadTrack, playTrack });
+    }).catch(() => {
+        try { initPlaylist({ loadTrack, playTrack }); } catch { /* ignore */ }
     });
 
     initMIDI({ startPad, stopPad, activeVoices, padVolumes });
@@ -530,7 +626,7 @@ async function initApp() {
     const btnOpenManual = document.getElementById('btnOpenManual');
     if (btnOpenManual) {
         btnOpenManual.addEventListener('click', () => {
-             bridge.openExternal('README.md');
+             bridge?.openExternal('README.md');
         });
     }
 
@@ -555,10 +651,7 @@ async function initApp() {
             e.preventDefault();
             e.stopPropagation();
 
-            // Hide others
-            if (padContextMenuEl) padContextMenuEl.classList.add('hidden');
-            const playlistCtxMenu = document.getElementById('contextMenu');
-            if (playlistCtxMenu) playlistCtxMenu.classList.add('hidden');
+            hideAllContextMenus();
 
             const mode = getPlaybackMode();
             if (ctxPlayContinuous) ctxPlayContinuous.innerText = `CONTINUOUS PLAYBACK ${mode === 'continuous' ? '✓' : ''}`;
@@ -601,10 +694,7 @@ async function initApp() {
             e.preventDefault();
             e.stopPropagation();
 
-            if (padContextMenuEl) padContextMenuEl.classList.add('hidden');
-            if (playContextMenu) playContextMenu.classList.add('hidden');
-            const playlistCtxMenu = document.getElementById('contextMenu');
-            if (playlistCtxMenu) playlistCtxMenu.classList.add('hidden');
+            hideAllContextMenus();
 
             const mode = getLoopMode();
             if (ctxLoopOff) ctxLoopOff.innerText = `LOOP OFF ${mode === 'off' ? '✓' : ''}`;
@@ -685,7 +775,7 @@ async function initApp() {
     
     // Startup sequence completion
     playStartupSound();
-    if (bridge?.appReadyToShow) bridge.appReadyToShow();
+    bridge?.appReadyToShow?.();
 
     // Initialize crash recovery (auto-save)
     initCrashRecovery();
@@ -697,31 +787,43 @@ async function initApp() {
     // addEventListener (not assignment) so earlier handlers aren't clobbered.
     window.addEventListener('error', (event) => {
         const { message, filename, lineno, colno, error } = event;
-        logger.error(`[Renderer Crash] ${message} at ${filename}:${lineno}:${colno}`);
+        try { logger.error(`[Renderer Crash] ${message} at ${filename}:${lineno}:${colno}`); } catch { /* ignore */ }
         // Pass a plain snapshot — the live ReactiveStore holds Maps/Sets of
         // functions that throw DataCloneError over IPC.
         let appState: unknown = null;
         try { appState = state.getSnapshot(); } catch { appState = null; }
-        logger.generateCrashReport({
-            type: 'RENDERER_ERROR',
-            message,
-            source: filename,
-            lineno,
-            colno,
-            stack: (error as Error | undefined)?.stack,
-            appState
-        });
+        try {
+            void Promise.resolve(logger.generateCrashReport({
+                type: 'RENDERER_ERROR',
+                message,
+                source: filename,
+                lineno,
+                colno,
+                stack: (error as Error | undefined)?.stack,
+                appState
+            })).catch(() => undefined);
+        } catch { /* report must never throw back into the handler */ }
     });
 
+    let rejectionReporting = false;
+    let lastRejectionReport = 0;
     window.addEventListener('unhandledrejection', (event) => {
-        logger.error(`[Renderer Rejection] ${event.reason}`);
+        try { event.preventDefault(); } catch { /* ignore */ }
+        if (rejectionReporting) return;
+        const now = Date.now();
+        try { logger.error(`[Renderer Rejection] ${event.reason}`); } catch { /* logger must never re-throw into the handler */ }
+        if (now - lastRejectionReport < 5000) return;
+        rejectionReporting = true;
+        lastRejectionReport = now;
         let appState: unknown = null;
         try { appState = state.getSnapshot(); } catch { appState = null; }
-        logger.generateCrashReport({
-            type: 'RENDERER_REJECTION',
-            reason: String(event.reason)?.slice(0, 2000),
-            appState
-        });
+        try {
+            void Promise.resolve(logger.generateCrashReport({
+                type: 'RENDERER_REJECTION',
+                reason: String(event.reason)?.slice(0, 2000),
+                appState
+            })).catch(() => undefined).finally(() => { rejectionReporting = false; });
+        } catch { rejectionReporting = false; }
     });
 }
 
@@ -741,7 +843,19 @@ if (document.readyState === 'loading') {
     initApp();
 }
 
-document.body.addEventListener('click', () => {
+// First-gesture unlock retries until it takes (H15): the old once:true
+// click meant keyboard-first users kept a suspended context and MIDI:OFF
+// forever, and one denied MIDI prompt never retried. enableMIDI() is cheap
+// to re-call (guard flag while a request is in flight).
+function tryFirstGestureUnlock(): void {
     void resumeAudioContext().catch(() => undefined);
     try { enableMIDI(); } catch { /* MIDI unavailable — non-fatal */ }
-}, { once: true });
+    try {
+        if (audioCtx && audioCtx.state === 'running') {
+            document.body.removeEventListener('click', tryFirstGestureUnlock);
+            document.body.removeEventListener('keydown', tryFirstGestureUnlock);
+        }
+    } catch { /* keep listening */ }
+}
+document.body.addEventListener('click', tryFirstGestureUnlock);
+document.body.addEventListener('keydown', tryFirstGestureUnlock);

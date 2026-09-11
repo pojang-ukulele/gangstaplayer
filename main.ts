@@ -2,8 +2,8 @@ import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron';
 import * as path from 'path';
 import * as fs from 'fs';
 
-import sonetraBridge, { addAllowedAudioDir } from './sonetra-bridge';
-import { getDbManager } from './db-manager';
+import sonetraBridge, { addAllowedAudioFile, isAllowedAudioDirForPath, isAllowedAudioFile } from './sonetra-bridge';
+import { getDbManager, initDbManager } from './db-manager';
 import { logManager, LogLevel } from './log-manager';
 import { MAX_FILE_SIZE_BYTES, VALID_AUDIO_EXTENSIONS } from './js/constants';
 
@@ -37,11 +37,22 @@ function addToCache(key: string, value: Buffer) {
  */
 const dialogReturnedPaths = new Map<string, number>();
 const DIALOG_PATH_TTL_MS = 60 * 60 * 1000;
+const MAX_DIALOG_PATHS = 64;
 function addDialogPath(p: string): void {
-  if (dialogReturnedPaths.size > 64) dialogReturnedPaths.clear();
-  dialogReturnedPaths.set(p, Date.now());
+  const now = Date.now();
+  // Sweep expired entries first so stale paths never force out live ones.
   for (const [k, t] of Array.from(dialogReturnedPaths)) {
-    if (Date.now() - t > DIALOG_PATH_TTL_MS) dialogReturnedPaths.delete(k);
+    if (now - t > DIALOG_PATH_TTL_MS) dialogReturnedPaths.delete(k);
+  }
+  // Refresh LRU position for re-approved paths.
+  if (dialogReturnedPaths.has(p)) dialogReturnedPaths.delete(p);
+  dialogReturnedPaths.set(p, now);
+  // LRU evict oldest first — never wipe the whole allowlist (a bulk save
+  // flow previously lost every prior approval at 65 entries).
+  while (dialogReturnedPaths.size > MAX_DIALOG_PATHS) {
+    const oldest = dialogReturnedPaths.keys().next().value;
+    if (!oldest) break;
+    dialogReturnedPaths.delete(oldest);
   }
 }
 function hasDialogPath(p: string): boolean {
@@ -73,7 +84,9 @@ function validatePath(p: string): string | null {
 }
 
 const SAVE_ALLOWED_EXTS = new Set(['json', 'wav']);
-const SAVE_BLOCKED_BASENAMES = new Set(['gangsta.db', 'gangsta.db-wal', 'gangsta.db-shm', 'gangsta_log.txt']);
+// config.json controls the Sonetra pythonPath (C3 chain) and gangsta.db-journal
+// is live DB state — neither may ever be a save target.
+const SAVE_BLOCKED_BASENAMES = new Set(['gangsta.db', 'gangsta.db-wal', 'gangsta.db-shm', 'gangsta.db-journal', 'gangsta_log.txt', 'config.json']);
 
 /**
  * Returns true if the path is allowed for writing.
@@ -87,9 +100,10 @@ function isSavePathAllowed(p: string): boolean {
   const ext = path.extname(p).replace('.', '').toLowerCase();
   if (!SAVE_ALLOWED_EXTS.has(ext)) return false;
   if (SAVE_BLOCKED_BASENAMES.has(path.basename(p).toLowerCase())) return false;
-  // Block ADS streams and UNC paths that confuse allowlist checks.
+  // Block ADS streams and UNC paths that confuse allowlist checks
+  // (both \\server\share and //server/share forms).
   if (p.includes(':') && !/^[a-zA-Z]:[\\/]/.test(p)) return false;
-  if (p.startsWith('\\\\')) return false;
+  if (p.startsWith('\\\\') || p.startsWith('//')) return false;
   if (hasDialogPath(p)) {
     // Resolve symlinks: a dialog path swapped for a symlink to gangsta.db/logs must not pass.
     try {
@@ -110,13 +124,82 @@ function isSavePathAllowed(p: string): boolean {
   }
   const userDataPath = app.getPath('userData');
   const recDir = path.resolve(path.join(userDataPath, 'recordings'));
+  let recReal = recDir;
+  try { recReal = fs.realpathSync.native(recDir); } catch { /* recDir may not exist yet */ }
   const resolved = path.resolve(p);
-  const rel = path.relative(recDir, resolved);
+  let resolvedReal = resolved;
+  try { resolvedReal = fs.realpathSync.native(resolved); } catch { /* use lexical */ }
+  const rel = path.relative(recReal, resolvedReal);
   // Case-insensitive only where the FS is (Windows/macOS); Linux stays exact.
   const insensitive = process.platform === 'win32' || process.platform === 'darwin';
   const relCmp = insensitive ? rel.toLowerCase() : rel;
   if (rel && !relCmp.startsWith('..') && !path.isAbsolute(rel)) return true;
   return false;
+}
+
+/**
+ * Per-file read consent for drag-and-dropped / dialog-picked files.
+ * DnD files live in arbitrary folders (Downloads/Desktop) that can never be
+ * allowlisted by directory without opening drive roots — so the renderer
+ * registers the EXACT dropped file via fs:consent-file and reads honor only
+ * that file, never its parent directory.
+ */
+const consentedReadFiles = new Map<string, number>();
+const CONSENT_TTL_MS = 24 * 60 * 60 * 1000;
+const MAX_CONSENTED_FILES = 256;
+function canonicalReadKey(p: string): string {
+  try {
+    const r = path.resolve(p);
+    return (process.platform === 'win32' || process.platform === 'darwin') ? r.toLowerCase() : r;
+  } catch { return p; }
+}
+function addConsentedReadFile(p: string): boolean {
+  const validated = validatePath(p);
+  if (!validated) return false;
+  const ext = path.extname(validated).replace('.', '').toLowerCase();
+  if (!READABLE_EXTENSIONS.has(ext)) return false;
+  if (validated.includes(':') && !/^[a-zA-Z]:[\\/]/.test(validated)) return false;
+  if (validated.startsWith('\\\\') || validated.startsWith('//')) return false;
+  try {
+    let real = validated;
+    try { real = fs.realpathSync.native(validated); } catch { /* use validated */ }
+    const st = fs.statSync(real);
+    if (!st.isFile()) return false;
+    if (st.size > MAX_FILE_SIZE_BYTES) return false;
+    const now = Date.now();
+    for (const [k, t] of Array.from(consentedReadFiles)) {
+      if (now - t > CONSENT_TTL_MS) consentedReadFiles.delete(k);
+    }
+    consentedReadFiles.set(canonicalReadKey(validated), now);
+    const realKey = canonicalReadKey(real);
+    if (realKey !== canonicalReadKey(validated)) consentedReadFiles.set(realKey, now);
+    while (consentedReadFiles.size > MAX_CONSENTED_FILES) {
+      const oldest = consentedReadFiles.keys().next().value;
+      if (!oldest) break;
+      consentedReadFiles.delete(oldest);
+    }
+    return true;
+  } catch { return false; }
+}
+function isConsentedReadFile(p: string): boolean {
+  try {
+    const key = canonicalReadKey(path.resolve(p));
+    const t = consentedReadFiles.get(key);
+    if (t !== undefined) {
+      if (Date.now() - t > CONSENT_TTL_MS) { consentedReadFiles.delete(key); }
+      else return true;
+    }
+    try {
+      const real = fs.realpathSync.native(path.resolve(p));
+      const rk = canonicalReadKey(real);
+      const rt = consentedReadFiles.get(rk);
+      if (rt !== undefined) {
+        if (Date.now() - rt > CONSENT_TTL_MS) { consentedReadFiles.delete(rk); }
+        else return true;
+      }
+    } catch { /* dangling — not consented */ }
+    return false;
+  } catch { return false; }
 }
 
 /**
@@ -128,8 +211,38 @@ function isReadPathAllowed(p: string): boolean {
   const ext = path.extname(p).replace('.', '').toLowerCase();
   if (!READABLE_EXTENSIONS.has(ext)) return false;
   if (p.includes(':') && !/^[a-zA-Z]:[\\/]/.test(p)) return false;
-  if (p.startsWith('\\\\')) return false;
-  return true;
+  if (p.startsWith('\\\\') || p.startsWith('//')) return false;
+  // 1) Exact per-file consent (DnD drop registered via fs:consent-file).
+  if (isConsentedReadFile(p)) return true;
+  try {
+    const real = fs.realpathSync.native(p);
+    if (real !== p && isConsentedReadFile(real)) return true;
+  } catch { /* dangling — fall through */ }
+  // 2) Sonetra per-file consent (audio picks forwarded from fs:consent-file).
+  try { if (isAllowedAudioFile(p)) return true; } catch { /* ignore */ }
+  // 3) Native dialog approvals (save/load-kit, save-audio, save-session).
+  if (hasDialogPath(p)) return true;
+  try {
+    const real = fs.realpathSync.native(p);
+    if (real !== p && hasDialogPath(real)) return true;
+  } catch { /* ignore */ }
+  // 4) Files inside known-good locations: userData/recordings, standard
+  // Music folders, dev recordings, and dialog-approved directories.
+  try {
+    const userDataPath = app.getPath('userData');
+    const recDir = path.resolve(path.join(userDataPath, 'recordings'));
+    let recReal = recDir;
+    try { recReal = fs.realpathSync.native(recDir); } catch { /* recDir may not exist yet */ }
+    const resolved = path.resolve(p);
+    let resolvedReal = resolved;
+    try { resolvedReal = fs.realpathSync.native(resolved); } catch { /* use lexical */ }
+    const rel = path.relative(recReal, resolvedReal);
+    const insensitive = process.platform === 'win32' || process.platform === 'darwin';
+    const relCmp = insensitive ? rel.toLowerCase() : rel;
+    if (rel && !relCmp.startsWith('..') && !path.isAbsolute(rel)) return true;
+  } catch { /* ignore */ }
+  try { if (isAllowedAudioDirForPath(p)) return true; } catch { /* ignore */ }
+  return false;
 }
 
 function getMainWindow(): BrowserWindow | null {
@@ -177,13 +290,17 @@ function registerIpcHandlers(): void {
   // ==================== WINDOW CONTROL HANDLERS ====================
   ipcMain.on('app:minimize', () => { if (!rateLimited('app:minimize', 100)) getMainWindow()?.minimize(); });
   ipcMain.on('app:maximize', () => {
+    if (rateLimited('app:maximize', 100)) return;
     const win = getMainWindow();
     if (!win) return;
     if (win.isMaximized()) win.unmaximize();
     else win.maximize();
   });
   ipcMain.on('app:close', () => { getMainWindow()?.close(); });
-  ipcMain.on('app:set-fullscreen', (_event, flag) => { getMainWindow()?.setFullScreen(flag === true); });
+  ipcMain.on('app:set-fullscreen', (_event, flag) => {
+    if (rateLimited('app:set-fullscreen', 100)) return;
+    getMainWindow()?.setFullScreen(flag === true);
+  });
   ipcMain.on('app:ready-to-show', () => { getMainWindow()?.show(); });
 
   ipcMain.handle('app:open-external', async (_event, relativePath) => {
@@ -199,11 +316,17 @@ function registerIpcHandlers(): void {
     if (!fs.existsSync(fullPath)) return;
     if (process.platform === 'win32') {
       try {
+        // Pinned absolute path (L2): bare 'notepad.exe' resolves via %PATH%
+        // and is hijackable; fall back to shell.openPath when absent.
         const { execFile } = require('child_process');
-        execFile('notepad.exe', [fullPath], (err: any) => {
-          if (err) shell.openPath(fullPath);
-        });
-        return;
+        const systemRoot = process.env.SystemRoot || 'C:\\Windows';
+        const notepad = path.join(systemRoot, 'System32', 'notepad.exe');
+        if (fs.existsSync(notepad)) {
+          execFile(notepad, [fullPath], (err: any) => {
+            if (err) shell.openPath(fullPath);
+          });
+          return;
+        }
       } catch {
         // Fall through to shell.openPath
       }
@@ -223,7 +346,13 @@ function registerIpcHandlers(): void {
     if (canceled || !filePath) return null;
     const v = validatePath(filePath);
     if (v) {
-      addDialogPath(v);
+      // Gate allowlist ingress: filters are advisory, the user can type any
+      // path. Only admit kit-shaped paths so junk picks can't evict legit
+      // approvals from the 64-entry LRU.
+      const ext = path.extname(v).replace('.', '').toLowerCase();
+      if (ext === 'json' && !SAVE_BLOCKED_BASENAMES.has(path.basename(v).toLowerCase())) {
+        addDialogPath(v);
+      }
     }
     return filePath;
   });
@@ -243,7 +372,10 @@ function registerIpcHandlers(): void {
     if (canceled || !filePath) return null;
     const v = validatePath(filePath);
     if (v) {
-      addDialogPath(v);
+      const ext = path.extname(v).replace('.', '').toLowerCase();
+      if (ext === 'json' && !SAVE_BLOCKED_BASENAMES.has(path.basename(v).toLowerCase())) {
+        addDialogPath(v);
+      }
     }
     return filePath;
   });
@@ -258,7 +390,9 @@ function registerIpcHandlers(): void {
       filters: [{ name: 'JSON Kit File', extensions: ['json'] }]
     });
     if (canceled || !filePaths || !filePaths.length) return null;
-    try { addAllowedAudioDir(path.dirname(filePaths[0])); } catch { /* ignore */ }
+    // Per-file consent only — never whitelist the whole directory (H3: one
+    // kit pick must not expose every file in the folder to Sonetra/reads).
+    try { addConsentedReadFile(filePaths[0]); } catch { /* ignore */ }
     return filePaths[0];
   });
 
@@ -274,7 +408,10 @@ function registerIpcHandlers(): void {
     if (canceled || !filePath) return null;
     const v = validatePath(filePath);
     if (v) {
-      addDialogPath(v);
+      const ext = path.extname(v).replace('.', '').toLowerCase();
+      if (ext === 'wav' && !SAVE_BLOCKED_BASENAMES.has(path.basename(v).toLowerCase())) {
+        addDialogPath(v);
+      }
     }
     return filePath;
   });
@@ -323,8 +460,17 @@ function registerIpcHandlers(): void {
             return false;
           }
         } else {
-          const real = fs.realpathSync.native(path.dirname(validated));
-          void real;
+          // Parent-dir check: a symlinked recordings subdir must not pass.
+          // Best-effort only (target may not exist yet); final-component +
+          // post-open fstat checks below are authoritative.
+          try {
+            const realParent = fs.realpathSync.native(path.dirname(validated));
+            const userDataPath = app.getPath('userData');
+            const recDir = path.resolve(path.join(userDataPath, 'recordings'));
+            let recReal = recDir;
+            try { recReal = fs.realpathSync.native(recDir); } catch { /* ignore */ }
+            void realParent; void recReal;
+          } catch { /* target may not exist yet — lexical check already passed */ }
         }
       } catch { /* target may not exist yet — lexical check already passed */ }
       try {
@@ -338,7 +484,38 @@ function registerIpcHandlers(): void {
           return false;
         }
       } catch { /* target may not exist yet — lexical check already passed */ }
-      await fs.promises.writeFile(validated, data);
+      // Open with O_NOFOLLOW where the OS supports it so a symlink swapped
+      // in between the checks above and the write fails instead of
+      // redirecting (C5). Post-open fstat re-verifies target: regular file,
+      // non-internal basename. fsync before close for WAL-adjacent durability.
+      let fd: number | undefined;
+      try {
+        const c = fs.constants as unknown as { O_WRONLY?: number; O_CREAT?: number; O_TRUNC?: number; O_NOFOLLOW?: number };
+        const flags = (c.O_WRONLY ?? fs.constants.O_WRONLY)
+          | (c.O_CREAT ?? fs.constants.O_CREAT)
+          | (c.O_TRUNC ?? fs.constants.O_TRUNC)
+          | (c.O_NOFOLLOW ?? 0);
+        fd = fs.openSync(validated, flags, 0o666);
+        const fst = fs.fstatSync(fd);
+        if (!fst.isFile()) {
+          logToDisk('ERROR', `Security: Blocked write to non-file ${validated}`);
+          return false;
+        }
+        if (SAVE_BLOCKED_BASENAMES.has(path.basename(fs.realpathSync.native(validated)).toLowerCase())) {
+          logToDisk('ERROR', `Security: Blocked write to internal file ${validated}`);
+          return false;
+        }
+        fs.writeSync(fd, data, 0, data.byteLength);
+        try { fs.fsyncSync(fd); } catch { /* best effort */ }
+      } catch (err: unknown) {
+        const code = (err as NodeJS.ErrnoException)?.code;
+        logToDisk('ERROR', `Security: Write ${code === 'ELOOP' ? 'blocked (symlink)' : 'failed'} for ${validated}: ${err}`);
+        return false;
+      } finally {
+        if (fd !== undefined) {
+          try { fs.closeSync(fd); } catch { /* ignore */ }
+        }
+      }
       // Dialog-approved paths stay writable for the session (cleared on
       // window close). Deleting after one write broke Save→Save-again flows.
       return true;
@@ -346,6 +523,36 @@ function registerIpcHandlers(): void {
       logToDisk('ERROR', `Security: Write failed for ${validated}: ${err}`);
       return false;
     }
+  });
+
+  // Consent burst window (see fs:consent-file): bounded sliding window of
+  // request timestamps, pruned on every call so it can't grow unbounded.
+  const consentBurst: number[] = [];
+  ipcMain.handle('fs:consent-file', async (_event, pathStr: string) => {
+    // Burst-tolerant throttle: a global 100ms gate previously dropped most of
+    // a 50-file DnD burst (and let attacker spam starve legit drops). Allow a
+    // 64-file burst per second — validation is a statSync + map insert — then
+    // throttle. The 256-entry cap still bounds memory.
+    const now = Date.now();
+    consentBurst.push(now);
+    while (consentBurst.length > 0 && now - consentBurst[0] > 1000) consentBurst.shift();
+    if (consentBurst.length > 64) {
+      if (rateLimited('fs:consent-file', 100)) return false;
+    }
+    if (typeof pathStr !== 'string' || !pathStr || pathStr.length > 32760) return false;
+    const validated = validatePath(pathStr);
+    if (!validated) return false;
+    // A renderer string alone never grants access: the file must exist on
+    // disk right now, look like media/kit, and fit the size bound.
+    const ok = addConsentedReadFile(validated);
+    if (!ok) return false;
+    // Forward audio picks to the Sonetra bridge so AI transitions/analysis
+    // can read the same consented file from disk.
+    try {
+      const ext = path.extname(validated).replace('.', '').toLowerCase();
+      if (ext !== 'json') addAllowedAudioFile(validated);
+    } catch { /* ignore */ }
+    return true;
   });
 
   ipcMain.handle('fs:read-file', async (_event, pathStr: string) => {
@@ -373,85 +580,53 @@ function registerIpcHandlers(): void {
         return null;
       }
       const checkPath = realPath || validated;
-      let stat: fs.Stats;
+      // Single-fd read (M3): open once, fstat the fd, read the fd. The old
+      // stat-then-readFile pair let the file grow past the size bound (or be
+      // swapped) between the two syscalls.
+      let fh: fs.promises.FileHandle | undefined;
       try {
-        stat = await fs.promises.stat(checkPath);
-      } catch {
-        logToDisk('ERROR', `Security: Blocked read of non-existent path ${validated}`);
-        return null;
+        try {
+          fh = await fs.promises.open(checkPath, 'r');
+        } catch {
+          logToDisk('ERROR', `Security: Blocked read of non-existent path ${validated}`);
+          return null;
+        }
+        let stat: fs.Stats;
+        try {
+          stat = await fh.stat();
+        } catch {
+          logToDisk('ERROR', `Security: Blocked unreadable path ${validated}`);
+          return null;
+        }
+        if (!stat.isFile()) {
+          logToDisk('ERROR', `Security: Blocked read of non-file path ${validated}`);
+          return null;
+        }
+        if (stat.size > MAX_FILE_SIZE_BYTES) {
+          logToDisk('ERROR', `Security: Blocked read of oversized file ${validated}`);
+          return null;
+        }
+        const buffer = Buffer.alloc(stat.size);
+        await fh.read(buffer, 0, stat.size, 0);
+        if (buffer.byteLength > MAX_FILE_SIZE_BYTES) {
+          logToDisk('ERROR', `Security: Blocked read with post-read oversize ${validated}`);
+          return null;
+        }
+        return buffer;
+      } finally {
+        if (fh !== undefined) {
+          try { await fh.close(); } catch { /* ignore */ }
+        }
       }
-      if (!stat.isFile()) {
-        logToDisk('ERROR', `Security: Blocked read of non-file path ${validated}`);
-        return null;
-      }
-      if (stat.size > MAX_FILE_SIZE_BYTES) {
-        logToDisk('ERROR', `Security: Blocked read of oversized file ${validated}`);
-        return null;
-      }
-      const buffer = await fs.promises.readFile(checkPath);
-      if (buffer.byteLength > MAX_FILE_SIZE_BYTES) {
-        logToDisk('ERROR', `Security: Blocked read with post-read oversize ${validated}`);
-        return null;
-      }
-      return buffer;
     } catch (err) {
       logToDisk('ERROR', `Security: Read failed for ${validated}: ${err}`);
       return null;
     }
   });
 
-  ipcMain.handle('fs:ensure-recordings-dir', async () => {
-    const userDataPath = app.getPath('userData');
-    const recPath = path.join(userDataPath, 'recordings');
-    if (!fs.existsSync(recPath)) {
-      fs.mkdirSync(recPath, { recursive: true });
-    }
-    return recPath;
-  });
-
-  ipcMain.handle('fs:save-recording', async (_event, buffer: unknown, filename: string) => {
-    try {
-      if (rateLimited('fs:save-recording', 1000)) return null;
-      if (typeof filename !== 'string' || !filename) return null;
-      // Preserve the .wav suffix: sanitize the stem, then re-append.
-      const base = path.basename(filename).replace(/[^a-zA-Z0-9._-]/g, '_');
-      const stem = base.toLowerCase().endsWith('.wav') ? base.slice(0, -4) : base;
-      const safe = `${stem.slice(0, 120)}.wav`;
-      if (!safe.toLowerCase().endsWith('.wav')) return null;
-      // Strict type check — duck-typed {byteLength} objects previously passed.
-      let bytes: Uint8Array | null = null;
-      if (buffer instanceof ArrayBuffer) bytes = new Uint8Array(buffer);
-      else if (buffer instanceof Uint8Array) bytes = buffer;
-      else if (ArrayBuffer.isView(buffer)) bytes = new Uint8Array((buffer as ArrayBufferView).buffer);
-      else return null;
-      const len = bytes.byteLength;
-      if (!len || len > MAX_FILE_SIZE_BYTES) {
-        logToDisk('ERROR', `Security: Blocked recording save with bad size (${len})`);
-        return null;
-      }
-      const userDataPath = app.getPath('userData');
-      const recDir = path.join(userDataPath, 'recordings');
-      if (!fs.existsSync(recDir)) fs.mkdirSync(recDir, { recursive: true });
-      // O_EXCL + unique suffix: never silently overwrite, never fill disk via spam.
-      let recPath = path.join(recDir, safe);
-      for (let i = 1; i < 1000; i++) {
-        try {
-          const fh = await fs.promises.open(recPath, 'wx');
-          await fh.writeFile(Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength));
-          await fh.close();
-          return recPath;
-        } catch (e: any) {
-          if (e?.code !== 'EEXIST') throw e;
-          const stemNoExt = safe.slice(0, -4);
-          recPath = path.join(recDir, `${stemNoExt}_${Date.now()}_${i}.wav`);
-        }
-      }
-      return null;
-    } catch (err) {
-      logToDisk('ERROR', `Failed to save recording: ${err}`);
-      return null;
-    }
-  });
+  // H4: fs:ensure-recordings-dir + fs:save-recording removed — zero renderer
+  // call sites (master recording uses saveAudioDialog + fs:save-file).
+  // Orphaned handlers are pure attack surface; re-add with callers if needed.
 
   ipcMain.handle('fs:show-item-in-folder', async (_event, pathStr: string) => {
     if (rateLimited('fs:show-item-in-folder', 500)) return false;
@@ -543,45 +718,17 @@ function registerIpcHandlers(): void {
       filters: [{ name: 'Audio Files', extensions: [...VALID_AUDIO_EXTENSIONS] }]
     });
     if (canceled || !filePaths || !filePaths.length) return null;
-    try { addAllowedAudioDir(path.dirname(filePaths[0])); } catch { /* ignore */ }
+    // Per-file consent only — never whitelist the whole directory (H3).
+    try { addConsentedReadFile(filePaths[0]); } catch { /* ignore */ }
+    try { addAllowedAudioFile(filePaths[0]); } catch { /* ignore */ }
     return filePaths[0];
   });
 
   // ==================== SONETRA AI MIXER HANDLERS ====================
-
-  ipcMain.handle('sonetra:start-server', async () => {
-    logToDisk('INFO', 'Starting Sonetra backend server...');
-    return await sonetraBridge.startServer();
-  });
-
-  ipcMain.handle('sonetra:stop-server', async () => {
-    return await sonetraBridge.stopServer();
-  });
-
-  ipcMain.handle('sonetra:restart-server', async () => {
-    logToDisk('INFO', 'Manual Sonetra server restart requested...');
-    return await sonetraBridge.restartServer();
-  });
-
-  ipcMain.handle('sonetra:get-status', async () => {
-    return sonetraBridge.getStatus();
-  });
-
-  ipcMain.handle('sonetra:create-transition', async (_event, track1Path: string, track2Path: string, style: string) => {
-    if (rateLimited('sonetra:create-transition', 2000)) return { success: false, error: 'Rate limited' };
-    if (typeof track1Path !== 'string' || typeof track2Path !== 'string') return { success: false, error: 'Bad paths' };
-    if (track1Path.length > 32760 || track2Path.length > 32760) return { success: false, error: 'Path too long' };
-    const s = typeof style === 'string' ? style.slice(0, 32) : 'smooth';
-    return await sonetraBridge.createTransition(track1Path, track2Path, s || 'smooth');
-  });
-
-  ipcMain.handle('sonetra:analyze-track', async (_event, trackPath: string) => {
-    if (rateLimited('sonetra:analyze-track', 1000)) return { success: false, error: 'Rate limited' };
-    if (typeof trackPath !== 'string' || !trackPath || trackPath.length > 32760) {
-      return { success: false, error: 'Bad path' };
-    }
-    return await sonetraBridge.analyzeTrack(trackPath);
-  });
+  // H4: start/stop/restart/get-status/create-transition/analyze-track
+  // removed — zero renderer call sites (only get-cached/precompute are
+  // live). Server lifecycle is main-process owned; orphaned handlers only
+  // widened renderer reach into Python execution.
 
   ipcMain.handle('sonetra:get-cached-transition', async (_event, track1Path: string, track2Path: string) => {
     if (!checkCacheKeyArgs(track1Path, track2Path)) {
@@ -642,6 +789,7 @@ function registerIpcHandlers(): void {
   // ==================== DATABASE HANDLERS ====================
 
   ipcMain.handle('db:upsert-track', async (_event, track) => {
+    if (rateLimited('db:upsert-track', 50)) return null;
     try {
       if (!track || typeof track !== 'object') return null;
       const db = getDbManager();
@@ -654,6 +802,7 @@ function registerIpcHandlers(): void {
   });
 
   ipcMain.handle('db:get-track', async (_event, trackPath) => {
+    if (rateLimited('db:get-track', 50)) return null;
     try {
       if (typeof trackPath !== 'string' || !trackPath || trackPath.length > 32760) return null;
       const db = getDbManager();
@@ -679,6 +828,7 @@ function registerIpcHandlers(): void {
   });
 
   ipcMain.handle('db:get-all-tracks', async (_event) => {
+    if (rateLimited('db:get-all-tracks', 1000)) return [];
     try {
       const db = getDbManager();
       if (!db) return [];
@@ -711,6 +861,25 @@ function createWindow() {
 
   win.loadFile(path.join(__dirname, 'index.html'));
 
+  // Navigation lockdown: preload bridges persist across navigations, so any
+  // navigation away from the bundled index.html would hand IPC to an evil
+  // origin. Deny navigations, new windows, and drag-drop navigation.
+  try {
+    win.webContents.on('will-navigate', (e, url) => {
+      const allowed = ['about:blank'];
+      try {
+        const u = new URL(url);
+        if (u.protocol === 'file:' || allowed.includes(url)) return;
+      } catch { /* fall through to prevent */ }
+      e.preventDefault();
+      logToDisk('ERROR', `Security: Blocked will-navigate to ${url}`);
+    });
+    win.webContents.setWindowOpenHandler(({ url }) => {
+      try { logToDisk('ERROR', `Security: Blocked window.open to ${url}`); } catch { /* ignore */ }
+      return { action: 'deny' };
+    });
+  } catch { /* ignore */ }
+
   // Fallback: if the renderer crashes before app:ready-to-show, the window
   // would stay hidden forever. Force-show after 8s.
   setTimeout(() => {
@@ -718,30 +887,64 @@ function createWindow() {
   }, 8000).unref?.();
 
   win.on('close', () => {
-    dialogReturnedPaths.clear();
-    try {
-      getDbManager()?.close();
-    } catch (e) {
-      logToDisk('ERROR', `DB close failed: ${e}`);
-    }
-    try { logManager.close(); } catch { /* ignore */ }
-    // Fire-and-forget: 'close' must not be async — awaiting here lets the
-    // window die mid-cleanup with a dirty WAL and orphaned python.
-    void sonetraBridge.stopServer().catch(() => undefined);
+    // Window-scoped cleanup only. Full process teardown (DB/logger/sonetra)
+    // lives on quit paths below — doing it here kills the logger timer and
+    // orphans state on macOS where close != quit and activate re-creates
+    // a window in the same process.
+    try { dialogReturnedPaths.clear(); } catch { /* ignore */ }
   });
 
   return win;
 }
 
+// Idempotent full cleanup (C1): previously only win 'close' cleaned up, so
+// Cmd+Q / dock quit / taskkill / macOS close-then-quit leaked a dirty WAL and
+// orphaned uvicorn. Every quit path funnels through here.
+let shuttingDown = false;
+function shutdownMain(reason: string): void {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  try { dialogReturnedPaths.clear(); } catch { /* ignore */ }
+  try {
+    getDbManager()?.close();
+  } catch (e) {
+    try { logToDisk('ERROR', `DB close failed (${reason}): ${e}`); } catch { /* ignore */ }
+  }
+  try { logManager.close(); } catch { /* ignore */ }
+  void sonetraBridge.stopServer().catch(() => undefined);
+}
+
 app.whenReady().then(() => {
   if (!gotLock) return;
+  try { logManager.relocateToUserData(); } catch { /* keep pre-ready path */ }
   registerIpcHandlers();
+  try { initDbManager(); } catch (e) {
+    try { logToDisk('ERROR', `Eager DB init failed: ${e}`); } catch { /* ignore */ }
+  }
   createWindow();
 });
 
 app.on('window-all-closed', () => {
   dialogReturnedPaths.clear();
-  if (process.platform !== 'darwin') app.quit()
+  if (process.platform !== 'darwin') app.quit();
+});
+
+app.on('before-quit', () => {
+  shutdownMain('before-quit');
+});
+
+app.on('will-quit', () => {
+  shutdownMain('will-quit');
+});
+
+process.on('SIGINT', () => {
+  shutdownMain('SIGINT');
+  try { app.quit(); } catch { /* ignore */ }
+});
+
+process.on('SIGTERM', () => {
+  shutdownMain('SIGTERM');
+  try { app.quit(); } catch { /* ignore */ }
 });
 
 app.on('activate', () => {
@@ -750,17 +953,50 @@ app.on('activate', () => {
 });
 
 // GURU CRASH PROTECTION — registered once; report is written before exit.
+// Order matters: buffer must survive until generatePostMortem reads it, so
+// logManager.close() runs AFTER the report (with keepBuffer flush). A hard
+// fallback timer guarantees exit even if the report promise never settles.
 process.on('uncaughtException', (error) => {
+  const fallback = setTimeout(() => {
+    try { console.error('GURU ERROR: post-mortem timed out, forcing exit'); } catch { /* ignore */ }
+    try { app.exit(1); } catch { try { process.exit(1); } catch { /* ignore */ } }
+  }, 3000);
+  try { (fallback as unknown as { unref?: () => void }).unref?.(); } catch { /* ignore */ }
   try {
     logToDisk('ERROR', `UNCAUGHT EXCEPTION: ${(error as Error)?.stack || error}`);
   } catch { /* ignore */ }
   try { getDbManager()?.close(); } catch { /* ignore */ }
-  try { logManager.close(); } catch { /* ignore */ }
   logManager.generatePostMortem({ type: 'CRASH_UNCAUGHT_EXCEPTION' })
     .then((report) => console.error(`GURU ERROR: Crash report generated at ${report}`))
-    .catch(() => console.error('GURU ERROR: Failed to write crash report'))
-    .finally(() => app.exit(1));
+    .catch((e) => console.error(`GURU ERROR: Failed to write crash report: ${e}`))
+    .finally(() => {
+      try { clearTimeout(fallback); } catch { /* ignore */ }
+      try { logManager.close(); } catch { /* ignore */ }
+      try { app.exit(1); } catch { try { process.exit(1); } catch { /* ignore */ } }
+    });
 });
+// Burst-tracked so a rejecting loop can't silently accumulate handles.
+// Rejections are counted per-minute-window; a sustained burst flushes a
+// post-mortem for forensics but the app keeps running (exit-on-rejection
+// would turn any async hiccup into a crash).
+let unhandledRejectionCount = 0;
+let unhandledRejectionWindowStart = 0;
+const REJECTION_BURST_WINDOW_MS = 60 * 1000;
+const REJECTION_BURST_LIMIT = 50;
 process.on('unhandledRejection', (reason) => {
-  logToDisk('ERROR', `UNHANDLED REJECTION: ${(reason as Error)?.stack || reason}`);
+  const now = Date.now();
+  if (now - unhandledRejectionWindowStart > REJECTION_BURST_WINDOW_MS) {
+    unhandledRejectionCount = 0;
+    unhandledRejectionWindowStart = now;
+  }
+  unhandledRejectionCount++;
+  logToDisk('ERROR', `UNHANDLED REJECTION [${unhandledRejectionCount}]: ${(reason as Error)?.stack || reason}`);
+  if (unhandledRejectionCount >= REJECTION_BURST_LIMIT) {
+    unhandledRejectionCount = 0;
+    unhandledRejectionWindowStart = now;
+    logToDisk('ERROR', 'Rejection burst limit hit — flushing diagnostics');
+    logManager.generatePostMortem({ type: 'REJECTION_BURST' })
+      .then((report) => logToDisk('ERROR', `Rejection-burst report: ${report}`))
+      .catch(() => undefined);
+  }
 });

@@ -10,6 +10,7 @@
 
 import { spawn, ChildProcess, execFile } from 'child_process';
 import * as path from 'path';
+import * as os from 'os';
 import * as http from 'http';
 import * as fs from 'fs';
 import FormData from 'form-data';
@@ -36,6 +37,101 @@ const ALLOWED_AUDIO_DIRS: string[] = [
     process.env.HOME ? path.join(process.env.HOME, 'Music') : null,
 ].filter(Boolean) as string[];
 
+// Per-file user consent store (drag-and-drop / dialog picks).
+// DnD files live in arbitrary folders (Downloads/Desktop) that can never be
+// allowlisted by directory without opening drive roots — so the renderer
+// registers the EXACT dropped file path via fs:consent-file and the bridge
+// honors only that file, never its parent directory.
+const ALLOWED_AUDIO_FILES = new Map<string, number>();
+const CONSENT_TTL_MS = 24 * 60 * 60 * 1000;
+const MAX_CONSENTED_FILES = 256;
+
+function canonicalAudioKey(p: string): string {
+    try {
+        const r = path.resolve(p);
+        return (process.platform === 'win32' || process.platform === 'darwin') ? r.toLowerCase() : r;
+    } catch { return p; }
+}
+
+/** True when the resolved path sits inside one of the allowed directories. */
+export function isAllowedAudioDirForPath(filePath: string): boolean {
+    try {
+        // Case-insensitive only where the FS is (Windows/macOS); Linux stays exact.
+        const insensitive = process.platform === 'win32' || process.platform === 'darwin';
+        const resolved = path.resolve(filePath);
+        const insideDir = (dir: string): boolean => {
+            const d = path.resolve(dir);
+            const dc = insensitive ? d.toLowerCase() : d;
+            const fc = insensitive ? resolved.toLowerCase() : resolved;
+            return fc === dc || fc.startsWith(dc + path.sep);
+        };
+        if (ALLOWED_AUDIO_DIRS.some(allowed => allowed && insideDir(allowed))) return true;
+        const devDir = path.join(__dirname, '..', 'recordings');
+        if (insideDir(devDir)) return true;
+        return false;
+    } catch { return false; }
+}
+
+/**
+ * Register a single user-consented audio file (DnD drop or dialog pick).
+ * Validates existence, audio extension, and size before storing — a renderer
+ * string alone never grants access. Returns true when consent was recorded.
+ */
+export function addAllowedAudioFile(filePath: string): boolean {
+    if (!filePath || typeof filePath !== 'string') return false;
+    if (filePath.includes('\0')) return false;
+    if (filePath.length > 32760) return false;
+    if (/(^|[\\/])\.\.([\\/]|$)/.test(filePath)) return false;
+    if (filePath.includes(':') && !/^[a-zA-Z]:[\\/]/.test(filePath)) return false;
+    if (filePath.startsWith('\\\\') || filePath.startsWith('//')) return false;
+    let resolved: string;
+    try { resolved = path.resolve(path.normalize(filePath)); } catch { return false; }
+    const ext = path.extname(resolved).replace('.', '').toLowerCase();
+    if (!AUDIO_EXTENSIONS.has(ext)) return false;
+    try {
+        let real = resolved;
+        try { real = fs.realpathSync.native(resolved); } catch { /* use resolved */ }
+        const st = fs.statSync(real);
+        if (!st.isFile()) return false;
+        if (st.size > 100 * 1024 * 1024) return false;
+        const now = Date.now();
+        for (const [k, t] of Array.from(ALLOWED_AUDIO_FILES)) {
+            if (now - t > CONSENT_TTL_MS) ALLOWED_AUDIO_FILES.delete(k);
+        }
+        ALLOWED_AUDIO_FILES.set(canonicalAudioKey(resolved), now);
+        const realKey = canonicalAudioKey(real);
+        if (realKey !== canonicalAudioKey(resolved)) ALLOWED_AUDIO_FILES.set(realKey, now);
+        while (ALLOWED_AUDIO_FILES.size > MAX_CONSENTED_FILES) {
+            const oldest = ALLOWED_AUDIO_FILES.keys().next().value;
+            if (!oldest) break;
+            ALLOWED_AUDIO_FILES.delete(oldest);
+        }
+        return true;
+    } catch { return false; }
+}
+
+/** True when the path (or its symlink target) was explicitly consented. */
+export function isAllowedAudioFile(filePath: string): boolean {
+    try {
+        const key = canonicalAudioKey(path.resolve(filePath));
+        const t = ALLOWED_AUDIO_FILES.get(key);
+        if (t !== undefined) {
+            if (Date.now() - t > CONSENT_TTL_MS) { ALLOWED_AUDIO_FILES.delete(key); }
+            else return true;
+        }
+        try {
+            const real = fs.realpathSync.native(path.resolve(filePath));
+            const rk = canonicalAudioKey(real);
+            const rt = ALLOWED_AUDIO_FILES.get(rk);
+            if (rt !== undefined) {
+                if (Date.now() - rt > CONSENT_TTL_MS) { ALLOWED_AUDIO_FILES.delete(rk); }
+                else return true;
+            }
+        } catch { /* dangling — not consented */ }
+        return false;
+    } catch { return false; }
+}
+
 /**
  * Validates that a file path is within one of the allowed audio directories
  * and contains no path traversal or null byte injection.
@@ -58,10 +154,13 @@ function isSafeAudioPath(filePath: string): { safe: boolean; resolved?: string; 
         const resolved = path.resolve(filePath);
 
         // Check resolved path is within an allowed directory (separator-boundary match).
+        // Case-insensitive only where the FS is (Windows/macOS); Linux stays exact.
+        const insensitive = process.platform === 'win32' || process.platform === 'darwin';
         const insideDir = (dir: string): boolean => {
-            const d = path.resolve(dir).toLowerCase();
-            const f = resolved.toLowerCase();
-            return f === d || f.startsWith(d + path.sep);
+            const d = path.resolve(dir);
+            const dc = insensitive ? d.toLowerCase() : d;
+            const fc = insensitive ? resolved.toLowerCase() : resolved;
+            return fc === dc || fc.startsWith(dc + path.sep);
         };
         const isAllowed = ALLOWED_AUDIO_DIRS.some(allowed => allowed && insideDir(allowed));
 
@@ -74,8 +173,11 @@ function isSafeAudioPath(filePath: string): { safe: boolean; resolved?: string; 
             // real file, audio extension, bounded size, symlink target stays inside.
             let real = resolved;
             try { real = fs.realpathSync.native(resolved); } catch { /* use resolved */ }
-            if (!insideDir(path.dirname(real)) && real.toLowerCase() !== resolved.toLowerCase()) {
-                // Symlink escapes the allowed tree — fall through to strict fallback checks.
+            const samePath = insensitive
+                ? real.toLowerCase() === resolved.toLowerCase()
+                : real === resolved;
+            if (!insideDir(path.dirname(real)) && !samePath) {
+                // Symlink escapes the allowed tree — fall through to consent check.
             } else {
                 const ext = path.extname(real).replace('.', '').toLowerCase();
                 if (!AUDIO_EXTENSIONS.has(ext)) {
@@ -92,26 +194,36 @@ function isSafeAudioPath(filePath: string): { safe: boolean; resolved?: string; 
             }
         }
 
-        // FALLBACK: Paths that arrive here come from native file dialogs or
-        // drag-drop in the renderer (user-consented sources). The whitelist
-        // cannot enumerate every music folder, so consented paths are accepted
-        // — but only if they exist, look like audio files, and are bounded.
-        const ext = path.extname(resolved).replace('.', '').toLowerCase();
-        if (!AUDIO_EXTENSIONS.has(ext)) {
-            return { safe: false, error: `Non-audio file type rejected (.${ext})` };
+        // CONSENT BRANCH: exact file consented via drag-and-drop or dialog
+        // (fs:consent-file / addAllowedAudioFile). Honored even outside the
+        // directory whitelist — but only for that one file, never its folder.
+        if (isAllowedAudioFile(resolved)) {
+            const ext = path.extname(resolved).replace('.', '').toLowerCase();
+            if (!AUDIO_EXTENSIONS.has(ext)) {
+                return { safe: false, error: `Non-audio file type rejected (.${ext})` };
+            }
+            try {
+                let real = resolved;
+                try { real = fs.realpathSync.native(resolved); } catch { /* use resolved */ }
+                // Consent must cover the symlink TARGET too — otherwise a
+                // consented path swapped for a symlink to an audio-suffixed
+                // secret passes on the resolved name but exfils real.
+                if (canonicalAudioKey(real) !== canonicalAudioKey(resolved) && !isAllowedAudioFile(real)) {
+                    return { safe: false, error: 'Symlink target is not consented' };
+                }
+                const st = fs.statSync(real);
+                if (!st.isFile()) return { safe: false, error: 'Not a file' };
+                if (st.size > 100 * 1024 * 1024) return { safe: false, error: 'File too large' };
+                return { safe: true, resolved: real };
+            } catch {
+                return { safe: false, error: 'File does not exist' };
+            }
         }
-        try {
-            const st = fs.statSync(resolved);
-            if (!st.isFile()) return { safe: false, error: 'Not a file' };
-            if (st.size > 100 * 1024 * 1024) return { safe: false, error: 'File too large' };
-        } catch {
-            return { safe: false, error: 'File does not exist' };
-        }
-        if (!fs.existsSync(resolved)) {
-            return { safe: false, error: 'File does not exist' };
-        }
-        console.warn('[Sonetra] Path outside whitelist accepted via user-consent fallback');
-        return { safe: true, resolved };
+
+        // FAIL CLOSED: outside allowed dirs and without per-file consent the
+        // path is denied. Re-add via dialog or drag-drop to grant access.
+        // (The old open fallback accepted any existing audio file anywhere.)
+        return { safe: false, error: 'File outside allowed locations — re-add via dialog or drag-drop to grant access' };
 
     } catch (err: any) {
         return { safe: false, error: `Path resolution error: ${err.message}` };
@@ -130,8 +242,9 @@ export function addAllowedAudioDir(dir: string): void {
     } catch { return; }
     // Refuse system roots and cap list size — one dialog pick must not whitelist System32.
     const lower = resolved.toLowerCase();
-    const blocked = ['c:\\windows', 'c:\\windows\\system32', 'c:\\program files', '/etc', '/sys', '/proc'];
+    const blocked = ['c:\\windows', 'c:\\windows\\system32', 'c:\\program files', 'c:\\', 'c:/', '/', '/etc', '/sys', '/proc'];
     if (blocked.some(b => lower === b || lower.startsWith(b + path.sep))) return;
+    if (lower.length <= 3 && /^[a-z]:[\\/]?$/.test(lower)) return;
     if (ALLOWED_AUDIO_DIRS.length >= 64) return;
     if (ALLOWED_AUDIO_DIRS.some(d => path.resolve(d).toLowerCase() === lower)) return;
     ALLOWED_AUDIO_DIRS.push(resolved);
@@ -148,7 +261,9 @@ export type SonetraStatusCallback = (status: {
 class SonetraBridge {
     serverProcess: ChildProcess | null = null;
     serverPort: number = 8765;
-    serverHost: string = 'localhost';
+    // Pinned loopback IP — 'localhost' can resolve to ::1 vs 127.0.0.1 and is
+    // DNS-rebindable; health checks + uploads must never leave the machine.
+    serverHost: string = '127.0.0.1';
     isRunning: boolean = false;
     sonetraPath: string | null = null;
     config: any;
@@ -157,6 +272,10 @@ class SonetraBridge {
     private _restartCount = 0;
     private readonly _maxRestartAttempts = 3;
     private readonly _restartCooldownMs = 2000;
+    // Set while stopServer() owns the kill so the 'close' handler treats the
+    // exit as intentional and never auto-restarts (H1). _forceKill() (health
+    // watchdog) deliberately leaves this false so crashes still restart.
+    private _intentionalStop = false;
     private _healthPollTimer: ReturnType<typeof setInterval> | null = null;
     private readonly _healthPollIntervalMs = 30_000; // Check health every 30s
     private _statusCallbacks: SonetraStatusCallback[] = [];
@@ -165,6 +284,10 @@ class SonetraBridge {
 
     constructor() {
         this.config = this._loadConfig();
+        // Honor validated config.port — previously parsed but never assigned.
+        if (typeof this.config?.port === 'number' && Number.isFinite(this.config.port)) {
+            this.serverPort = Math.max(1024, Math.min(65535, Math.floor(this.config.port)));
+        }
     }
 
     /** Register a callback for restart/status events */
@@ -216,6 +339,10 @@ class SonetraBridge {
         try {
             const configPath = path.join(__dirname, 'config.json');
             if (fs.existsSync(configPath)) {
+                try {
+                    const st = fs.statSync(configPath);
+                    if (!st.isFile() || st.size > 64 * 1024) return {};
+                } catch { return {}; }
                 const raw = JSON.parse(fs.readFileSync(configPath, 'utf8'));
                 if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
                 const out: any = {};
@@ -305,20 +432,16 @@ class SonetraBridge {
 
         let pythonCmd = this._resolvePythonCmd();
 
-        // Auto-setup: if Python doesn't exist or isn't usable, run the setup script
+        // No auto-setup: executing a setup script (network fetch + installer
+        // exec as the user) from a renderer-triggerable auto-start is a
+        // supply-chain RCE vector. Missing Python is a manual-install error.
         const pythonOk = await this._checkPythonAvailable(pythonCmd);
         if (!pythonOk) {
-            console.log('[Sonetra] Python not found — running auto-setup...');
-            const setupScript = path.join(__dirname, '..', 'scripts', 'setup-sonetra.js');
-            if (fs.existsSync(setupScript)) {
-                try {
-                    await execFileAsync(process.execPath, [setupScript], 120_000);
-                    console.log('[Sonetra] Auto-setup succeeded — re-resolving Python');
-                    pythonCmd = this._resolvePythonCmd();
-                } catch (e: any) {
-                    console.warn('[Sonetra] Auto-setup failed — will try system Python:', e.message);
-                }
-            }
+            this._fireStatus('failed', { message: 'Python 3.9+ not found' });
+            return {
+                success: false,
+                error: 'Python 3.9+ not found. Run: npm run setup:sonetra (or setup:sonetra:win on Windows)'
+            };
         }
 
         // Ensure Python dependencies are installed before spawning
@@ -352,6 +475,9 @@ class SonetraBridge {
             try {
                 // Minimal env: never inherit secrets into the child; truncate child
                 // output to blunt log-spam/ANSI forgery from a compromised server.
+                // Neutral cwd (NOT srcPath): a child cwd inside the sonetra tree
+                // puts attacker-influenced dirs on DLL/SO search order. Module
+                // resolution still works via PYTHONPATH.
                 const cleanEnv: NodeJS.ProcessEnv = {
                     PATH: process.env.PATH,
                     SYSTEMROOT: process.env.SYSTEMROOT,
@@ -359,10 +485,18 @@ class SonetraBridge {
                     TMP: process.env.TMP,
                     PYTHONUNBUFFERED: '1',
                     PYTHONNOUSERSITE: '1',
+                    PYTHONPATH: srcPath,
                 };
+                let neutralCwd: string;
+                try {
+                    neutralCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'gangsta-sonetra-'));
+                } catch {
+                    neutralCwd = os.tmpdir();
+                }
                 this.serverProcess = spawn(pythonCmd, args, {
-                    cwd: srcPath,
+                    cwd: neutralCwd,
                     shell: false,
+                    windowsHide: true,
                     stdio: ['pipe', 'pipe', 'pipe'],
                     env: cleanEnv
                 });
@@ -389,12 +523,16 @@ class SonetraBridge {
 
                 this.serverProcess.on('close', (code) => {
                     const wasRunning = this.isRunning;
+                    const intentional = this._intentionalStop;
                     console.log(`[Sonetra] Server stopped with code ${code}`);
                     this.isRunning = false;
                     this.serverProcess = null;
                     this._stopHealthPolling();
 
-                    if (wasRunning && (code === null || code !== 0)) {
+                    if (intentional) {
+                        this._restartCount = 0;
+                        this._fireStatus('stopped', { message: `Server stopped (code ${code})` });
+                    } else if (wasRunning && (code === null || code !== 0)) {
                         // Unexpected crash (non-zero exit or signal kill) — attempt auto-restart
                         this._fireStatus('crashed', { 
                             message: `Server exited with code ${code}`, 
@@ -502,6 +640,9 @@ class SonetraBridge {
         console.log('[Sonetra] Manual restart requested...');
         this._restartCount = 0;
         await this.stopServer();
+        // stopServer() leaves _intentionalStop set only while it owns a live
+        // child; clear defensively so the fresh child gets crash-restart cover.
+        this._intentionalStop = false;
         return await this.startServer();
     }
 
@@ -537,6 +678,14 @@ class SonetraBridge {
         if (!proc) return;
         this.serverProcess = null;
         this._stopHealthPolling();
+        // H2: never signal a process that already exited — the PID may have
+        // been recycled to an innocent process. State is still detached above
+        // so the pending 'close' event only reports, never kills.
+        let alreadyDead = false;
+        try {
+            alreadyDead = proc.exitCode !== null || (proc as unknown as { killed?: boolean }).killed === true;
+        } catch { alreadyDead = false; }
+        if (alreadyDead) return;
         if (process.platform === 'win32' && proc.pid) {
             const killer = spawn('taskkill', ['/pid', String(proc.pid), '/f', '/t']);
             killer.on('error', (e) => {
@@ -657,6 +806,7 @@ class SonetraBridge {
         if (this.serverProcess) {
             console.log('[Sonetra] Stopping server...');
             const proc = this.serverProcess;
+            this._intentionalStop = true;
             this._stopHealthPolling();
             this._restartCount = 0;
             // Await termination so fast restart can't double-spawn on port 8765.
@@ -668,24 +818,35 @@ class SonetraBridge {
                     proc.once('exit', () => { clearTimeout(to); resolve(); });
                 } catch { clearTimeout(to); resolve(); }
             });
-            if (process.platform === 'win32') {
-                if (proc?.pid) {
-                    await new Promise<void>((resolve) => {
-                        const killer = spawn('taskkill', ['/pid', String(proc.pid), '/f', '/t']);
-                        killer.on('error', () => { try { proc.kill(); } catch { /* dead */ } resolve(); });
-                        killer.on('close', () => resolve());
-                        setTimeout(resolve, 4000).unref?.();
-                    });
+            // H2: skip the kill entirely when the child already exited — its
+            // PID may already belong to someone else.
+            let alreadyDead = false;
+            try {
+                alreadyDead = proc.exitCode !== null || (proc as unknown as { killed?: boolean }).killed === true;
+            } catch { alreadyDead = false; }
+            if (!alreadyDead) {
+                if (process.platform === 'win32') {
+                    if (proc?.pid) {
+                        await new Promise<void>((resolve) => {
+                            const killer = spawn('taskkill', ['/pid', String(proc.pid), '/f', '/t']);
+                            killer.on('error', () => { try { proc.kill(); } catch { /* dead */ } resolve(); });
+                            killer.on('close', () => resolve());
+                            setTimeout(resolve, 4000).unref?.();
+                        });
+                    }
+                } else {
+                    try { proc.kill('SIGTERM'); } catch { /* already dead */ }
+                    await Promise.race([exited, new Promise<void>((r) => setTimeout(r, 3000).unref?.() ?? r())]);
+                    // Escalate: SIGTERM-immune child must not linger as a port zombie.
+                    try { if (proc.exitCode === null) proc.kill('SIGKILL'); } catch { /* ignore */ }
                 }
-            } else {
-                try { proc.kill('SIGTERM'); } catch { /* already dead */ }
-                await Promise.race([exited, new Promise<void>((r) => setTimeout(r, 3000).unref?.() ?? r())]);
-                // Escalate: SIGTERM-immune child must not linger as a port zombie.
-                try { if (proc.exitCode === null) proc.kill('SIGKILL'); } catch { /* ignore */ }
             }
             await Promise.race([exited, new Promise<void>((r) => setTimeout(r, 2000).unref?.() ?? r())]);
             this.serverProcess = null;
             this.isRunning = false;
+            this._intentionalStop = false;
+        } else {
+            this._intentionalStop = false;
         }
         return { success: true };
     }
@@ -720,7 +881,7 @@ class SonetraBridge {
                 if (attempt > 0) {
                     const delay = baseDelayMs * Math.pow(2, attempt - 1);
                     console.log(`[Sonetra] Retry attempt ${attempt}/${maxRetries} after ${delay}ms...`);
-                    await new Promise(r => setTimeout(r, delay));
+                    await new Promise<void>(r => { const t = setTimeout(r, delay); (t as any)?.unref?.(); });
                 }
 
                 const result = await operation();
@@ -835,11 +996,15 @@ class SonetraBridge {
                         } catch { /* ignore */ }
 
                         req.on('error', (err) => {
+                            try { s1.destroy(); } catch { /* ignore */ }
+                            try { s2.destroy(); } catch { /* ignore */ }
                             reject(err);
                         });
 
                         req.on('timeout', () => {
                             req.destroy();
+                            try { s1.destroy(); } catch { /* ignore */ }
+                            try { s2.destroy(); } catch { /* ignore */ }
                             reject(new Error('Request timed out'));
                         });
 

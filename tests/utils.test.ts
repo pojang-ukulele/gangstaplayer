@@ -5,7 +5,7 @@
  * ts-jest transforms code into a separate realm, breaking instanceof
  * for built-ins like ArrayBuffer. We use a cross-realm-safe check instead.
  */
-import { normalizeToArrayBuffer } from '../js/utils';
+import { normalizeToArrayBuffer, validateAudioSignature } from '../js/utils';
 
 /** Cross-realm safe ArrayBuffer check (same technique used in the source) */
 function isArrayBuffer(v: any): boolean {
@@ -174,5 +174,55 @@ describe('normalizeToArrayBuffer', () => {
         const resultView = new Uint8Array(result);
         expect(resultView[0]).toBe(1);
         expect(resultView[size - 1]).toBe(255);
+    });
+});
+
+describe('validateAudioSignature', () => {
+    const buf = (bytes: number[]): ArrayBuffer => new Uint8Array(bytes).buffer;
+
+    test('accepts RIFF/WAVE', () => {
+        const b = new Uint8Array(16);
+        b.set([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x41, 0x56, 0x45]);
+        expect(validateAudioSignature(b.buffer)).toBeNull();
+    });
+
+    test('accepts RIFX/WAVE and RF64 and AIFF', () => {
+        const rifx = new Uint8Array(16);
+        rifx.set([0x52, 0x49, 0x46, 0x58, 0, 0, 0, 0, 0x57, 0x41, 0x56, 0x45]);
+        expect(validateAudioSignature(rifx.buffer)).toBeNull();
+        const rf64 = new Uint8Array(16);
+        rf64.set([0x52, 0x46, 0x36, 0x34, 0, 0, 0, 0, 0, 0, 0, 0]);
+        expect(validateAudioSignature(rf64.buffer)).toBeNull();
+        const aiff = new Uint8Array(16);
+        aiff.set([0x46, 0x4F, 0x52, 0x4D, 0, 0, 0, 0, 0x41, 0x49, 0x46, 0x46]);
+        expect(validateAudioSignature(aiff.buffer)).toBeNull();
+    });
+
+    test('accepts valid MP3 frame sync, rejects reserved layer bits', () => {
+        expect(validateAudioSignature(buf([0xFF, 0xFB, 0, 0]))).toBeNull();
+        // Layer 00 is reserved — JPEG APP0 (FF E0) must not pass as MP3.
+        expect(validateAudioSignature(buf([0xFF, 0xE0, 0, 0]))).not.toBeNull();
+        expect(validateAudioSignature(buf([0xFF, 0xD8, 0xFF, 0xE0]))).not.toBeNull();
+    });
+
+    test('accepts ID3-wrapped FLAC via inner magic', () => {
+        // ID3v2 header (size 16) + fLaC magic.
+        const b = new Uint8Array(10 + 16 + 4);
+        b.set([0x49, 0x44, 0x33, 3, 0, 0, 0, 0, 0, 0x10]);
+        b.set([0x66, 0x4C, 0x61, 0x43], 26);
+        expect(validateAudioSignature(b.buffer)).toBeNull();
+    });
+
+    test('rejects garbage and tiny buffers', () => {
+        expect(validateAudioSignature(buf([1, 2, 3, 4]))).not.toBeNull();
+        expect(validateAudioSignature(new ArrayBuffer(0))).not.toBeNull();
+    });
+
+    test('accepts OggS and fLaC and ftyp', () => {
+        expect(validateAudioSignature(buf([0x4F, 0x67, 0x67, 0x53]))).toBeNull();
+        expect(validateAudioSignature(buf([0x66, 0x4C, 0x61, 0x43]))).toBeNull();
+        const m4a = new Uint8Array(12);
+        m4a.set([0, 0, 0, 0, 0x66, 0x74, 0x79, 0x70, 0, 0, 0, 0]);
+        expect(validateAudioSignature(m4a.buffer)).toBeNull();
     });
 });

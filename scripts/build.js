@@ -176,8 +176,149 @@ async function build() {
         console.log('Portable Python not found — Sonetra AI will auto-setup on first use.');
     }
 
+    // 9. Stage external native/runtime deps into the bundle.
+    // Main/Sonetra keep better-sqlite3 + form-data external (native binding
+    // can't be bundled), and electron-builder only packs what's inside
+    // app-build — so copy them here or getDbManager() dies packaged.
+    stageExternalDeps();
+
     console.log('--- BUILD COMPLETE ---');
     console.log(`Ready to package in: ${BUILD_DIR}`);
+}
+
+/**
+ * Copies external runtime deps (native binding + pure-JS form-data tree)
+ * into app-build/node_modules so the packaged app can require() them.
+ */
+function stageExternalDeps() {
+    const deps = [
+        'better-sqlite3',
+        // better-sqlite3 native binding loader chain — missing packaged
+        // kills getDbManager() (require('bindings') throws in main).
+        'bindings',
+        'file-uri-to-path',
+        'form-data',
+        // form-data transitive tree (bundled copies stay consistent).
+        // form-data v4 requires es-set-tostringtag + hasown at top level,
+        // which pull a deeper es-shims closure — every entry must be
+        // staged or require(form-data) throws packaged-only before
+        // createWindow (7 dirs is NOT enough).
+        'asynckit',
+        'combined-stream',
+        'delayed-stream',
+        'mime-types',
+        'mime-db',
+        'es-set-tostringtag',
+        'hasown',
+        'get-intrinsic',
+        'es-errors',
+        'es-object-atoms',
+        'es-define-property',
+        'gopd',
+        'dunder-proto',
+        'get-proto',
+        'has-symbols',
+        'has-tostringtag',
+        'function-bind',
+        'call-bind-apply-helpers',
+        'math-intrinsics',
+    ];
+    const destRoot = path.join(BUILD_DIR, 'node_modules');
+    let staged = 0;
+    for (const dep of deps) {
+        const src = path.join('node_modules', dep);
+        const dest = path.join(destRoot, dep);
+        try {
+            if (!fs.existsSync(src)) continue;
+            if (fs.existsSync(dest)) {
+                fs.rmSync(dest, { recursive: true, force: true });
+            }
+            fs.mkdirSync(path.dirname(dest), { recursive: true });
+            fs.cpSync(src, dest, { recursive: true });
+            staged++;
+        } catch (e) {
+            console.warn(`Warning: failed to stage ${dep}: ${e?.message || e}`);
+        }
+    }
+    // Sanity: the native binding must exist or the packaged DB is dead.
+    const binding = path.join(destRoot, 'better-sqlite3', 'build', 'Release', 'better_sqlite3.node');
+    if (!fs.existsSync(binding)) {
+        console.warn('Warning: better-sqlite3 native binding not staged — packaged getDbManager() will fail. Run `npm install` then rebuild.');
+    } else {
+        console.log(`Staged ${staged} external dep(s) including better-sqlite3 native binding.`);
+    }
+    // Closure verification: the staged list is hardcoded, so a `npm update`
+    // adding a new transitive dep breaks packaged-only (dev passes). Walk the
+    // static require() closure from each staged root and fail loud on gaps.
+    verifyStagedClosure(deps, destRoot);
+}
+
+/**
+ * Collects bare-specifier require() targets reachable from a package's entry
+ * files (depth-bounded walk). Only runtime requires count — install-time-only
+ * trees (e.g. prebuild-install, never require()d by better-sqlite3/lib) are
+ * correctly ignored, unlike a package.json dependency walk.
+ */
+function verifyStagedClosure(staged, destRoot) {
+    const stagedSet = new Set(staged);
+    const needed = new Set();
+    const visitedFiles = new Set();
+    const requireSrc = /require\(\s*['"]([^'"]+)['"]\s*\)/g.source;
+    const pkgOf = (spec) => spec.startsWith('@') ? spec.split('/').slice(0, 2).join('/') : spec.split('/')[0];
+    const tryFile = (p) => {
+        if (fs.existsSync(p)) {
+            try { if (fs.statSync(p).isFile()) return p; } catch { return null; }
+        }
+        for (const cand of [p + '.js', path.join(p, 'index.js')]) {
+            try { if (fs.existsSync(cand) && fs.statSync(cand).isFile()) return cand; } catch { /* next */ }
+        }
+        return null;
+    };
+    const entryOf = (pkg) => {
+        try {
+            const pj = JSON.parse(fs.readFileSync(path.join('node_modules', pkg, 'package.json'), 'utf8'));
+            return tryFile(path.join('node_modules', pkg, pj.main || 'index.js'));
+        } catch { return null; }
+    };
+    const walkFile = (file, depth) => {
+        if (depth > 24 || visitedFiles.has(file)) return;
+        visitedFiles.add(file);
+        let src;
+        try { src = fs.readFileSync(file, 'utf8'); } catch { return; }
+        // Fresh regex per file: a shared /g regex corrupts lastIndex across
+        // the recursive walk and silently drops most of the closure.
+        for (const m of src.matchAll(new RegExp(requireSrc, 'g'))) {
+            const spec = m[1];
+            if (spec.startsWith('.')) {
+                // Relative file in the same package — its bare requires still
+                // count toward the closure.
+                const rel = tryFile(path.resolve(path.dirname(file), spec));
+                if (rel) walkFile(rel, depth + 1);
+                continue;
+            }
+            const pkg = pkgOf(spec);
+            if (pkg === 'electron' || pkg === 'fsevents') continue;
+            // Node builtins (fs, path, ...) have no package dir — skip.
+            let resolved;
+            try { resolved = require.resolve(pkg, { paths: [path.dirname(file)] }); }
+            catch { continue; }
+            if (!resolved.includes('node_modules')) continue; // relative/builtin
+            needed.add(pkg);
+            walkFile(resolved, depth + 1);
+        }
+    };
+    for (const root of ['better-sqlite3', 'bindings', 'file-uri-to-path', 'form-data']) {
+        const entry = entryOf(root);
+        if (entry) walkFile(entry, 0);
+    }
+    const missing = [...needed].filter((p) => !stagedSet.has(p));
+    if (missing.length > 0) {
+        throw new Error(
+            `Staged externals are missing runtime deps (packaged app would crash on require): ${missing.join(', ')}. ` +
+            `Add them to the deps list in stageExternalDeps().`
+        );
+    }
+    console.log(`Staged closure verified (${needed.size} runtime dep(s) covered).`);
 }
 
 build().catch(err => {

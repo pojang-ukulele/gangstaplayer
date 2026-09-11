@@ -37,6 +37,7 @@ const mockSettings = {
         bpmSync: false,
         trackDuration: 10,
         btnDuration: 4,
+        enableAI: false,
     },
 };
 jest.mock('../js/settings', () => ({
@@ -89,6 +90,8 @@ const mockEngine = {
         audio: mockMainAudio,
         reset: jest.fn(),
         load: jest.fn(),
+        loadAsync: jest.fn().mockResolvedValue(true),
+        needsReload: false,
         gain: { gain: makeMockAudioNode(1) },
         lowEQ: makeMockFilter(),
         midEQ: makeMockFilter(),
@@ -100,6 +103,8 @@ const mockEngine = {
         audio: mockCrossfadeAudio,
         reset: jest.fn(),
         load: jest.fn(),
+        loadAsync: jest.fn().mockResolvedValue(true),
+        needsReload: false,
         gain: { gain: makeMockAudioNode(0.001) },
         lowEQ: makeMockFilter(),
         midEQ: makeMockFilter(),
@@ -303,8 +308,10 @@ describe('Player — guarded functions (no DOM, no crash)', () => {
         expect(mockMainAudio.play).not.toHaveBeenCalled();
     });
 
-    test('playTrack calls audio.play when conditions allow', () => {
+    test('playTrack calls audio.play when conditions allow', async () => {
         playTrack();
+        // play() chains after the resume attempt — flush the microtask queue.
+        await new Promise((r) => setTimeout(r, 0));
         expect(mockMainAudio.play).toHaveBeenCalledTimes(1);
     });
 
@@ -312,7 +319,7 @@ describe('Player — guarded functions (no DOM, no crash)', () => {
         mockMainAudio.play.mockResolvedValueOnce(undefined);
         playTrack();
         // Allow promise microtask to resolve
-        await Promise.resolve();
+        await new Promise((r) => setTimeout(r, 0));
         expect(state.isPlaying).toBe(true);
     });
 
@@ -374,7 +381,7 @@ describe('Player — guarded functions (no DOM, no crash)', () => {
         await loadTrack(0);
 
         expect(mockEngine.main.reset).toHaveBeenCalledTimes(1);
-        expect(mockEngine.main.load).toHaveBeenCalled();
+        expect(mockEngine.main.loadAsync).toHaveBeenCalled();
         expect(state.currentTrackIndex).toBe(0);
     });
 });

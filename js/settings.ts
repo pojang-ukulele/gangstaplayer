@@ -24,7 +24,7 @@ interface Settings {
 
 import './types';
 
-const bridge = window.electronAPI;
+const bridge = typeof window !== 'undefined' ? window.electronAPI : undefined;
 
 const _settings: Settings = {
     fullScreen: false,
@@ -76,7 +76,9 @@ export function initSettings(deps: { setAutoMixEnabled: (enabled: boolean) => vo
     if (settingsBtn && settingsModal) {
         settingsBtn.addEventListener('click', () => {
             openModal(settingsModal);
-            refreshAudioDevices();
+            // Enumerate only — no mic request on open. Mic labels are primed
+            // on explicit user action (input select interaction, see below).
+            void refreshAudioDevices();
         });
     }
     if (closeSettings && settingsModal) {
@@ -132,17 +134,21 @@ export function loadSettings(): void {
                     if (Number.isFinite(Number(am.btnDuration))) _settings.autoMix.btnDuration = Math.min(30, Math.max(0.5, Number(am.btnDuration)));
                 }
             }
-            applySettingsToUI();
-            // Apply Full Screen + persisted output route on load (output was
-            // previously reflected in the <select> but never actuated).
-            if (bridge && bridge.setFullScreen) bridge.setFullScreen(settings.fullScreen);
-            try { applyOutputDevice(settings.outputDevice); } catch { /* no device yet */ }
-            try {
-                void import('./midi').then((m) => {
-                    try { if (settings.midiDevice) m.setSelectedMidiDevice(settings.midiDevice); } catch { /* ignore */ }
-                }).catch(() => undefined);
-            } catch { /* MIDI sync best-effort */ }
         }
+        // First-boot actuation: the block above only ran with saved settings,
+        // leaving fresh profiles on HTML slider max=20/8 (code: 60/30) with
+        // output/MIDI never synced. Defaults are safe (fullscreen off,
+        // default devices), so always apply.
+        try { applySettingsToUI(); } catch { /* ignore */ }
+        // Apply Full Screen + persisted output route on load (output was
+        // previously reflected in the <select> but never actuated).
+        if (bridge && bridge.setFullScreen) bridge.setFullScreen(settings.fullScreen);
+        try { applyOutputDevice(settings.outputDevice); } catch { /* no device yet */ }
+        try {
+            void import('./midi').then((m) => {
+                try { if (settings.midiDevice) m.setSelectedMidiDevice(settings.midiDevice); } catch { /* ignore */ }
+            }).catch(() => undefined);
+        } catch { /* MIDI sync best-effort */ }
     } catch(e) {
         logger.error("Load Settings Error", e);
     }
@@ -208,7 +214,30 @@ export function saveSettings(): void {
         if (mixOptBPMSync) _settings.autoMix.bpmSync = mixOptBPMSync.checked;
         if (mixOptEnableAI) _settings.autoMix.enableAI = mixOptEnableAI.checked;
 
-        localStorage.setItem('ug_settings', JSON.stringify(_settings));
+        // M26: merge — never last-wins drop. midi.ts writes midiDevice /
+        // midiDeviceName into the same key; a blind write of _settings would
+        // drop those (and a stale _settings.midiDevice would clobber a fresh
+        // MIDI selection). Adopt the stored MIDI route when _settings is stale.
+        let existing: Record<string, unknown> | null = null;
+        try {
+            const raw = localStorage.getItem('ug_settings');
+            existing = raw ? JSON.parse(raw) as Record<string, unknown> : null;
+        } catch { existing = null; }
+        if (existing && typeof existing === 'object') {
+            const storedMidi = existing['midiDevice'];
+            if (typeof storedMidi === 'string' && storedMidi && storedMidi !== _settings.midiDevice) {
+                _settings.midiDevice = storedMidi.slice(0, 256);
+            }
+        }
+        const merged: Record<string, unknown> = {
+            ...(existing && typeof existing === 'object' ? existing : {}),
+            ...JSON.parse(JSON.stringify(_settings)) as Record<string, unknown>,
+        };
+        // Preserve keys _settings does not own (e.g. midiDeviceName).
+        if (existing && typeof existing === 'object' && existing['midiDeviceName'] !== undefined) {
+            (merged as Record<string, unknown>)['midiDeviceName'] = existing['midiDeviceName'];
+        }
+        localStorage.setItem('ug_settings', JSON.stringify(merged));
 
         // Actuate Full Screen
         if (bridge && bridge.setFullScreen) bridge.setFullScreen(_settings.fullScreen);
@@ -252,12 +281,23 @@ export function setupSettingsHandlers(): void {
     const inputSelect = document.getElementById('inputDeviceSelect') as HTMLSelectElement;
     const outputSelect = document.getElementById('outputDeviceSelect') as HTMLSelectElement;
     inputSelect?.addEventListener('change', () => {
+        // Never persist an empty/placeholder device id.
+        if (!inputSelect.value) return;
         updateSettings({ inputDevice: inputSelect.value });
     });
     outputSelect?.addEventListener('change', () => {
+        if (!outputSelect.value) return;
         updateSettings({ outputDevice: outputSelect.value });
         applyOutputDevice(outputSelect.value);
     });
+    // Mic labels unlock only on explicit user action (focus/open of the
+    // input select), not on every settings open. One-shot per session once
+    // real labels are obtained.
+    if (inputSelect && !_micPrimeWired) {
+        _micPrimeWired = true;
+        inputSelect.addEventListener('pointerdown', primeMicLabelsOnce);
+        inputSelect.addEventListener('focus', primeMicLabelsOnce);
+    }
 
     // Auto-save on any change (via updateSettings so persistence is unified).
     // Route AutoMix checkbox changes into the player engine — previously the
@@ -297,7 +337,17 @@ export function setupSettingsHandlers(): void {
                 };
                 saveSettings();
                 applySettingsToUI();
+                // M19: defaults must reach the UI selects + actuation, not
+                // just _settings — stale selects/output-route/fullscreen
+                // otherwise survive the "reset".
+                try {
+                    const inSel = document.getElementById('inputDeviceSelect') as HTMLSelectElement | null;
+                    if (inSel) inSel.value = _settings.inputDevice;
+                    const outSel = document.getElementById('outputDeviceSelect') as HTMLSelectElement | null;
+                    if (outSel) outSel.value = _settings.outputDevice;
+                } catch { /* ignore */ }
                 try { applyOutputDevice(_settings.outputDevice); } catch { /* ignore */ }
+                try { if (bridge && bridge.setFullScreen) bridge.setFullScreen(false); } catch { /* ignore */ }
                 try {
                     void import('./midi').then((m) => {
                         try { m.setSelectedMidiDevice('all'); } catch { /* ignore */ }
@@ -398,6 +448,9 @@ function setupDurationSlider(sliderId: string, labelId: string, isTrackFade: boo
     const label = document.getElementById(labelId);
     if (!slider || !label) return;
 
+    // Debounced save: dragging previously fired saveSettings() (localStorage
+    // + setFullScreen IPC) on every input tick — jank + window flash.
+    let saveTimer: ReturnType<typeof setTimeout> | null = null;
     slider.addEventListener('input', (e) => {
         const target = e.target as HTMLInputElement;
         const val = parseFloat(target.value);
@@ -407,56 +460,122 @@ function setupDurationSlider(sliderId: string, labelId: string, isTrackFade: boo
         label.innerText = clamped.toFixed(1) + 's';
         if (isTrackFade) _settings.autoMix.trackDuration = clamped;
         else _settings.autoMix.btnDuration = clamped;
-        saveSettings();
+        if (saveTimer) clearTimeout(saveTimer);
+        saveTimer = setTimeout(() => {
+            saveTimer = null;
+            try { saveSettings(); } catch { /* ignore */ }
+        }, 300);
     });
 }
 
-async function refreshAudioDevices(): Promise<void> {
+async function refreshAudioDevices(options?: { requestMic?: boolean }): Promise<void> {
     const inputSelect = document.getElementById('inputDeviceSelect') as HTMLSelectElement;
     const outputSelect = document.getElementById('outputDeviceSelect') as HTMLSelectElement;
     if (!inputSelect || !outputSelect) return;
 
     let stream: MediaStream | null = null;
     try {
-        // Check if we already have mic permission before requesting
-        let hasPermission = false;
-        if (navigator.permissions?.query) {
-            const permStatus = await navigator.permissions.query({ name: 'microphone' as PermissionName });
-            hasPermission = permStatus.state === 'granted';
-            if (permStatus.state === 'denied') {
-                logger.warn("Microphone permission denied — audio device list may be incomplete");
-                // Fall through — enumerateDevices() still returns limited info without permission
+        // Mic is requested ONLY on explicit user action (requestMic: true).
+        // A plain enumerate never warms the mic; labels stay placeholders
+        // until the user deliberately primes them.
+        if (options?.requestMic) {
+            // Check if we already have mic permission before requesting
+            let hasPermission = false;
+            if (navigator.permissions?.query) {
+                try {
+                    const permStatus = await navigator.permissions.query({ name: 'microphone' as PermissionName });
+                    hasPermission = permStatus.state === 'granted';
+                    if (permStatus.state === 'denied') {
+                        logger.warn("Microphone permission denied — audio device list may be incomplete");
+                    }
+                } catch { /* permissions API unavailable — request directly */ }
+            }
+            if (!hasPermission) {
+                // The stream exists ONLY to unlock device labels — it is
+                // stopped immediately after enumerateDevices resolves.
+                try {
+                    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                } catch (e) {
+                    logger.warn("Mic label prime failed", e);
+                }
             }
         }
-        if (!hasPermission) {
-            // The stream exists ONLY to unlock device labels — it must be
-            // released immediately or the mic stays hot at the OS level.
-            stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        }
         const devices = await navigator.mediaDevices.enumerateDevices();
+        // Release the mic BEFORE touching the DOM so a slow render can't
+        // keep the indicator hot.
+        if (stream) {
+            try { stream.getTracks().forEach(t => t.stop()); } catch { /* ignore */ }
+            stream = null;
+        }
         inputSelect.innerHTML = '';
         outputSelect.innerHTML = '';
-        
-        devices.forEach(device => {
+
+        let inputIdx = 0;
+        let outputIdx = 0;
+        for (const device of devices) {
             const option = document.createElement('option');
             option.value = device.deviceId;
-            option.text = device.label || `${device.kind} - ${device.deviceId.substring(0, 8)}`;
-            if (device.kind === 'audioinput') inputSelect.appendChild(option);
-            else if (device.kind === 'audiooutput') outputSelect.appendChild(option);
-        });
+            // Never surface an empty label as a selectable identity — empty
+            // labels are placeholders, never persisted.
+            if (device.kind === 'audioinput') {
+                inputIdx++;
+                option.text = device.label || `Microphone ${inputIdx}`;
+                if (!device.label) option.dataset['unlabeled'] = '1';
+                inputSelect.appendChild(option);
+            } else if (device.kind === 'audiooutput') {
+                outputIdx++;
+                option.text = device.label || `Speaker ${outputIdx}`;
+                if (!device.label) option.dataset['unlabeled'] = '1';
+                outputSelect.appendChild(option);
+            }
+        }
 
-        // Reflect persisted selections
+        // Reflect persisted selections (only when the stored id exists and
+        // the matched option carries a real label).
         if (settings.inputDevice && settings.inputDevice !== 'default') {
-            inputSelect.value = settings.inputDevice;
+            const opt = Array.from(inputSelect.options).find(o => o.value === settings.inputDevice);
+            if (opt && !opt.dataset['unlabeled']) inputSelect.value = settings.inputDevice;
         }
         if (settings.outputDevice && settings.outputDevice !== 'default') {
-            outputSelect.value = settings.outputDevice;
+            const opt = Array.from(outputSelect.options).find(o => o.value === settings.outputDevice);
+            if (opt && !opt.dataset['unlabeled']) outputSelect.value = settings.outputDevice;
         }
-    } catch (e) { 
-        logger.warn("Device refresh failed", e); 
+        // Unplug desync: a stored id with no live option left the UI on the
+        // first device while _settings kept the stale id — the next save
+        // wrote the dead route back and audio silently stayed misrouted.
+        try {
+            let corrected = false;
+            if (inputSelect.value !== _settings.inputDevice) {
+                const live = Array.from(inputSelect.options).some(o => o.value === _settings.inputDevice);
+                if (!live) { _settings.inputDevice = inputSelect.value || 'default'; corrected = true; }
+            }
+            if (outputSelect.value !== _settings.outputDevice) {
+                const live = Array.from(outputSelect.options).some(o => o.value === _settings.outputDevice);
+                if (!live) { _settings.outputDevice = outputSelect.value || 'default'; corrected = true; }
+            }
+            if (corrected) saveSettings();
+        } catch { /* correction best-effort */ }
+        // Labels obtained — no further mic primes needed this session.
+        if (options?.requestMic) {
+            const anyLabeled = devices.some(d => !!d.label);
+            if (anyLabeled) _micPrimed = true;
+        }
+    } catch (e) {
+        logger.warn("Device refresh failed", e);
     } finally {
-        stream?.getTracks().forEach(t => t.stop());
+        if (stream) {
+            try { stream.getTracks().forEach(t => t.stop()); } catch { /* ignore */ }
+        }
     }
+}
+
+// One-shot mic-label priming on explicit user action (input-select focus).
+let _micPrimed = false;
+let _micPrimeWired = false;
+function primeMicLabelsOnce(): void {
+    if (_micPrimed) return;
+    _micPrimed = true; // single attempt per session — no repeated prompts
+    void refreshAudioDevices({ requestMic: true }).catch(() => undefined);
 }
 
 /**

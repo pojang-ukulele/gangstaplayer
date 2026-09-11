@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3';
+import * as fs from 'fs';
 import * as path from 'path';
 import { app } from 'electron';
 import { MAX_PLAYLIST_SEARCH_RESULTS } from './js/constants';
@@ -18,6 +19,7 @@ export class DatabaseManager {
 
     constructor() {
         const userDataPath = app.getPath('userData');
+        try { fs.mkdirSync(userDataPath, { recursive: true }); } catch { /* ignore */ }
         const dbPath = path.join(userDataPath, 'gangsta.db');
 
         this.db = new Database(dbPath);
@@ -108,12 +110,12 @@ export class DatabaseManager {
     }
 
     public getAllTracks(limit = 5000) {
-        const safeLimit = Math.max(1, Math.min(20000, Math.floor(Number(limit) || 5000)));
-        const stmt = this.db.prepare(`SELECT * FROM tracks ORDER BY name ASC LIMIT ${safeLimit}`);
-        return stmt.all().map((row: any) => {
-            if (row.metadata) row.metadata = safeParse(row.metadata, {});
-            return row;
-        });
+        const safeLimit = Math.max(1, Math.min(5000, Math.floor(Number(limit) || 5000)));
+        // Bulk path excludes metadata: 5000 rows x 256KB metadata = GBs over
+        // IPC (freeze/OOM). Single-track getTrackByPath keeps metadata for
+        // callers that need it (track-info).
+        const stmt = this.db.prepare(`SELECT id, path, name, duration, bpm, last_analyzed FROM tracks ORDER BY name ASC LIMIT ${safeLimit}`);
+        return stmt.all();
     }
 
     // KIT OPERATIONS
@@ -175,23 +177,16 @@ export class DatabaseManager {
 }
 
 // Lazy singleton: constructing pre-`whenReady` relies on Electron internals.
-// Main process creates the DB only when the first IPC handler needs it.
+// Main process creates the DB eagerly on whenReady and on first IPC use.
+// Concurrent first-use while init is in flight returns null immediately —
+// every db:* handler already null-checks, so callers retry/degrade instead
+// of the old 2s busy-spin that froze the entire main loop (C4).
 let _instance: DatabaseManager | null = null;
 let _constructing = false;
 
 export function getDbManager(): DatabaseManager | null {
     if (_instance) return _instance;
-    if (_constructing) {
-        const start = Date.now();
-        while (!( _instance as unknown) && Date.now() - start < 2000) {
-            const end = Date.now() + 10;
-            while (Date.now() < end) { /* brief spin, init is synchronous */ }
-            if (_instance) return _instance;
-            if (!_constructing) break;
-        }
-        if (_instance) return _instance;
-        if (_constructing) return null;
-    }
+    if (_constructing) return null;
     _constructing = true;
     try {
         _instance = new DatabaseManager();
@@ -202,4 +197,9 @@ export function getDbManager(): DatabaseManager | null {
         _constructing = false;
     }
     return _instance;
+}
+
+/** Eager init, safe to call once from app.whenReady(). Returns null on failure. */
+export function initDbManager(): DatabaseManager | null {
+    return getDbManager();
 }

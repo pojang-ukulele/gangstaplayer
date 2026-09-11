@@ -22,21 +22,14 @@ export interface ElectronAPI {
 
 export interface FileSystemAPI {
     readFile(filePath: string): Promise<Uint8Array | null>;
+    consentFile(filePath: string): Promise<boolean>;
     saveFile(filePath: string, data: Uint8Array): Promise<boolean>;
-    saveRecording(buffer: ArrayBuffer, filename: string): Promise<string | null>;
     showItemInFolder(filePath: string): Promise<boolean>;
     appendLog(level: string, message: string): Promise<void>;
     getLogPath(): Promise<string>;
-    ensureRecordingsDir(): Promise<string>;
 }
 
 export interface SonetraAPI {
-    startServer(): Promise<{ success: boolean; error?: string }>;
-    stopServer(): Promise<{ success: boolean }>;
-    restartServer(): Promise<{ success: boolean; error?: string }>;
-    getStatus(): Promise<{ isRunning: boolean; port?: number; hasSonetraPath?: boolean; sonetraPath?: string; error?: string }>;
-    createTransition(track1Path: string, track2Path: string, style: string): Promise<{ success: boolean; audioBuffer?: any; error?: string }>;
-    analyzeTrack(trackPath: string): Promise<any>;
     getCachedTransition(track1Path: string, track2Path: string): Promise<{ success: boolean; audioBuffer?: any; error?: string }>;
     precomputeTransition(track1Path: string, track2Path: string): Promise<{ success: boolean; cached?: boolean; error?: string }>;
     onRestartStatus(callback: (status: unknown) => void): () => void;
@@ -76,17 +69,10 @@ export type IpcChannels =
     | 'dialog:open-sample'
     | 'fs:save-file'
     | 'fs:read-file'
-    | 'fs:ensure-recordings-dir'
-    | 'fs:save-recording'
+    | 'fs:consent-file'
     | 'fs:show-item-in-folder'
     | 'fs:append-log'
     | 'fs:get-log-path'
-    | 'sonetra:start-server'
-    | 'sonetra:stop-server'
-    | 'sonetra:restart-server'
-    | 'sonetra:get-status'
-    | 'sonetra:create-transition'
-    | 'sonetra:analyze-track'
     | 'sonetra:get-cached-transition'
     | 'sonetra:precompute-transition'
     | 'db:upsert-track'

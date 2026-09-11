@@ -26,13 +26,29 @@ export let analyser: AnalyserNode | null = null;
 let _failed = false;
 let _owningCtx: AudioContext | null = null;
 
+/** Fired whenever a brand-new AudioContext + master chain is built. */
+type RebuiltCallback = () => void;
+const _rebuiltCallbacks = new Set<RebuiltCallback>();
+export function onAudioRebuilt(cb: RebuiltCallback): () => void {
+    _rebuiltCallbacks.add(cb);
+    return () => { _rebuiltCallbacks.delete(cb); };
+}
+function _fireRebuilt(): void {
+    for (const cb of Array.from(_rebuiltCallbacks)) {
+        try { cb(); } catch (e) { console.error('[Audio] rebuilt callback failed', e); }
+    }
+}
+
 /** Create (or recreate) context + master chain. Returns true when usable. */
 export function ensureAudio(): boolean {
     try {
         if (audioCtx && audioCtx.state !== 'closed' && masterGain && analyser) return true;
         // Closed contexts can't resume — drop everything and rebuild.
+        // (No close() call: state is already 'closed', and awaiting it here
+        // would serialize device-loss recovery behind a dead handle.)
         if (audioCtx && audioCtx.state === 'closed') {
-            try { audioCtx.close().catch(() => undefined); } catch { /* ignore */ }
+            try { masterGain?.disconnect(); } catch { /* ignore */ }
+            try { analyser?.disconnect(); } catch { /* ignore */ }
             audioCtx = null; masterGain = null; analyser = null;
         }
         if (!audioCtx) {
@@ -42,12 +58,17 @@ export function ensureAudio(): boolean {
             _owningCtx = audioCtx;
         }
         if (!masterGain || !analyser || _owningCtx !== audioCtx) {
+            try { masterGain?.disconnect(); } catch { /* ignore */ }
+            try { analyser?.disconnect(); } catch { /* ignore */ }
             masterGain = audioCtx.createGain();
             analyser = audioCtx.createAnalyser();
             analyser.fftSize = VISUALIZER_FFT_SIZE;
             masterGain.connect(analyser);
             analyser.connect(audioCtx.destination);
             _owningCtx = audioCtx;
+            // Fire AFTER the chain exists — subscribers retapping masterGain
+            // previously got null and never retried.
+            _fireRebuilt();
         }
         _failed = false;
         return true;
@@ -85,6 +106,9 @@ export async function resumeAudioContext(): Promise<void> {
  * Convert AudioBuffer to a Blob (WAV) - Offloaded to Worker
  */
 export async function bufferToWave(ab: AudioBuffer): Promise<Blob> {
+    if (!ab || typeof ab.length !== 'number' || ab.length <= 0 || !Number.isFinite(ab.length)) {
+        throw new Error('bufferToWave: empty or detached buffer');
+    }
     return await bufferToWaveWorker(ab, ab.length);
 }
 
@@ -111,9 +135,19 @@ export async function initWorklets(): Promise<void> {
     }
     // Re-register if the context was rebuilt after a close.
     if (isWorkletRegistered && workletCtx === audioCtx) return;
+    // Bound registration: a hung file:// fetch previously stalled
+    // engine.initWorklets retries forever with no timeout.
+    const withTimeout = <T>(p: Promise<T>, ms: number, label: string): Promise<T> =>
+        Promise.race([
+            p,
+            new Promise<T>((_, reject) => {
+                const t = setTimeout(() => reject(new Error(`Worklet timeout: ${label}`)), ms);
+                (t as any)?.unref?.();
+            }),
+        ]);
     try {
-        await audioCtx.audioWorklet.addModule(workletUrl('gangsta-processor.js'));
-        await audioCtx.audioWorklet.addModule(workletUrl('recorder-processor.js'));
+        await withTimeout(audioCtx.audioWorklet.addModule(workletUrl('gangsta-processor.js')), 10000, 'gangsta-processor');
+        await withTimeout(audioCtx.audioWorklet.addModule(workletUrl('recorder-processor.js')), 10000, 'recorder-processor');
         isWorkletRegistered = true;
         workletCtx = audioCtx;
         console.log('[Audio] Worklets Registered');
