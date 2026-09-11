@@ -181,8 +181,10 @@ export function initMIDI(deps: MidiDeps): void {
         midiDeviceSelect.addEventListener('change', (e) => {
             const target = e.target as HTMLSelectElement;
             selectedMidiId = target.value;
+            // Persist the name too — re-pairing after unplug/replug matches
+            // by name when the id changes. Id-only persist broke re-pairing.
             selectedMidiName = target.options[target.selectedIndex]?.text || '';
-            persistMidiDevice(selectedMidiId);
+            persistMidiDevice(selectedMidiId, selectedMidiName);
         });
     }
 

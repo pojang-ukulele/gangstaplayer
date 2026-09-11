@@ -1017,7 +1017,8 @@ function setupTransportHandlers(): void {
                 if (!Number.isFinite(d) || d <= 0 || !Number.isFinite(ratio)) return;
                 if (engine.main.audio.readyState === 0 || !engine.main.audio.src) return;
                 const seekable = engine.main.audio.seekable;
-                if (seekable && seekable.length === 0) return;
+                // Silent ignore previously made fresh-blob drags feel broken.
+                if (seekable && seekable.length === 0) { try { toast.info('TRACK STILL LOADING — SEEK NOT READY'); } catch { /* ignore */ } return; }
                 engine.main.audio.currentTime = Math.min(Math.max(0, ratio * d), d);
             } catch { /* seeking during load/after delete must not throw */ }
         };

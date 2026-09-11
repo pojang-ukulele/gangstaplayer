@@ -116,9 +116,15 @@ class ReactiveStore implements AppStateData {
     private globalListeners: Set<(state: AppStateData) => void> = new Set();
 
     /**
-     * Subscribe to a specific state property change
+     * Subscribe to a specific state property change.
+     * Unknown keys warn loudly instead of creating dead entries that never
+     * fire (a typo'd key previously subscribed into the void silently).
      */
     subscribe<K extends keyof AppStateData>(key: K, fn: Listener<AppStateData[K]>): () => void {
+        if (typeof key !== 'string' || !(key in this._data)) {
+            console.warn(`[State] subscribe to unknown key`, key);
+            return () => undefined;
+        }
         if (!this.listeners.has(key)) {
             this.listeners.set(key, new Set());
         }

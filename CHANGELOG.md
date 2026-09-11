@@ -17,6 +17,14 @@
 - **Corrections to prior audit claims (verified, not changed)**: `ctxClearPad`/`ctxUnselectArea` already wired; `POOL_SIZE` live (gain pool); modal focus trap survives `innerHTML` rebuilds; `normalizeToArrayBuffer` always-copy is load-bearing (tests enforce it — zero-copy prototype reverted).
 - **Deferred with reason**: `db:search` FTS5 (native binding is Electron-ABI; system Node can't execute it here — shipping an untested migration risks a corrupt library); `normalizeToArrayBuffer` zero-copy (see above).
 
+### ➕ 2026-09-11 follow-up (verified: `tsc --noEmit` clean, Jest 99/99)
+
+- **MIDI (`js/midi.ts`)**: device dropdown change persists the device name too (id-only persist broke name-based re-pairing after replug with a new id).
+- **State (`js/state.ts`)**: `subscribe()` warns on unknown keys and returns a no-op unsubscriber instead of creating dead entries that never fire.
+- **Playlist dialog (`index.html`)**: file input `accept` leads with the supported extensions (`.wav,.mp3,.ogg,.flac,.m4a,.aac,.webm`) before the `audio/*` fallback.
+- **Player (`js/player.ts`)**: seeking into an unbuffered fresh blob toasts instead of silently ignoring the drag; empty-deck and mid-blend stays silent.
+- **Verified stale, not changed**: `utils.throttle` returns the last result (never `undefined`) — prior claim was wrong.
+
 ## [Unreleased] — "Paranoid Audit Round 3 (2026-09-08)"
 
 ### 🛠️ 2026-09-08 batch (verified: `tsc --noEmit` clean, Jest 93/93 with `--coverage=false`)
