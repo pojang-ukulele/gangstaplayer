@@ -67,7 +67,22 @@ class RecorderProcessor extends BaseProcessor {
     this.port.postMessage({ type: 'DATA', payload }, payload.map(ch => ch.buffer));
   }
 
-  process(inputs: Float32Array[][], _outputs: Float32Array[][], _parameters: Record<string, any>) {
+  process(inputs: Float32Array[][], outputs: Float32Array[][], _parameters: Record<string, any>) {
+    // Passthrough first: the client holds node→zeroGain→destination so the
+    // worklet never runs sink-less (suspended worklets capture nothing).
+    // Muted downstream — capture behavior is unchanged.
+    try {
+      const src = inputs[0];
+      const dst = outputs[0];
+      if (src && dst) {
+        const m = Math.min(src.length, dst.length);
+        for (let c = 0; c < m; c++) {
+          const s = src[c];
+          const d = dst[c];
+          if (s && d) d.set(s.subarray(0, Math.min(s.length, d.length)));
+        }
+      }
+    } catch { /* capture path below still runs */ }
     if (!this.isRecording) return true;
 
     const input = inputs[0];

@@ -1,6 +1,7 @@
-import { audioCtx, ensureAudio } from './audio';
+import { audioCtx, ensureAudio, onAudioRebuilt } from './audio';
 import { bufferToWaveWorker } from './worker-client';
 import { logger } from './logger';
+import { toast } from './toast';
 
 export class HighFidelityRecorder {
     private node: AudioWorkletNode | null = null;
@@ -15,6 +16,18 @@ export class HighFidelityRecorder {
     private _capped = false;
     /** Serializes stop() — concurrent stops corrupted the ack handler. */
     private _stopping = false;
+    // Take-start tap ownership: the {source, context, node} live at start().
+    // stop()/dispose() disconnect THAT stored tap, never the current
+    // _source() (which may belong to a rebuilt chain mid-take).
+    private _takeSource: AudioNode | null = null;
+    private _takeCtx: AudioContext | null = null;
+    private _takeNode: AudioWorkletNode | null = null;
+    /** Set when a mid-take rebuild killed the tap — stop() rejects loudly. */
+    private _tapDead = false;
+    private _tapDeadReason = '';
+    /** Zero-gain sink: node→sink→destination keeps the worklet alive
+     * (a sink-less worklet can suspend and capture nothing). */
+    private _sink: GainNode | null = null;
 
     private readonly _resolveSource: () => AudioNode | null;
 
@@ -27,15 +40,71 @@ export class HighFidelityRecorder {
         this._resolveSource = typeof sourceNode === 'function'
             ? sourceNode as () => AudioNode | null
             : () => sourceNode as AudioNode;
+        // Auto-retap path: an ensureAudio() rebuild mid-take orphans the tap.
+        // When idle this is a no-op (next start() resolves fresh); mid-take
+        // the handler re-attaches to the new chain or fails the take loudly.
+        try { onAudioRebuilt(() => this._onRebuilt()); } catch { /* headless — ignore */ }
     }
 
     private _source(): AudioNode | null {
         try { return this._resolveSource(); } catch { return null; }
     }
 
+    /** Rebuild handler: retap mid-take onto the new chain, or fail loudly. */
+    private _onRebuilt(): void {
+        if (!this.accepting) return; // idle — next start() resolves the tap fresh
+        if (this._doRetap()) {
+            // Retap succeeded — re-point take ownership at the live chain.
+            try { this._takeSource = this._source(); } catch { /* keep old */ }
+            try { this._takeCtx = audioCtx; } catch { /* keep old */ }
+            logger.warn('[Recorder] Tap re-attached after audio rebuild mid-take');
+            return;
+        }
+        // Retap failed: the take is stuck on a dead context. Stop intake and
+        // mark it — stop() rejects instead of handing back a silent WAV.
+        this._tapDead = true;
+        this._tapDeadReason = 'rebuild';
+        this.accepting = false;
+        try { toast.error('RECORDING TAP LOST (AUDIO REBUILD) — TAKE DISCARDED'); } catch { /* ignore */ }
+        logger.error('[Recorder] Audio rebuilt mid-take and retap failed — take marked dead');
+    }
+
+    /** Best-effort zero-gain sink so the worklet never runs sink-less. */
+    private _attachSink(): void {
+        try {
+            const actx = audioCtx as AudioContext | null;
+            if (!this.node || !actx || typeof actx.createGain !== 'function' || !actx.destination) return;
+            try { this._sink?.disconnect(); } catch { /* ignore */ }
+            const sink = actx.createGain();
+            sink.gain.value = 0;
+            this.node.connect(sink as unknown as AudioNode);
+            (sink as GainNode).connect(actx.destination);
+            this._sink = sink;
+        } catch { /* headless/test env — capture path still works without a sink */ }
+    }
+
+    /** Reconnect node to the current source (+ sink). Mid-take capable. */
+    private _doRetap(): boolean {
+        const src = this._source();
+        if (!this.node || !src) return false;
+        try { this.node.disconnect(); } catch { /* ignore */ }
+        try { src.disconnect(this.node as unknown as AudioNode); } catch { /* old chain — ignore */ }
+        try {
+            src.connect(this.node);
+            this._attachSink();
+            this.connected = true;
+            return true;
+        } catch {
+            this.connected = false;
+            return false;
+        }
+    }
+
     /**
      * Re-attach the tap to the current master chain after an AudioContext
-     * rebuild. Refused mid-take (would split the capture across contexts).
+     * rebuild. Refused mid-take (would split the capture across contexts) —
+     * mid-take rebuilds are handled by the onAudioRebuilt auto-retap path
+     * instead, which fails the take loudly when re-attachment is impossible.
      * Returns true when tapped.
      */
     retap(): boolean {
@@ -43,18 +112,7 @@ export class HighFidelityRecorder {
             logger.warn('[Recorder] retap refused: take in progress');
             return false;
         }
-        const src = this._source();
-        if (!this.node || !src) return false;
-        try { this.node.disconnect(); } catch { /* ignore */ }
-        try { src.disconnect(this.node as unknown as AudioNode); } catch { /* old chain — ignore */ }
-        try {
-            src.connect(this.node);
-            this.connected = true;
-            return true;
-        } catch {
-            this.connected = false;
-            return false;
-        }
+        return this._doRetap();
     }
 
     async init(): Promise<void> {
@@ -94,6 +152,9 @@ export class HighFidelityRecorder {
             if (!src) throw new Error('Master tap unavailable');
             src.connect(this.node);
             this.connected = true;
+            // Sink-less worklets can suspend and capture nothing — keep
+            // node→zeroGain→destination alongside the tap (best-effort).
+            this._attachSink();
             logger.info('[Recorder] High-Fidelity Recorder initialized');
         } catch (e) {
             logger.error('[Recorder] Initialization failed', e);
@@ -123,8 +184,16 @@ export class HighFidelityRecorder {
         if (!this.connected || !this._source()) {
             throw new Error('Recorder has no master tap (audio unavailable)');
         }
+        this._attachSink();
         this.chunks = [];
         this._capped = false;
+        // Take-start ownership: stop()/dispose() tear down THIS tap, even if
+        // the live chain is rebuilt mid-take.
+        try { this._takeSource = this._source(); } catch { this._takeSource = null; }
+        try { this._takeCtx = audioCtx; } catch { this._takeCtx = null; }
+        this._takeNode = this.node;
+        this._tapDead = false;
+        this._tapDeadReason = '';
         this.accepting = true;
         // Lock the rate for this take — compileWav stamps the header from
         // this value even if the context is rebuilt mid-take.
@@ -175,18 +244,46 @@ export class HighFidelityRecorder {
         this.accepting = false;
         const wasCapped = this._capped;
         this._capped = false;
+        const wasDead = this._tapDead;
+        const deadReason = this._tapDeadReason;
+        this._tapDead = false;
+        this._tapDeadReason = '';
+        // Snapshot + clear synchronously: bufferToWaveWorker transfers
+        // (neuters) the assembled copies, so a racing second stop can only
+        // ever see the fresh empty array — never a neutered buffer.
         const captured = this.chunks;
         this.chunks = [];
-        if (wasCapped) logger.warn('[Recorder] Take hit the 30-minute cap — tail beyond the cap was not captured');
 
-        // Disconnect the tap while idle — a permanently connected worklet
-        // processes every quantum forever after the first take.
+        // Disconnect the TAKE's stored tap while idle — a permanently
+        // connected worklet processes every quantum forever after the first
+        // take. Uses take-start ownership, not the current live source.
         try {
-            if (this.node && this.connected) {
-                try { this._source()?.disconnect(this.node); } catch { /* old chain — ignore */ }
+            const takeNode = this._takeNode ?? this.node;
+            if (takeNode && this.connected) {
+                try { this._takeSource?.disconnect(takeNode as unknown as AudioNode); } catch { /* old chain — ignore */ }
+                try { takeNode.disconnect(); } catch { /* ignore */ }
                 this.connected = false;
             }
+            try { this._sink?.disconnect(); } catch { /* ignore */ }
+            this._sink = null;
         } catch { /* already disconnected */ }
+        this._takeSource = null;
+        this._takeCtx = null;
+        this._takeNode = null;
+
+        // Loud failures — never hand back a silent/partial WAV as success.
+        if (wasDead) {
+            const msg = `Recorder tap went stale mid-take (${deadReason || 'rebuild'}) — take is dead, no data recorded`;
+            try { toast.error('RECORDING TAP LOST — TAKE DISCARDED'); } catch { /* ignore */ }
+            logger.error(`[Recorder] ${msg}`);
+            throw new Error(msg);
+        }
+        if (wasCapped) {
+            const msg = 'TAKE_TOO_LONG: Recording exceeded the 30-minute block cap — tail beyond the cap was not captured';
+            try { toast.error('RECORDING TOO LONG (30MIN CAP) — TAKE DISCARDED'); } catch { /* ignore */ }
+            logger.error(`[Recorder] ${msg}`);
+            throw new Error(msg);
+        }
 
         const result = await this.compileWav(captured);
         this._stopping = false;
@@ -203,7 +300,7 @@ export class HighFidelityRecorder {
         // ≈ 86.4M samples/ch ≈ 84k chunks. Cap blocks + total PCM samples.
         const MAX_BLOCKS = 90000;
         const MAX_SAMPLES = 90 * 1000000;
-        if (chunks.length > MAX_BLOCKS) throw new Error('Recording too long (30min cap)');
+        if (chunks.length > MAX_BLOCKS) throw new Error('TAKE_TOO_LONG: Recording too long (30min block cap)');
 
         const firstValid = chunks.find(b => Array.isArray(b) && b.length > 0);
         const numChannels = firstValid ? firstValid.length : 0;
@@ -221,7 +318,7 @@ export class HighFidelityRecorder {
         }
         const finalLen = exactLens[0] ?? 0;
         if (finalLen <= 0) throw new Error('No data recorded');
-        if (finalLen > MAX_SAMPLES) throw new Error('Recording too long (30min cap)');
+        if (finalLen > MAX_SAMPLES) throw new Error('TAKE_TOO_LONG: Recording too long (30min sample cap)');
 
         const channels: Float32Array[] = [];
         for (let channel = 0; channel < numChannels; channel++) {
@@ -238,6 +335,18 @@ export class HighFidelityRecorder {
             channels.push(channelData);
         }
         if (finalLen <= 0) throw new Error('No data recorded');
+        // Dead/stale taps capture exact silence — handing that back as a WAV
+        // looks like a successful take. Fail loudly instead (never silent WAV).
+        let peak = 0;
+        for (const ch of channels) {
+            for (let i = 0; i < ch.length; i++) {
+                const a = Math.abs(ch[i]);
+                if (a > peak) peak = a;
+                if (peak > 0) break;
+            }
+            if (peak > 0) break;
+        }
+        if (peak === 0) throw new Error('Recorder captured silent audio (dead/stale tap?) — no data recorded');
 
         // Build a minimal AudioBuffer-like object for the worker (avoids AudioBuffer + round-trip)
         // Use the take-start rate, not the live context rate (may have switched mid-take).
@@ -263,10 +372,21 @@ export class HighFidelityRecorder {
         if (this.accepting) logger.warn('[Recorder] dispose() during take — capture discarded');
         this.accepting = false;
         this._capped = false;
+        this._tapDead = false;
+        this._tapDeadReason = '';
         this.connected = false;
+        // Tear down the take's stored tap (not the current live source).
+        const takeNode = this._takeNode ?? this.node;
+        if (takeNode) {
+            try { (this._takeSource ?? this._source())?.disconnect(takeNode as unknown as AudioNode); } catch { /* ignore */ }
+            try { takeNode.disconnect(); } catch { /* ignore */ }
+        }
+        try { this._sink?.disconnect(); } catch { /* ignore */ }
+        this._sink = null;
+        this._takeSource = null;
+        this._takeCtx = null;
+        this._takeNode = null;
         if (this.node) {
-            try { this._source()?.disconnect(this.node); } catch { /* ignore */ }
-            try { this.node.disconnect(); } catch { /* ignore */ }
             this.node = null;
         }
         this.chunks = [];

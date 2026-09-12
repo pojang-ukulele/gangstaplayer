@@ -530,9 +530,14 @@ function clampTempoRate(r: number): number {
     return Number.isFinite(r) ? Math.min(4, Math.max(0.25, r)) : 1;
 }
 
-/** Abort any armed blend so delete/stop can't be resurrected by a stale timer. */
-export function abortCrossfade(): void {
+/** Abort any armed blend so delete/stop can't be resurrected by a stale timer.
+ * crossfadeGen IS the crossfadeToken: bumped on every startCrossfade, abort,
+ * and stop so all async continuations (loadAsync, play, loadTrack chains)
+ * can bail when stale. A second blend can start immediately after abort
+ * because the flag + lock reset here. */
+export function abortCrossfade(reason?: string): void {
     crossfadeGen++;
+    if (reason) logger.debug(`[AutoMix] Crossfade aborted: ${reason}`);
     crossfadeRateRatio = 1;
     if (crossfadeTimer) { clearTimeout(crossfadeTimer); crossfadeTimer = null; }
     try { engine.crossfade.audio.pause(); } catch { /* ignore */ }
@@ -646,6 +651,12 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
     // background for future mixes; live AI-stem playback is NOT implemented
     // (checkbox previously implied it was). Guard indices — currentTrackIndex
     // can be -1 on an empty/fresh playlist.
+    // Safety: the AI lookup + rate setup + EQ/filter/gain automation below
+    // run inside one try — any throw aborts the blend (incoming stopped,
+    // URL revoked, flag + lock reset) and rethrows so callers see the
+    // failure instead of deadlocking with isCrossfadeInProgress stuck true.
+    // Blend sound is unchanged; this only adds failure cleanup.
+    try {
     const aiOn = typeof isAiEnabled === 'function' ? isAiEnabled() : settings.autoMix.enableAI;
     if (aiOn && window.sonetra) {
         const cur = playlist[state.currentTrackIndex];
@@ -767,6 +778,13 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
         if (gen !== crossfadeGen) return;
         finishCrossfade(nextIdx, expectedId);
     }, duration * 1000);
+    } catch (e) {
+        // Abort only if this blend is still current — a concurrent abort/stop
+        // already bumped the token and a newer blend may be running; aborting
+        // again would clobber it. Rethrow preserves the rejection for callers.
+        if (myGen === crossfadeGen) abortCrossfade('automation-failed');
+        throw e;
+    }
 }
 
 function finishCrossfade(nextIndex: number, expectedId?: string): void {
@@ -785,7 +803,10 @@ function finishCrossfade(nextIndex: number, expectedId?: string): void {
         updateControlsLock(false);
         if (setBlendingIndexFn) setBlendingIndexFn(-1);
         if (autoMixBtn) autoMixBtn.classList.remove('blending');
-        loadTrack(nextIndex).then(playTrack).catch(() => undefined);
+        // STOP-during-load guard: a stop/abort bumps the token while
+        // loadTrack is in flight; the stale continuation must not resurrect.
+        const _tok = crossfadeGen;
+        loadTrack(nextIndex).then(() => { if (_tok !== crossfadeGen) return; playTrack(); }).catch(() => undefined);
         return;
     }
 
@@ -840,6 +861,9 @@ export function playTrack(): void {
 
 async function playTrackAsync(): Promise<void> {
     if (state.isCrossfadeInProgress || !state.playlist.length || !engine.main.audio) return;
+    // Token against STOP-during-load resurrection: stop/abort bump it, so any
+    // continuation after an await bails instead of replaying a dead deck.
+    const _tok = crossfadeGen;
     // A closed-context rebuild swaps in an empty <audio> element (C7) — the
     // old blob: URL is gone, so re-load the current track instead of playing
     // silence while the UI claims playback.
@@ -847,7 +871,7 @@ async function playTrackAsync(): Promise<void> {
         const idx = state.currentTrackIndex;
         if (idx >= 0 && idx < state.playlist.length) {
             logger.warn('[Player] Deck rebuilt — re-loading current track');
-            void loadTrack(idx).then(() => playTrack()).catch(() => undefined);
+            void loadTrack(idx).then(() => { if (_tok !== crossfadeGen) return; playTrack(); }).catch(() => undefined);
         } else {
             toast.error("AUDIO DEVICE CHANGED — RELOAD A TRACK");
         }
@@ -856,9 +880,11 @@ async function playTrackAsync(): Promise<void> {
     // Chain play() after the resume attempt (H12): firing play() into a
     // suspended context rejects and leaves the UI claiming playback.
     try { await resumeAudioContext(); } catch { /* play attempt still runs below */ }
+    if (_tok !== crossfadeGen) return;
     if (state.isCrossfadeInProgress) return;
     try {
         await engine.main.audio.play();
+        if (_tok !== crossfadeGen) return;
         state.update({ isPlaying: true });
         updateControlsLock(false);
     } catch (e) {
@@ -876,26 +902,15 @@ export function stopPlayback(): void {
     // Abort any pending blend first so finishCrossfade can't resurrect audio.
     // Also invalidate in-flight loadTrack decodes that would swap title/BPM under a stopped UI.
     _loadTrackId++;
-    crossfadeGen++;
-    if (crossfadeTimer) { clearTimeout(crossfadeTimer); crossfadeTimer = null; }
+    // Shared abort path: bumps the token (stale loadTrack/play continuations
+    // bail), clears the timer, stops the incoming deck, revokes its URL,
+    // cancels automation via reset, and resets flag + lock.
+    abortCrossfade('stop');
     try { engine.main.audio.pause(); } catch { /* ignore */ }
     try { engine.main.audio.currentTime = 0; } catch { /* sourceless element — ignore (M9) */ }
-    try { engine.crossfade.audio.pause(); } catch { /* ignore */ }
     try { engine.crossfade.audio.src = ""; } catch { /* ignore */ }
 
-    // Cancel any in-flight crossfade automation — otherwise scheduled gain/EQ
-    // ramps keep running and the next replay starts muted or swept.
-    engine.main.reset();
-    engine.crossfade.reset();
-
-    // The crossfade source is dead now; reclaim its blob URL
-    if (crossfadeBlobUrl) {
-        revokeLater(crossfadeBlobUrl);
-        crossfadeBlobUrl = "";
-    }
-
-    state.update({ isPlaying: false, isCrossfadeInProgress: false });
-    updateControlsLock(false);
+    state.update({ isPlaying: false });
     // stopPlayback invalidates in-flight loadTrack generations, which makes
     // hideSpinnerIfCurrent(loadId) a no-op for the superseded load — the
     // spinner would stick forever on stop-during-slow-load. Hide directly.
@@ -967,7 +982,8 @@ function wireChannelHandlers(el: HTMLAudioElement): void {
                 if (state.loopMode === 'all') nextIndex = 0;
                 else { stopPlayback(); return; }
             }
-            loadTrack(nextIndex).then(() => playTrack()).catch(() => undefined);
+            const _autoTok = crossfadeGen;
+            loadTrack(nextIndex).then(() => { if (_autoTok !== crossfadeGen) return; playTrack(); }).catch(() => undefined);
             return;
         }
         if (!state.isAutoMixEnabled && !state.isCrossfadeInProgress) {
@@ -984,7 +1000,8 @@ function wireChannelHandlers(el: HTMLAudioElement): void {
                     if (state.loopMode === 'all') nextIndex = 0;
                     else { stopPlayback(); return; }
                 }
-                loadTrack(nextIndex).then(() => playTrack()).catch(() => undefined);
+                const _advTok = crossfadeGen;
+                loadTrack(nextIndex).then(() => { if (_advTok !== crossfadeGen) return; playTrack(); }).catch(() => undefined);
             }
         }
     });
@@ -1031,7 +1048,8 @@ function setupTransportHandlers(): void {
             if (state.isAutoMixEnabled) void startCrossfade(null, settings.autoMix.btnDuration).catch(() => undefined);
             else {
                 const nextIdx = (state.currentTrackIndex + 1) % state.playlist.length;
-                loadTrack(nextIdx).then(playTrack).catch(() => undefined);
+                const _nextTok = crossfadeGen;
+                loadTrack(nextIdx).then(() => { if (_nextTok !== crossfadeGen) return; playTrack(); }).catch(() => undefined);
             }
         };
     }
@@ -1043,7 +1061,8 @@ function setupTransportHandlers(): void {
             if (state.isAutoMixEnabled) void startCrossfade((state.currentTrackIndex - 1 + state.playlist.length) % state.playlist.length, settings.autoMix.btnDuration).catch(() => undefined);
             else {
                 const prevIdx = (state.currentTrackIndex - 1 + state.playlist.length) % state.playlist.length;
-                loadTrack(prevIdx).then(playTrack).catch(() => undefined);
+                const _prevTok = crossfadeGen;
+                loadTrack(prevIdx).then(() => { if (_prevTok !== crossfadeGen) return; playTrack(); }).catch(() => undefined);
             }
         };
     }
