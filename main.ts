@@ -1,6 +1,7 @@
 import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron';
 import * as path from 'path';
 import * as fs from 'fs';
+import { createHash } from 'crypto';
 
 import sonetraBridge, { addAllowedAudioFile, isAllowedAudioDirForPath, isAllowedAudioFile } from './sonetra-bridge';
 import { getDbManager, initDbManager } from './db-manager';
@@ -9,15 +10,31 @@ import { MAX_FILE_SIZE_BYTES, VALID_AUDIO_EXTENSIONS } from './js/constants';
 
 const READABLE_EXTENSIONS = new Set([...VALID_AUDIO_EXTENSIONS, 'json']);
 
-// Transition cache for pre-computed transitions (byte-budgeted)
+// Transition cache for pre-computed transitions (byte-budgeted).
+// Keys are 64-char SHA-256 hex from normalizeCacheKey (fixed length,
+// poison-resistant: an unvalidated/giant renderer string can never become a
+// Map key or evict legit entries). Byte cap 200MB + 50-entry cap enforced
+// here via oldest-first (LRU-insertion) eviction.
 const MAX_CACHE_ENTRIES = 50;
 const MAX_CACHE_BYTES = 200 * 1024 * 1024;
 const transitionCache = new Map<string, { buffer: Buffer; bytes: number }>();
 let transitionCacheBytes = 0;
 
 function addToCache(key: string, value: Buffer) {
+  // Poison resistance: only hashed keys enter the cache. Anything else
+  // (raw paths, oversized strings) is rejected before it can evict legit
+  // entries via LRU pressure.
+  if (typeof key !== 'string' || !/^[0-9a-f]{64}$/.test(key)) return;
+  if (!value || !(value instanceof Buffer)) return;
   const bytes = value.byteLength;
+  if (!Number.isFinite(bytes) || bytes <= 0) return;
   if (bytes > MAX_CACHE_BYTES) return;
+  // Overwrite accounting: re-caching the same key must not double-count.
+  const existing = transitionCache.get(key);
+  if (existing) {
+    transitionCacheBytes -= existing.bytes;
+    transitionCache.delete(key);
+  }
   while (
     (transitionCache.size >= MAX_CACHE_ENTRIES || transitionCacheBytes + bytes > MAX_CACHE_BYTES) &&
     transitionCache.size > 0
@@ -453,14 +470,26 @@ function registerIpcHandlers(): void {
 
   // Secure File System Handlers
   const inFlightPrecompute = new Set<string>();
-  const normalizeCacheKey = (a: string, b: string): string => {
-    const sa = String(a ?? '').slice(0, 32760);
-    const sb = String(b ?? '').slice(0, 32760);
+  const normalizeCacheKey = (a: string, b: string): string | null => {
+    // Length-bound + validated: non-strings, empties, null bytes, and
+    // overlong inputs never become keys. The normalized pair is hashed to a
+    // fixed 64-char key so giant paths can't bloat the Map and crafted keys
+    // can't collide with / evict legit entries (poison resistance).
+    if (typeof a !== 'string' || typeof b !== 'string') return null;
+    if (!a || !b || a.length > 32760 || b.length > 32760) return null;
+    if (a.includes('\0') || b.includes('\0')) return null;
+    const sa = a.slice(0, 32760);
+    const sb = b.slice(0, 32760);
     const norm = (s: string): string => {
       const r = path.resolve(s);
       return process.platform === 'win32' || process.platform === 'darwin' ? r.toLowerCase() : r;
     };
-    return `${norm(sa)}||${norm(sb)}`;
+    const raw = `${norm(sa)}||${norm(sb)}`;
+    try {
+      return createHash('sha256').update(raw).digest('hex');
+    } catch {
+      return null;
+    }
   };
   function checkCacheKeyArgs(a: unknown, b: unknown): boolean {
     return typeof a === 'string' && typeof b === 'string'
@@ -797,9 +826,15 @@ function registerIpcHandlers(): void {
       return { success: false, error: 'Rate limited' };
     }
     const cacheKey = normalizeCacheKey(track1Path, track2Path);
+    if (!cacheKey) {
+      return { success: false, error: 'Bad paths' };
+    }
     const cached = transitionCache.get(cacheKey);
     if (cached) {
-      // Cap IPC clone size — 200MB Buffer clones freeze the renderer.
+      // 50MB IPC cap (documented): Electron structured-clones the Buffer
+      // across IPC — a 200MB cached transition would freeze/OOM the
+      // renderer. Cache may hold up to 200MB total, but single IPC replies
+      // are capped at 50MB; larger entries require re-streaming.
       if (cached.bytes > 50 * 1024 * 1024) {
         return { success: false, error: 'Cached transition too large for IPC' };
       }
@@ -816,6 +851,9 @@ function registerIpcHandlers(): void {
       return { success: false, error: 'Rate limited' };
     }
     const cacheKey = normalizeCacheKey(track1Path, track2Path);
+    if (!cacheKey) {
+      return { success: false, error: 'Bad paths' };
+    }
     if (transitionCache.has(cacheKey)) {
       return { success: true, cached: true };
     }

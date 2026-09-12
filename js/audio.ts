@@ -138,13 +138,14 @@ export async function initWorklets(): Promise<void> {
     // Bound registration: a hung file:// fetch previously stalled
     // engine.initWorklets retries forever with no timeout.
     const withTimeout = <T>(p: Promise<T>, ms: number, label: string): Promise<T> =>
-        Promise.race([
-            p,
-            new Promise<T>((_, reject) => {
-                const t = setTimeout(() => reject(new Error(`Worklet timeout: ${label}`)), ms);
-                (t as any)?.unref?.();
-            }),
-        ]);
+        new Promise<T>((resolve, reject) => {
+            const t = setTimeout(() => reject(new Error(`Worklet timeout: ${label}`)), ms);
+            (t as any)?.unref?.();
+            p.then(
+                (v) => { clearTimeout(t); resolve(v); },
+                (e) => { clearTimeout(t); reject(e); }
+            );
+        });
     try {
         await withTimeout(audioCtx.audioWorklet.addModule(workletUrl('gangsta-processor.js')), 10000, 'gangsta-processor');
         await withTimeout(audioCtx.audioWorklet.addModule(workletUrl('recorder-processor.js')), 10000, 'recorder-processor');

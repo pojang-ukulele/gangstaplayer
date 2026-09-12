@@ -17,12 +17,25 @@ interface PendingRequest {
     reject: (err: Error) => void;
 }
 
-function workerUrl(): string {
+function workerUrlCandidates(): string[] {
+    // file:// + asar: document.baseURI in a packaged Electron renderer is a
+    // file:// URL inside app.asar where `new Worker()` cannot load scripts
+    // left packed. The build unpacks js/workers (asarUnpack) so the resolved
+    // file URL loads; dev uses the http/baseURI URL. Try every candidate in
+    // order — spawnWorker fails loud (WORKER_UNAVAILABLE) when all miss.
+    const out: string[] = [];
     try {
         const base = typeof document !== 'undefined' && document.baseURI ? document.baseURI : undefined;
-        if (base) return new URL('js/workers/audio-worker.js', base).toString();
+        if (base) {
+            try { out.push(new URL('js/workers/audio-worker.js', base).toString()); } catch { /* next */ }
+        }
     } catch { /* fall through */ }
-    return 'js/workers/audio-worker.js';
+    out.push('js/workers/audio-worker.js');
+    return [...new Set(out)];
+}
+
+function workerUrl(): string {
+    return workerUrlCandidates()[0] || 'js/workers/audio-worker.js';
 }
 
 let worker: Worker | null = null;
@@ -46,33 +59,34 @@ function noteSpawnFailure(): void {
 function spawnWorker(): Worker {
     // Resolve lazily (not at import time) so packaged file:// baseURIs and
     // late <base> changes don't freeze a broken URL forever.
-    const url = workerUrl();
-    let w: Worker;
-    try {
-        w = new Worker(url);
-    } catch (e) {
-        if (url !== 'js/workers/audio-worker.js') {
-            try {
-                w = new Worker('js/workers/audio-worker.js');
-            } catch (e2) {
-                noteSpawnFailure();
-                throw e2;
-            }
-        } else {
-            noteSpawnFailure();
-            throw e;
+    const candidates = workerUrlCandidates();
+    let lastErr: unknown = null;
+    let w: Worker | null = null;
+    for (const url of candidates) {
+        try {
+            w = new Worker(url);
+            break;
+        } catch (e) {
+            lastErr = e;
         }
+    }
+    if (!w) {
+        noteSpawnFailure();
+        throw new Error(`WORKER_UNAVAILABLE: audio worker failed to spawn (${candidates.join(', ')}): ${lastErr instanceof Error ? lastErr.message : String(lastErr)}`);
     }
 
     w!.onmessage = (e: MessageEvent) => {
         // A healthy response resets the crash counter.
         spawnFailCount = 0;
-        const { type, bpm, blob, id } = e.data || {};
+        const { type, bpm, confidence, blob, id } = e.data || {};
+        // Id-less replies are dropped without leaking: no pending entry is
+        // touched, nothing is resolved or rejected.
+        if (id === undefined || id === null) return;
         const request = pendingRequests.get(id);
         if (!request) return;
         pendingRequests.delete(id);
         if (type === 'BPM_RESULT' && request.kind === 'BPM') {
-            request.resolve(typeof bpm === 'number' ? bpm : 0);
+            request.resolve(typeof bpm === 'number' ? { bpm, confidence: typeof confidence === 'string' ? confidence : 'none' } : { bpm: 0, confidence: 'none' });
         } else if (type === 'WAVE_RESULT' && request.kind === 'WAVE') {
             request.resolve(blob);
         } else {
@@ -93,6 +107,12 @@ function spawnWorker(): Worker {
         console.error('[WorkerClient] Audio worker message error:', err);
         // Structured-clone failure (e.g. neutered buffer) is known instantly —
         // previously pending ids hung until the 30s timeout despite that.
+        // Null the worker: a deserializing worker is untrustworthy for queued
+        // jobs — the next call spawns fresh instead of timing out one by one.
+        if (worker === w) {
+            try { w!.terminate(); } catch { /* ignore */ }
+            worker = null;
+        }
         failAllPending(new Error('Audio worker message error: response could not be deserialized'));
     };
 
@@ -110,7 +130,9 @@ function failAllPending(err: Error): void {
 
 function getWorker(): Worker {
     if (Date.now() < spawnCoolUntil) {
-        throw new Error('Audio worker cooling down after repeated crashes');
+        // Fail loud (not a silent cooldown): callers surface this to toast/log
+        // instead of hanging until a timeout.
+        throw new Error('WORKER_UNAVAILABLE: audio worker cooling down after repeated crashes');
     }
     if (!worker) {
         console.warn('[WorkerClient] Spawning audio worker');
@@ -165,7 +187,23 @@ function isAudioBufferLike(v: unknown): v is AudioBuffer {
         && typeof (v as AudioBuffer).numberOfChannels === 'number';
 }
 
-export function detectBPMWorker(audioBuffer: AudioBuffer, options?: { threshold?: number; minStepSeconds?: number }): Promise<number> {
+export type BpmConfidence = 'high' | 'medium' | 'low' | 'none';
+export interface BpmAnalysis {
+    /** BPM value, or null when the analysis needs review (low-confidence/-1). Never 0-as-analyzed. */
+    bpm: number | null;
+    confidence: BpmConfidence;
+    /** True when callers must retry/other-means and must NOT cache as analyzed 0. */
+    needsReview: boolean;
+}
+
+/**
+ * Detect BPM with a confidence flag (mono fast path: channel-0, 90s cap).
+ * Low-confidence and -1 results resolve to { bpm: null, needsReview: true }
+ * so callers retry instead of caching a bogus analyzed 0. Octave-fold limits:
+ * the worker corrects one 2x octave error into 60-180 (usable 30-210);
+ * triplets and <30/>210 extremes are needs-review by design.
+ */
+export function detectBPMWithConfidence(audioBuffer: AudioBuffer, options?: { threshold?: number; minStepSeconds?: number }): Promise<BpmAnalysis> {
     if (!isAudioBufferLike(audioBuffer)) return Promise.reject(new Error('Invalid AudioBuffer'));
     // Cap analysis to the first ~90s mono — full-length DJ mixes previously
     // copied ~600MB into the worker and always timed out.
@@ -173,6 +211,9 @@ export function detectBPMWorker(audioBuffer: AudioBuffer, options?: { threshold?
     if (!Number.isFinite(sr) || sr < 3000 || sr > 192000) {
         return Promise.reject(new Error('Invalid sample rate'));
     }
+    // Copy before transfer: getChannelData returns a live view into the
+    // AudioBuffer — transferring it would neuter the caller's buffer for
+    // later decode/play. This transient copy is the safe price.
     const full = audioBuffer.getChannelData(0);
     const maxLen = Math.min(full.length, Math.floor(sr * 90));
     const data = new Float32Array(full.subarray(0, maxLen));
@@ -189,7 +230,23 @@ export function detectBPMWorker(audioBuffer: AudioBuffer, options?: { threshold?
             minStepSeconds: typeof minStep === 'number' && minStep > 0 && minStep <= 5 ? minStep : BPM_MIN_STEP_SECONDS
         },
         id
-    }), [data.buffer]).then((bpm) => typeof bpm === 'number' && bpm > 0 ? bpm : 0);
+    }), [data.buffer]).then((res: { bpm?: number; confidence?: BpmConfidence }) => {
+        const bpm = typeof res?.bpm === 'number' ? res.bpm : 0;
+        const confidence: BpmConfidence = res?.confidence === 'high' || res?.confidence === 'medium' || res?.confidence === 'low' ? res.confidence : 'none';
+        if (bpm <= 0 || confidence === 'low' || confidence === 'none') {
+            return { bpm: null, confidence, needsReview: true };
+        }
+        return { bpm, confidence, needsReview: false };
+    });
+}
+
+/**
+ * Legacy BPM entry (kept for existing deck/playlist callers): resolves a
+ * number, 0 when analysis needs review. New code should prefer
+ * detectBPMWithConfidence() and skip caching needs-review results.
+ */
+export function detectBPMWorker(audioBuffer: AudioBuffer, options?: { threshold?: number; minStepSeconds?: number }): Promise<number> {
+    return detectBPMWithConfidence(audioBuffer, options).then((r) => (r.needsReview || r.bpm === null ? 0 : r.bpm));
 }
 /**
  * Convert an AudioBuffer (or pre-built channel object) to a WAV Blob using a worker.
@@ -218,11 +275,24 @@ export function bufferToWaveWorker(audioBuffer: AudioBuffer | { numberOfChannels
             channels
         };
     } else {
-        // Already in transfer format (from recorder optimization)
-        bufferPayload = audioBuffer;
+        // Already in transfer format (from recorder optimization) — copy
+        // before transfer so the caller's Float32Arrays survive (transfer
+        // neuters the sent buffer; sending the caller's view would blank
+        // their live recording data).
+        const channels: Float32Array[] = [];
         for (const ch of audioBuffer.channels) {
-            transferables.push(ch.buffer);
+            if (!ch || ch.length === 0) {
+                return Promise.reject(new Error('Encode buffer empty or already transferred'));
+            }
+            const copy = new Float32Array(ch.subarray(0, Math.min(ch.length, safeLen)));
+            channels.push(copy);
+            transferables.push(copy.buffer);
         }
+        bufferPayload = {
+            numberOfChannels: audioBuffer.numberOfChannels,
+            sampleRate: audioBuffer.sampleRate,
+            channels
+        };
     }
     // Neutered (already-transferred) inputs decode to 0-length and fail
     // inside the worker as 'Invalid length' (C12) — fail here with a cause.

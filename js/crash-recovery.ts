@@ -114,6 +114,79 @@ function removeFromStorage(key: string): void {
     }
 }
 
+// Archive retention: unbounded `_archive_${Date.now()}` keys previously grew
+// without limit against the ~5MB quota. Keep newest 3, expire after 14d.
+export const MAX_SNAPSHOT_ARCHIVES = 3;
+export const SNAPSHOT_ARCHIVE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+function archivePrefix(): string {
+    return `${STORAGE_KEY}_archive_`;
+}
+function listArchiveKeys(): string[] {
+    const found = new Set<string>();
+    try {
+        const ls = localStorage as unknown as { length?: unknown; key?: (i: number) => string | null };
+        if (typeof ls.length === 'number' && typeof ls.key === 'function') {
+            for (let i = 0; i < (ls.length as number); i++) {
+                try {
+                    const k = ls.key(i);
+                    if (typeof k === 'string' && k.startsWith(archivePrefix())) found.add(k);
+                } catch { /* ignore */ }
+            }
+        }
+    } catch { /* ignore */ }
+    try {
+        const idxRaw = localStorage.getItem(`${STORAGE_KEY}_archive_index`);
+        if (idxRaw) {
+            const arr = JSON.parse(idxRaw) as unknown;
+            if (Array.isArray(arr)) {
+                for (const k of arr) {
+                    if (typeof k === 'string' && k.startsWith(archivePrefix())) found.add(k);
+                }
+            }
+        }
+    } catch { /* ignore */ }
+    return [...found];
+}
+export function pruneSnapshotArchives(now = Date.now()): void {
+    try {
+        const keys = listArchiveKeys();
+        // 14d expiry first.
+        for (const k of keys) {
+            const ts = Number(k.slice(archivePrefix().length));
+            if (Number.isFinite(ts) && now - ts > SNAPSHOT_ARCHIVE_TTL_MS) {
+                try { localStorage.removeItem(k); } catch { /* ignore */ }
+            }
+        }
+        // Cap: keep newest 3 (timestamp suffix sorts chronologically).
+        const remaining = listArchiveKeys().sort();
+        while (remaining.length > MAX_SNAPSHOT_ARCHIVES) {
+            const oldest = remaining.shift();
+            if (!oldest) break;
+            try { localStorage.removeItem(oldest); } catch { /* ignore */ }
+        }
+        // Persist pruned index for length/key-less environments.
+        try {
+            const live = listArchiveKeys().sort();
+            // Rebuild index from enumeration when available; otherwise prune stored index.
+            if (live.length > 0) {
+                localStorage.setItem(`${STORAGE_KEY}_archive_index`, JSON.stringify(live));
+            } else {
+                const idxRaw = localStorage.getItem(`${STORAGE_KEY}_archive_index`);
+                if (idxRaw) {
+                    try {
+                        const arr = JSON.parse(idxRaw) as unknown;
+                        if (Array.isArray(arr)) {
+                            const kept = (arr as unknown[]).filter((k): k is string =>
+                                typeof k === 'string' && remaining.includes(k));
+                            localStorage.setItem(`${STORAGE_KEY}_archive_index`, JSON.stringify(kept));
+                        }
+                    } catch { /* ignore */ }
+                }
+            }
+        } catch { /* ignore */ }
+    } catch { /* ignore */ }
+}
+
 // === Collect Current State ===
 
 function collectSnapshot(reason?: string): CrashSnapshot {
@@ -253,6 +326,9 @@ function saveSnapshot(reason?: string): void {
 // === Restore Snapshot ===
 
 export function getLatestSnapshot(): CrashSnapshot | null {
+    // Enforce archive retention on every read so expired archives can't
+    // accumulate when restores never run.
+    try { pruneSnapshotArchives(); } catch { /* ignore */ }
     // Rotation: newest is STORAGE_KEY, older copy in _1 (single backup).
     // Staging holds a newest that failed to promote (quota) — prefer live,
     // fall back to staging before history so it is never lost.
@@ -295,6 +371,14 @@ export async function restoreSnapshot(): Promise<boolean> {
     // Stage-then-commit backup (matches session.ts:365-388 rollback): capture
     // live pads/playlist BEFORE any mutation so a failed pad reload can
     // restore them. Never clearSnapshots on partial success — archive instead.
+    const readSliderNumber = (id: string): number | null => {
+        try {
+            const el = document.getElementById(id) as HTMLInputElement | null;
+            if (!el) return null;
+            const v = Number(el.value);
+            return Number.isFinite(v) ? v : null;
+        } catch { return null; }
+    };
     const liveBackup = {
         playlist: [...state.playlist],
         selectedIndices: [...state.selectedIndices],
@@ -306,6 +390,8 @@ export async function restoreSnapshot(): Promise<boolean> {
         blendingIndex: state.blendingIndex,
         isPlaying: state.isPlaying,
         isCrossfadeInProgress: state.isCrossfadeInProgress,
+        masterVolume: readSliderNumber('masterVol'),
+        tempoValue: readSliderNumber('tempoSlider'),
         pads: Array.from({ length: NUM_PADS }, (_, i) => ({
             buf: (padBuffers as unknown as unknown[])[i],
             path: padPaths[i] ?? '',
@@ -314,6 +400,7 @@ export async function restoreSnapshot(): Promise<boolean> {
             sync: !!padSyncState[i],
             ls: padLoopStart[i] ?? -1,
             le: padLoopEnd[i] ?? -1,
+            wf: (padWaveforms as unknown as unknown[])[i],
         })),
     };
     const restoreLive = () => {
@@ -339,14 +426,65 @@ export async function restoreSnapshot(): Promise<boolean> {
                     padSyncState[i] = p.sync;
                     padLoopStart[i] = p.ls;
                     padLoopEnd[i] = p.le;
+                    (padWaveforms as unknown as unknown[])[i] = p.wf;
                 } catch { /* ignore */ }
             });
+            // Gate-3: a partial failure previously left volume/tempo mutated
+            // (sliders actuated pre-pad-loop) and waveforms empty (cleared,
+            // never restored). Restore captured slider positions + pad UI.
+            try {
+                if (liveBackup.masterVolume !== null) {
+                    const volSlider = document.getElementById('masterVol') as HTMLInputElement | null;
+                    if (volSlider) {
+                        volSlider.value = String(liveBackup.masterVolume);
+                        volSlider.dispatchEvent(new Event('input'));
+                    }
+                }
+                if (liveBackup.tempoValue !== null) {
+                    const tempo = document.getElementById('tempoSlider') as HTMLInputElement | null;
+                    if (tempo) {
+                        tempo.value = String(liveBackup.tempoValue);
+                        tempo.dispatchEvent(new Event('input'));
+                    }
+                }
+            } catch { /* ignore */ }
+            try {
+                const grid = document.getElementById('padGrid');
+                liveBackup.pads.forEach((p, i) => {
+                    try {
+                        const slider = grid?.children[i]?.querySelector('.pad-slider') as HTMLInputElement | null;
+                        if (slider) slider.value = String(p.vol);
+                    } catch { /* ignore */ }
+                });
+            } catch { /* ignore */ }
+            // Best-effort waveform repaint so pads don't stay visually empty.
+            try {
+                void import('./sampler').then((m) => {
+                    liveBackup.pads.forEach((_p, i) => {
+                        try {
+                            if ((padWaveforms as unknown as unknown[])[i] !== undefined) m.renderWaveform(i);
+                        } catch { /* ignore */ }
+                    });
+                }).catch(() => undefined);
+            } catch { /* ignore */ }
         } catch { /* best-effort */ }
     };
     const archiveSnapshot = () => {
         try {
             const raw = localStorage.getItem(STORAGE_KEY);
-            if (raw) localStorage.setItem(`${STORAGE_KEY}_archive_${Date.now()}`, raw);
+            if (!raw) return;
+            const key = `${STORAGE_KEY}_archive_${Date.now()}`;
+            try { localStorage.setItem(key, raw); } catch { /* quota — skip archiving */ }
+            // Track index for environments without length/key enumeration (tests).
+            try {
+                const idxRaw = localStorage.getItem(`${STORAGE_KEY}_archive_index`);
+                const idx: string[] = idxRaw ? (JSON.parse(idxRaw) as string[]) : [];
+                if (Array.isArray(idx)) {
+                    idx.push(key);
+                    localStorage.setItem(`${STORAGE_KEY}_archive_index`, JSON.stringify(idx));
+                }
+            } catch { /* ignore */ }
+            pruneSnapshotArchives();
         } catch { /* ignore */ }
     };
     let hadFailure = false;
@@ -392,29 +530,24 @@ export async function restoreSnapshot(): Promise<boolean> {
         }
 
         // 2. Stage UI updates (committed only on full success).
+        // Gate-3: sliders must NOT be actuated before the pad loop — a
+        // partial pad failure previously left volume/tempo mutated while
+        // restoreLive() restored only state/pads. Stage values here, actuate
+        // after pads prove loadable (commit block below).
         let stagedUiUpdates: Record<string, unknown> | null = null;
+        let stagedMasterVolume: number | null = null;
+        let stagedTempoValue: number | null = null;
         if (snapshot.ui) {
             const clamp = (v: unknown, lo: number, hi: number): number | null => {
                 const n = typeof v === 'number' ? v : parseFloat(String(v));
                 if (!Number.isFinite(n)) return null;
                 return Math.min(hi, Math.max(lo, n));
             };
-            const volSlider = document.getElementById('masterVol') as HTMLInputElement;
-            if (volSlider && snapshot.ui.masterVolume !== undefined) {
-                const mv = clamp(snapshot.ui.masterVolume, 0, 1);
-                if (mv !== null) {
-                    volSlider.value = mv.toString();
-                    volSlider.dispatchEvent(new Event('input'));
-                }
+            if (snapshot.ui.masterVolume !== undefined) {
+                stagedMasterVolume = clamp(snapshot.ui.masterVolume, 0, 1);
             }
-
-            const tempo = document.getElementById('tempoSlider') as HTMLInputElement;
-            if (tempo && snapshot.ui.tempoValue !== undefined) {
-                const tv = clamp(snapshot.ui.tempoValue, 0.5, 1.5);
-                if (tv !== null) {
-                    tempo.value = tv.toString();
-                    tempo.dispatchEvent(new Event('input'));
-                }
+            if (snapshot.ui.tempoValue !== undefined) {
+                stagedTempoValue = clamp(snapshot.ui.tempoValue, 0.5, 1.5);
             }
 
             const updates: Record<string, any> = {};
@@ -512,6 +645,8 @@ export async function restoreSnapshot(): Promise<boolean> {
             return false;
         }
         // Commit staged playlist + UI only after all pads succeeded.
+        // Slider actuation lives here (not pre-pad-loop) so a failure path
+        // never leaves volume/tempo mutated.
         if (stagedPlaylist) {
             state.update({
                 playlist: stagedPlaylist,
@@ -522,6 +657,22 @@ export async function restoreSnapshot(): Promise<boolean> {
             state.update({ isPlaying: false, isCrossfadeInProgress: false, blendingIndex: -1, masterBPM: 0 });
         }
         if (stagedUiUpdates) state.update(stagedUiUpdates);
+        try {
+            if (stagedMasterVolume !== null) {
+                const volSlider = document.getElementById('masterVol') as HTMLInputElement | null;
+                if (volSlider) {
+                    volSlider.value = String(stagedMasterVolume);
+                    volSlider.dispatchEvent(new Event('input'));
+                }
+            }
+            if (stagedTempoValue !== null) {
+                const tempo = document.getElementById('tempoSlider') as HTMLInputElement | null;
+                if (tempo) {
+                    tempo.value = String(stagedTempoValue);
+                    tempo.dispatchEvent(new Event('input'));
+                }
+            }
+        } catch { /* slider actuation is best-effort */ }
 
         // 4. Trigger playlist render
         try {

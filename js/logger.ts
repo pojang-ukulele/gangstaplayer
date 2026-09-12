@@ -23,12 +23,15 @@ interface LogEntry {
     level: LogLevel;
     message: string;
     timestamp: string;
+    sessionId: string;
 }
 
 class GangstaLogger {
     private ringBuffer: LogEntry[] = [];
     private minLevel: LogLevel = 'DEBUG';
     private sessionId: string;
+    /** DEBUG disk writes stay off unless explicitly enabled (flag). */
+    private debugDiskEnabled = false;
     private _lastDiskWrite = 0;
     private _diskDropped = 0;
     // H31: per-level disk throttle for WARN/ERROR (same IPC-flood class as
@@ -46,7 +49,8 @@ class GangstaLogger {
         try {
             const fs = (window as unknown as { fileSystem?: { appendLog: (l: string, m: string) => Promise<unknown> } }).fileSystem;
             if (!fs?.appendLog) return;
-            fs.appendLog(level, message).then(
+            // Attach sessionId to every persisted line (never bare counts).
+            fs.appendLog(level, `[${this.sessionId}] ${message}`).then(
                 () => { this._diskFailStreak = 0; },
                 () => { this._noteDiskFailure(); }
             );
@@ -59,7 +63,7 @@ class GangstaLogger {
             try { console.error('[Logger] disk persistence failing — logs are memory-only'); } catch { /* ignore */ }
             try {
                 const timestamp = new Date().toLocaleTimeString('en-US', { hour12: false });
-                this.ringBuffer.push({ level: 'WARN', message: '[Logger] disk persistence failing — logs are memory-only', timestamp });
+                this.ringBuffer.push({ level: 'WARN', message: '[Logger] disk persistence failing — logs are memory-only', timestamp, sessionId: this.sessionId });
                 if (this.ringBuffer.length > MAX_LOG_ENTRIES) this.ringBuffer.shift();
             } catch { /* ignore */ }
         }
@@ -72,6 +76,15 @@ class GangstaLogger {
 
     // ==================== PUBLIC API ====================
 
+    /** Enable/disable DEBUG persistence to disk (default off — flag-gated). */
+    setDebugDiskEnabled(on: boolean): void {
+        this.debugDiskEnabled = !!on;
+    }
+
+    /** Session id attached to every persisted line + ring entry. */
+    getSessionId(): string {
+        return this.sessionId;
+    }
     /** Set minimum log level at runtime (blocks lower severity) */
     setLogLevel(level: LogLevel): void {
         this.minLevel = level;
@@ -95,7 +108,7 @@ class GangstaLogger {
     /** Returns log entries formatted as plain text for copying */
     getLogsAsText(): string {
         return this.ringBuffer.map(e =>
-            `[${e.timestamp}] [${e.level}] ${e.message}`
+            `[${e.timestamp}] [${e.level}] [${e.sessionId}] ${e.message}`
         ).join('\n');
     }
 
@@ -121,11 +134,15 @@ class GangstaLogger {
         this._log('DEBUG', text);
     }
 
-    async getLogPath(): Promise<string> {
-        if (window.fileSystem?.getLogPath) {
-            return await window.fileSystem.getLogPath();
-        }
-        return 'UNKNOWN';
+    /** Log file path, or null when the bridge is unavailable (callers handle null). */
+    async getLogPath(): Promise<string | null> {
+        try {
+            if (window.fileSystem?.getLogPath) {
+                const p = await window.fileSystem.getLogPath();
+                return typeof p === 'string' && p.length > 0 ? p : null;
+            }
+        } catch { /* bridge down */ }
+        return null;
     }
 
     async generateCrashReport(stateSnapshot: Record<string, unknown>): Promise<string | null | undefined> {
@@ -179,7 +196,7 @@ class GangstaLogger {
         }
 
         const timestamp = new Date().toLocaleTimeString('en-US', { hour12: false });
-        const entry: LogEntry = { level, message, timestamp };
+        const entry: LogEntry = { level, message, timestamp, sessionId: this.sessionId };
         this._storeLog(entry);
         this._writeLog(entry);
     }
@@ -198,63 +215,65 @@ class GangstaLogger {
         const consoleFn = console[consoleMethod as keyof Console] as ((...args: any[]) => void) | undefined;
         if (typeof consoleFn === 'function') consoleFn(`[${entry.level}] ${entry.message}`);
 
-        // Persist to disk via Electron Bridge (skip DEBUG — high-frequency
-        // debug spam previously IPC-flooded the main process on every frame).
-        // Throttle INFO: drum-roll mousedown/click storms emit one IPC each.
-        // H31: same treatment for WARN/ERROR — decode-failure storms and
-        // renderer error loops previously sent one IPC per call.
-        if (entry.level !== 'DEBUG' && typeof window !== 'undefined' && (window as unknown as { fileSystem?: unknown }).fileSystem) {
-            if (entry.level === 'INFO') {
-                const now = Date.now();
-                if (now - this._lastDiskWrite < 200) {
-                    this._diskDropped++;
-                    if (this._diskDropped === 1) {
-                        this._persist('INFO', `[Logger] ... throttling INFO burst`);
-                    }
-                    return;
+        // Persist to disk via Electron Bridge. DEBUG is flag-gated (default
+        // off — high-frequency debug spam previously IPC-flooded main).
+        // Burst policy is first-N + sampled, never pure counts: the first
+        // messages in a window persist verbatim, then one sampled message per
+        // window persists WITH its text, so disk always holds real errors.
+        if (typeof window === 'undefined' || !(window as unknown as { fileSystem?: unknown }).fileSystem) return;
+        if (entry.level === 'DEBUG' && !this.debugDiskEnabled) return;
+        if (entry.level === 'INFO') {
+            const now = Date.now();
+            if (now - this._lastDiskWrite < 200) {
+                this._diskDropped++;
+                // Sample the burst: persist the sampled INFO text (not a bare
+                // count) so disk holds evidence, throttled to one per window.
+                if (this._diskDropped === 2) {
+                    this._persist('INFO', `[Logger] INFO burst sample: ${entry.message.slice(0, 200)}`);
                 }
-                if (this._diskDropped > 0) {
-                    const n = this._diskDropped;
-                    this._diskDropped = 0;
-                    this._lastDiskWrite = now;
-                    this._persist('INFO', `[Logger] dropped ${n} INFO message(s) during burst`);
-                }
-                this._lastDiskWrite = now;
-            } else if (entry.level === 'WARN' || entry.level === 'ERROR') {
-                const now = Date.now();
-                const lvl = entry.level;
-                const last = this._lastDiskWriteByLevel[lvl] ?? 0;
-                if (now - last < 500) {
-                    this._diskDroppedByLevel[lvl] = (this._diskDroppedByLevel[lvl] ?? 0) + 1;
-                    if (entry.message === (this._lastMsgByLevel[lvl] ?? '')) {
-                        this._repeatByLevel[lvl] = (this._repeatByLevel[lvl] ?? 0) + 1;
-                    } else if ((this._diskDroppedByLevel[lvl] ?? 0) === 1) {
-                        this._lastMsgByLevel[lvl] = entry.message;
-                        this._repeatByLevel[lvl] = 0;
-                        this._persist(lvl, `[Logger] ... throttling ${lvl} burst`);
-                    }
-                    return;
-                }
-                const dropped = this._diskDroppedByLevel[lvl] ?? 0;
-                if (dropped > 0) {
-                    const repeats = this._repeatByLevel[lvl] ?? 0;
-                    const sample = (this._lastMsgByLevel[lvl] ?? entry.message).slice(0, 160);
-                    this._diskDroppedByLevel[lvl] = 0;
-                    this._repeatByLevel[lvl] = 0;
-                    this._lastDiskWriteByLevel[lvl] = now;
-                    this._lastMsgByLevel[lvl] = entry.message;
-                    const summary = repeats > 0
-                        ? `[Logger] dropped ${dropped} ${lvl} message(s) during burst (x${repeats + 1} repeats of '${sample}')`
-                        : `[Logger] dropped ${dropped} ${lvl} message(s) during burst`;
-                    this._persist(lvl, summary);
-                } else {
-                    this._lastDiskWriteByLevel[lvl] = now;
-                    this._lastMsgByLevel[lvl] = entry.message;
-                    this._repeatByLevel[lvl] = 0;
-                }
+                return;
             }
-            this._persist(entry.level, entry.message);
+            if (this._diskDropped > 0) {
+                const n = this._diskDropped;
+                this._diskDropped = 0;
+                this._lastDiskWrite = now;
+                this._persist('INFO', `[Logger] INFO burst: ${n} dropped, resuming with sample: ${entry.message.slice(0, 200)}`);
+            }
+            this._lastDiskWrite = now;
+        } else if (entry.level === 'WARN' || entry.level === 'ERROR') {
+            const now = Date.now();
+            const lvl = entry.level;
+            const last = this._lastDiskWriteByLevel[lvl] ?? 0;
+            if (now - last < 500) {
+                this._diskDroppedByLevel[lvl] = (this._diskDroppedByLevel[lvl] ?? 0) + 1;
+                if (entry.message === (this._lastMsgByLevel[lvl] ?? '')) {
+                    this._repeatByLevel[lvl] = (this._repeatByLevel[lvl] ?? 0) + 1;
+                } else if ((this._diskDroppedByLevel[lvl] ?? 0) === 1) {
+                    this._lastMsgByLevel[lvl] = entry.message;
+                    this._repeatByLevel[lvl] = 0;
+                    this._persist(lvl, `[Logger] ${lvl} burst sample: ${entry.message.slice(0, 200)}`);
+                }
+                return;
+            }
+            const dropped = this._diskDroppedByLevel[lvl] ?? 0;
+            if (dropped > 0) {
+                const repeats = this._repeatByLevel[lvl] ?? 0;
+                const sample = (this._lastMsgByLevel[lvl] ?? entry.message).slice(0, 160);
+                this._diskDroppedByLevel[lvl] = 0;
+                this._repeatByLevel[lvl] = 0;
+                this._lastDiskWriteByLevel[lvl] = now;
+                this._lastMsgByLevel[lvl] = entry.message;
+                const summary = repeats > 0
+                    ? `[Logger] ${lvl} burst: ${dropped} dropped (x${repeats + 1} repeats of '${sample}'), resuming with: ${entry.message.slice(0, 200)}`
+                    : `[Logger] ${lvl} burst: ${dropped} dropped, resuming with: ${entry.message.slice(0, 200)}`;
+                this._persist(lvl, summary);
+            } else {
+                this._lastDiskWriteByLevel[lvl] = now;
+                this._lastMsgByLevel[lvl] = entry.message;
+                this._repeatByLevel[lvl] = 0;
+            }
         }
+        this._persist(entry.level, entry.message);
     }
 
     private _generateSessionId(): string {

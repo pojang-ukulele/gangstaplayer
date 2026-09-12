@@ -25,6 +25,7 @@ import { toast } from './toast';
 import { logger } from './logger';
 import { HighFidelityRecorder } from './recorder-client';
 
+import { getTopModal } from './modals';
 import { saveSession, loadSession, purgeLegacySessionKey } from './session';
 import { initCrashRecovery, checkAndRestore } from './crash-recovery';
 import { initTrackInfo } from './track-info';
@@ -83,8 +84,23 @@ function hideAllContextMenus(): void {
             const m = document.getElementById(id);
             if (m) { m.classList.add('hidden'); m.setAttribute('aria-hidden', 'true'); }
         }
-        if (padContextMenuEl) { padContextMenuEl.classList.add('hidden'); padContextMenuEl.setAttribute('aria-hidden', 'true'); }
-        if (controlContextMenuEl) controlContextMenuEl.classList.add('hidden');
+        if (padContextMenuEl) {
+            padContextMenuEl.classList.add('hidden');
+            padContextMenuEl.setAttribute('aria-hidden', 'true');
+            // Stale padIndex previously survived hides — the next opener that
+            // reads dataset.padIndex without a fresh contextmenu (e.g. a
+            // keyboard-triggered action) acted on the wrong pad.
+            try { delete padContextMenuEl.dataset.padIndex; } catch { /* ignore */ }
+        }
+        if (controlContextMenuEl) {
+            controlContextMenuEl.classList.add('hidden');
+            controlContextMenuEl.setAttribute('aria-hidden', 'true');
+            try { delete controlContextMenuEl.dataset.controlId; } catch { /* ignore */ }
+        }
+        const playlistCtx = document.getElementById('contextMenu');
+        if (playlistCtx) {
+            try { delete playlistCtx.dataset.ctxIndex; } catch { /* ignore */ }
+        }
         const samplerParent = document.getElementById('ctxLoadToSampler');
         if (samplerParent) samplerParent.setAttribute('aria-expanded', 'false');
     } catch { /* ignore */ }
@@ -99,7 +115,12 @@ function hideAllContextMenus(): void {
 let padContextMenuEl: HTMLElement | null = null;
 let controlContextMenuEl: HTMLElement | null = null;
 
+let _contextMenusWired = false;
 function setupContextMenus() {
+    // Idempotent (mirrors playlist/sampler guards): re-init previously
+    // stacked duplicate contextmenu/mousedown listeners per pad.
+    if (_contextMenusWired) return;
+    _contextMenusWired = true;
     // Context Menu for Pads
     const padGrid = getPadGrid();
     const padContextMenu = document.getElementById('padContextMenu');
@@ -164,8 +185,15 @@ function setupContextMenus() {
                     logger.info(`[Main] Pad ${i} mousedown. button=${e.button}, bufferExists=${!!padBuffers[i]}`);
                     if (e.button === 0 && padBuffers[i]) startPad(i);
                 });
-                pad.addEventListener('mouseup', () => stopPad(i));
-                pad.addEventListener('mouseleave', () => stopPad(i));
+                // Mouse parity: a click auditions the full sample like a
+                // keyboard/MIDI one-shot. Only a held (loop-upgraded) voice
+                // is choked on release; one-shots ring out naturally.
+                pad.addEventListener('mouseup', () => {
+                    try { if (activeVoices[i]?.source?.loop) stopPad(i); } catch { /* ignore */ }
+                });
+                pad.addEventListener('mouseleave', () => {
+                    try { if (activeVoices[i]?.source?.loop) stopPad(i); } catch { /* ignore */ }
+                });
                 pad.addEventListener('click', async () => {
                     logger.info(`[Main] Pad ${i} click. bufferExists=${!!padBuffers[i]}`);
                     if (!padBuffers[i]) {
@@ -332,11 +360,11 @@ function setupGlobalKeyboardShortcuts() {
                 return;
             }
             e.preventDefault();
-            // Try modals first — topmost, not first in DOM order. The confirm
-            // modal must go through its No-button path so the queue drains;
-            // closeModal() directly would wedge _confirmOpen forever.
-            const actives = document.querySelectorAll('.modal.active');
-            const activeModal = (actives.length ? actives[actives.length - 1] : document.querySelector('.modal.active')) as HTMLElement | null;
+            // Try modals first — topmost via the modals.ts single source
+            // (getTopModal: last .active wins). The confirm modal must go
+            // through its No-button path so the queue drains; closeModal()
+            // directly would wedge _confirmOpen forever.
+            const activeModal = getTopModal();
             if (activeModal) {
                 if (activeModal.id === 'confirmModal') {
                     const noBtn = document.getElementById('confirmNo') as HTMLElement | null;
@@ -377,6 +405,9 @@ function setupGlobalKeyboardShortcuts() {
 
         // Transport — play/pause queue as intent mid-blend (C8), so SPACE
         // stays live during AutoMix blending instead of blacking out.
+        // Modal-open guard: Space/Enter must not drive transport while any
+        // modal (incl. the queued confirm) holds the screen.
+        if ((e.code === 'Space' || e.code === 'Enter') && document.querySelector('.modal.active')) return;
         if (e.code === 'Space') {
             e.preventDefault();
             const playerAudio = getPlayerAudio();
@@ -424,6 +455,13 @@ function setupGlobalKeyboardShortcuts() {
         } else if (['ArrowUp', 'ArrowDown', 'Delete', 'Backspace'].includes(e.key)) {
             if (isTextEdit) return;
             if (onTransportControl) return;
+            // Delete/Backspace must never mutate the playlist from a control:
+            // checkboxes/radios/colors/ranges/buttons consume or ignore it
+            // natively, and forwarding deletes tracks while operating transport.
+            if (e.key === 'Delete' || e.key === 'Backspace') {
+                if (tag === 'BUTTON') return;
+                if (tag === 'INPUT' && ['checkbox', 'radio', 'color', 'range', 'button', 'submit'].includes(inputType)) return;
+            }
             if (tag === 'INPUT' && inputType === 'range' && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) return;
             if (tag === 'SELECT' && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) return;
             handlePlaylistNavigation(e);
@@ -748,6 +786,7 @@ async function initApp() {
         if (playlistCtxMenu) {
             playlistCtxMenu.classList.add('hidden');
             playlistCtxMenu.setAttribute('aria-hidden', 'true');
+            try { delete (playlistCtxMenu as HTMLElement).dataset.ctxIndex; } catch { /* ignore */ }
         }
         const samplerSub = document.getElementById('samplerSubmenu');
         if (samplerSub) {
@@ -759,6 +798,7 @@ async function initApp() {
         if (padContextMenuEl) {
             padContextMenuEl.classList.add('hidden');
             padContextMenuEl.setAttribute('aria-hidden', 'true');
+            try { delete padContextMenuEl.dataset.padIndex; } catch { /* ignore */ }
         }
         if (playContextMenu) {
             playContextMenu.classList.add('hidden');
@@ -770,6 +810,8 @@ async function initApp() {
         }
         if (controlContextMenuEl) {
             controlContextMenuEl.classList.add('hidden');
+            controlContextMenuEl.setAttribute('aria-hidden', 'true');
+            try { delete controlContextMenuEl.dataset.controlId; } catch { /* ignore */ }
         }
     });
     
@@ -785,9 +827,18 @@ async function initApp() {
 
     // === GURU CRASH PROTECTION (RENDERER) ===
     // addEventListener (not assignment) so earlier handlers aren't clobbered.
+    // Mirrors the rejection path: re-entrancy flag + 5s throttle so an
+    // erroring logger/report can never recurse into a report storm.
+    let errorReporting = false;
+    let lastErrorReport = 0;
     window.addEventListener('error', (event) => {
+        if (errorReporting) return;
+        const now = Date.now();
         const { message, filename, lineno, colno, error } = event;
         try { logger.error(`[Renderer Crash] ${message} at ${filename}:${lineno}:${colno}`); } catch { /* ignore */ }
+        if (now - lastErrorReport < 5000) return;
+        errorReporting = true;
+        lastErrorReport = now;
         // Pass a plain snapshot — the live ReactiveStore holds Maps/Sets of
         // functions that throw DataCloneError over IPC.
         let appState: unknown = null;
@@ -801,8 +852,8 @@ async function initApp() {
                 colno,
                 stack: (error as Error | undefined)?.stack,
                 appState
-            })).catch(() => undefined);
-        } catch { /* report must never throw back into the handler */ }
+            })).catch(() => undefined).finally(() => { errorReporting = false; });
+        } catch { errorReporting = false; /* report must never throw back into the handler */ }
     });
 
     let rejectionReporting = false;

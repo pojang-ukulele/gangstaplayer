@@ -5,9 +5,11 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>GANGSTA PLAYER PRO 3</title>
-    <!-- Content Security Policy for Safety -->
+    <!-- Content Security Policy for Safety.
+         connect-src allows any loopback port (http/ws, 127.0.0.1 + localhost)
+         so a user-configured Sonetra port works, not just the 8765 default. -->
     <meta http-equiv="Content-Security-Policy"
-        content="default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data: blob:; media-src 'self' blob: data:; connect-src 'self' http://127.0.0.1:8765; worker-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none';">
+        content="default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data: blob:; media-src 'self' blob: data:; connect-src 'self' http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:*; worker-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none';">
     <link rel="stylesheet" href="styles.css">
 </head>
 
@@ -417,8 +419,12 @@
         </div>
     </div>
 
-    <!-- SCRIPTS -->
-    <script type="module" src="js/main.js"></script>
+    <!-- SCRIPTS (boot-fallback first: classic CSP-safe script that wires an
+         error listener onto #mainScript — a blank deck on load failure is a
+         fail-silent bug, so failures surface a visible #bootError + console) -->
+    <div id="bootError" role="alert" hidden></div>
+    <script src="js/boot-fallback.js"></script>
+    <script id="mainScript" type="module" src="js/main.js"></script>
 </body>
 
 </html>

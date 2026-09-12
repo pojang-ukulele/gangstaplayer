@@ -9,8 +9,12 @@ import { state } from '../js/state';
 function wavBuffer(): ArrayBuffer {
     const buf = new ArrayBuffer(64);
     const v = new Uint8Array(buf);
-    // RIFF....WAVE
-    v.set([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x41, 0x56, 0x45]);
+    // Genuinely valid WAV: RIFF size + WAVE + fmt chunk tag + minimal body.
+    // (A bare 64B RIFF....WAVE header with no fmt/data chunk is correctly
+    // rejected by the P3-I gate, so the fixture must carry fmt evidence.)
+    v.set([0x52, 0x49, 0x46, 0x46, 0x38, 0x00, 0x00, 0x00, 0x57, 0x41, 0x56, 0x45]);
+    v.set([0x66, 0x6D, 0x74, 0x20], 12); // "fmt "
+    v.set([0x10, 0x00, 0x00, 0x00], 16); // fmt chunk size 16 (PCM)
     return buf;
 }
 

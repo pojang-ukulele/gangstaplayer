@@ -216,18 +216,25 @@ export class AudioChannel {
         try {
             this.workletNode = new AudioWorkletNode(audioCtx, 'gangsta-processor');
 
-            // Safe re-routing
+            // Flag sets ONLY when routing actually connected — hpFilter/gain
+            // may be null on a lazily-materialized channel, in which case the
+            // base chain still plays and injection retries later.
             if (this.hpFilter && this.workletNode && this.gain) {
                 this.hpFilter.disconnect(this.gain);
                 this.hpFilter.connect(this.workletNode);
                 this.workletNode.connect(this.gain);
+                this._isWorkletConnected = true;
+                console.log("[AudioChannel] Worklet injection successful");
+                return true;
             }
 
-            this._isWorkletConnected = true;
-            console.log("[AudioChannel] Worklet injection successful");
-            return true;
+            try { this.workletNode.disconnect(); } catch { /* ignore */ }
+            this.workletNode = null;
+            this._isWorkletConnected = false;
+            return false;
         } catch {
             console.warn("[AudioChannel] Worklet injection deferred (node not ready)");
+            this._isWorkletConnected = false;
             // Base chain is still connected, so audio will still play.
             return false;
         }
@@ -248,6 +255,18 @@ export class AudioChannel {
     }
 
     reset(): void {
+        // Cancel automation FIRST, even when the chain can't be (re)built —
+        // a dead context must not leave stale ramps on surviving params.
+        // Each cancel is individually guarded; failures are ignored.
+        try {
+            const t = this.gain?.context?.currentTime ?? audioCtx?.currentTime ?? 0;
+            try { this.gain?.gain.cancelScheduledValues(t); } catch { /* ignore */ }
+            try { this.lowEQ?.gain.cancelScheduledValues(t); } catch { /* ignore */ }
+            try { this.midEQ?.gain.cancelScheduledValues(t); } catch { /* ignore */ }
+            try { this.highEQ?.gain.cancelScheduledValues(t); } catch { /* ignore */ }
+            try { this.lpFilter?.frequency.cancelScheduledValues(t); } catch { /* ignore */ }
+            try { this.hpFilter?.frequency.cancelScheduledValues(t); } catch { /* ignore */ }
+        } catch { /* ignore */ }
         if (!this.ensureNodes() || !audioCtx || !this.gain || !this.lowEQ || !this.midEQ || !this.highEQ || !this.lpFilter || !this.hpFilter) {
             console.warn("[AudioChannel] Cannot reset: AudioContext or audio nodes not available.");
             return;
@@ -334,13 +353,18 @@ class AudioEngine {
 
     /** Keep the idle deck silent even when nodes materialize lazily after construction. */
     private muteCrossfade(): void {
-        // Single 1s retry previously left the idle deck at gain 1.0 when the
-        // context still wasn't ready — the first AutoMix then blasted at full
-        // volume. Retry a bounded number of times instead.
+        // Zero synchronously whenever nodes exist — no delayed-blast window.
+        // The bounded retry covers lazy materialization only (no audio can
+        // play before the context exists anyway).
         let attempts = 0;
         const tryMute = (): void => {
             try {
+                try { this.crossfade.ensureNodes(); } catch { /* not ready yet */ }
                 if (this.crossfade.gain) {
+                    try {
+                        const t = this.crossfade.gain.context.currentTime;
+                        this.crossfade.gain.gain.cancelScheduledValues(t);
+                    } catch { /* ignore */ }
                     this.crossfade.gain.gain.value = 0;
                     return;
                 }
@@ -372,18 +396,10 @@ class AudioEngine {
         }
     }
 
-    private _swapping = false;
-
     swapChannels(): void {
-        // Engine-level atomicity (C9): the caller-side gen guard can still let
-        // a stale finishCrossfade timer slip in during the swap itself.
-        if (this._swapping) return;
-        this._swapping = true;
-        try {
-            this._swapChannelsInner();
-        } finally {
-            this._swapping = false;
-        }
+        // Fully synchronous (no awaits) — no re-entrancy possible, so no
+        // guard flag. Caller-side generation checks serialize blends.
+        this._swapChannelsInner();
     }
 
     private _swapChannelsInner(): void {
@@ -442,10 +458,13 @@ class AudioEngine {
         this.main.audio.loop = (state.loopMode === 'one');
         // Timer-vs-audio-clock drift can leave the promoted gain below 1 —
         // enforce unity so the deck never gets stuck quiet after a swap.
+        // Uses the node's OWN context clock, not the (possibly rebuilt)
+        // module-level audioCtx handle.
         try {
-            if (this.main.gain && audioCtx) {
-                this.main.gain.gain.cancelScheduledValues(audioCtx.currentTime);
-                this.main.gain.gain.setValueAtTime(1, audioCtx.currentTime);
+            if (this.main.gain) {
+                const t = this.main.gain.context.currentTime;
+                this.main.gain.gain.cancelScheduledValues(t);
+                this.main.gain.gain.setValueAtTime(1, t);
             }
         } catch { /* ignore */ }
     }

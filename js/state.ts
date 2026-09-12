@@ -94,7 +94,16 @@ class ReactiveStore implements AppStateData {
     get playbackMode(): PlaybackMode { return this._data.playbackMode; }
     get loopMode(): LoopMode { return this._data.loopMode; }
     get masterBPM(): number { return this._data.masterBPM; }
-    get playlist(): Track[] { return [...this._data.playlist]; }
+    /**
+     * Deep-frozen copy: the array AND every Track are Object.freeze()d.
+     * Tracks must be treated as immutable — in-place writes
+     * (`state.playlist[i].bpm = x`) throw in strict mode instead of
+     * silently skipping notification (see update()). Clone-then-update
+     * (or replaceTrack) is the only supported write path.
+     */
+    get playlist(): Track[] {
+        return Object.freeze(this._data.playlist.map(t => Object.freeze({ ...t }) as Track)) as Track[];
+    }
     get selectedIndices(): number[] { return [...this._data.selectedIndices]; }
     get isAutoMixEnabled(): boolean { return this._data.isAutoMixEnabled; }
     get isCrossfadeInProgress(): boolean { return this._data.isCrossfadeInProgress; }
@@ -195,6 +204,11 @@ class ReactiveStore implements AppStateData {
                 changedKeys.push(k);
             }
         }
+
+        // Callers should check the boolean return (false = patch partially
+        // rejected); the summary warn below is the backstop for those that
+        // don't (per-key warns fire inline above).
+        if (rejected) console.warn('[State] update partially rejected patch', Object.keys(patch));
 
         if (changedKeys.length > 0) {
             // Notify specific listeners — one throwing subscriber must not kill the rest.

@@ -7,6 +7,19 @@ import { MIDI_LEARN_TIMEOUT_MS } from './constants';
 
 const MIDI_MAPPINGS_STORAGE_KEY = 'ug_midi_mappings';
 
+/**
+ * Allowlisted MIDI-control targets: faders/knobs only. MIDI must never
+ * drive buttons or save/action controls — a CC sweep writing .value into a
+ * button was silent garbage, and into a save/action control is a hazard.
+ * Regex shape validation is kept; the allowlist is enforced on top.
+ */
+const MIDI_CONTROL_ALLOWLIST: ReadonlySet<string> = new Set(['masterVol', 'tempoSlider']);
+function isAllowedMidiControl(id: unknown): id is string {
+    if (typeof id !== 'string' || !id) return false;
+    if (!MIDI_CONTROL_ALLOWLIST.has(id)) return false;
+    return /^[A-Za-z0-9_-]+$/.test(id);
+}
+
 interface MidiDeps {
     startPad: (pad: number) => void;
     stopPad: (pad: number) => void;
@@ -124,6 +137,9 @@ function loadMidiMappings(): void {
                 if (typeof v !== 'string' || !v) continue;
                 const id = v.slice(0, 64);
                 if (!/^[A-Za-z0-9_-]+$/.test(id)) continue;
+                // Persisted bindings from older builds may target buttons or
+                // removed controls — drop anything outside the allowlist.
+                if (!MIDI_CONTROL_ALLOWLIST.has(id)) continue;
                 cleanCtrl[cc] = id;
             }
             patch.controlMidiMap = cleanCtrl;
@@ -203,7 +219,9 @@ export function initMIDI(deps: MidiDeps): void {
             clearTimeout(learnTimeout);
             learnTimeout = null;
         }
-        if (!learning) return;
+        // Learn ended externally (Esc path, timeout, newer learn): retire
+        // any pending steal-confirm token with it.
+        if (!learning) { _learnGen++; return; }
         learnTimeout = setTimeout(() => {
             if (!state.isLearningMidi) return;
             state.update({ isLearningMidi: false, midiLearnTarget: null });
@@ -250,9 +268,14 @@ function onMIDISuccess(midiAccess: WebMidi.MIDIAccess): void {
     }
     midiAccess.onstatechange = (e: any) => {
         updateMidiStatus(midiAccess);
-        if (e.port.type === 'input' && e.port.state === 'connected') {
+        if (e.port.type !== 'input') return;
+        if (e.port.state === 'connected') {
             const input = e.port as WebMidi.MIDIInput;
             input.onmidimessage = getMIDIMessage;
+        } else {
+            // Detach disconnected ports — a zombie handler on a removed
+            // device previously kept firing with a stale id.
+            try { (e.port as WebMidi.MIDIInput).onmidimessage = null; } catch { /* ignore */ }
         }
     };
 }
@@ -329,7 +352,16 @@ function stashMidiUndo(): void {
     };
 }
 
+/**
+ * Steal-confirm generation: showConfirm is queued/async, so a steal prompt
+ * can outlive its learn session (Esc cancel, 10s timeout, newer learn). The
+ * captured token is checked in onYes — a stale confirm becomes a no-op
+ * instead of applying a binding the user already cancelled.
+ */
+let _learnGen = 0;
+
 function cancelMidiLearn(): void {
+    _learnGen++;
     state.update({ isLearningMidi: false, midiLearnTarget: null });
 }
 
@@ -351,6 +383,12 @@ function applyPadBind(data1: number, padId: number): void {
 }
 
 function applyControlBind(data1: number, ctrlId: string): void {
+    if (!isAllowedMidiControl(ctrlId)) {
+        logger.warn(`[MIDI Learn] Rejected non-allowlisted control '${String(ctrlId).slice(0, 64)}'`);
+        try { toast.error('CONTROL CANNOT BE MIDI-MAPPED'); } catch { /* ignore */ }
+        cancelMidiLearn();
+        return;
+    }
     stashMidiUndo();
     const newMap = { ...state.controlMidiMap };
     // 1. Unbind CC from others
@@ -389,11 +427,29 @@ function handleMidiLearn(cmd: number, data1: number) {
             cancelMidiLearn();
             return;
         }
+        if (!isAllowedMidiControl(ctrlId)) {
+            logger.warn(`[MIDI Learn] Rejected non-allowlisted control '${String(ctrlId).slice(0, 64)}'`);
+            try { toast.error('CONTROL CANNOT BE MIDI-MAPPED'); } catch { /* ignore */ }
+            cancelMidiLearn();
+            return;
+        }
     } else {
         cancelMidiLearn();
         return;
     }
     logger.info(`[MIDI Learn] Learning ${target.type}:${target.id} from MIDI ${cmd === 9 ? 'Note' : 'CC'} ${data1}`);
+    // NOTE (channel collision): bindings are channel-agnostic — note/CC
+    // number only. The same note on another channel/device collides into the
+    // same slot by design (single-slot maps); the steal confirm below is the
+    // backstop and is kept for every collision.
+    const learnToken = _learnGen;
+    const ifFresh = (fn: () => void): (() => void) => () => {
+        if (learnToken !== _learnGen) {
+            logger.info('[MIDI Learn] Stale steal-confirm dropped (learn cancelled)');
+            return;
+        }
+        fn();
+    };
 
     if (target.type === 'pad') {
         const padId = target.id as number;
@@ -406,7 +462,7 @@ function handleMidiLearn(cmd: number, data1: number) {
                 showConfirm(
                     'STEAL MIDI BINDING?',
                     `Note ${data1} currently triggers PAD ${victimPad + 1}. Move it to PAD ${padId + 1}?`,
-                    () => applyPadBind(data1, padId),
+                    ifFresh(() => applyPadBind(data1, padId)),
                     () => cancelMidiLearn()
                 );
             } catch {
@@ -423,7 +479,7 @@ function handleMidiLearn(cmd: number, data1: number) {
                 showConfirm(
                     'STEAL MIDI BINDING?',
                     `CC ${data1} currently controls ${victim.toUpperCase()}. Move it to ${ctrlId.toUpperCase()}?`,
-                    () => applyControlBind(data1, ctrlId),
+                    ifFresh(() => applyControlBind(data1, ctrlId)),
                     () => cancelMidiLearn()
                 );
             } catch {
@@ -438,6 +494,12 @@ function handleMidiLearn(cmd: number, data1: number) {
 const _ccChangeTimers: Record<string, ReturnType<typeof setTimeout>> = {};
 
 function updateControlFromMidi(targetId: string, value: number) {
+    // Allowlist first: faders/knobs only, never buttons/save actions.
+    // (Shape regex is re-checked inside isAllowedMidiControl.)
+    if (!isAllowedMidiControl(targetId)) {
+        logger.warn(`[MIDI] CC ${value} ignored for non-mappable control '${String(targetId).slice(0, 64)}'`);
+        return;
+    }
     const el = document.getElementById(targetId) as HTMLInputElement;
     if (!el) return;
     const tag = (el.tagName || '').toUpperCase();
@@ -559,9 +621,12 @@ function getMIDIMessage(message: any): void {
                     if (!audioCtx) return;
                     const g = activeVoicesRef[padIndex].gain.gain;
                     const t = audioCtx.currentTime;
+                    // setTargetAtTime smoothing: exponential approach, no
+                    // zipper steps on velocity jumps and no ramp pile-up when
+                    // notes repeat faster than the 5ms linear ramp.
                     g.cancelScheduledValues(t);
                     try { g.setValueAtTime(Math.max(0.0001, g.value), t); } catch { /* ignore */ }
-                    g.linearRampToValueAtTime(Math.max(0.0001, vol), t + 0.005);
+                    g.setTargetAtTime(Math.max(0.0001, vol), t, 0.008);
                 } catch (e) {}
             }
         }

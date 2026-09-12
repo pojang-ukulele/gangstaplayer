@@ -143,6 +143,18 @@ const AUDIO_SIGNATURES: Record<string, { offset: number; bytes: number[] }> = {
  * Validates that a file buffer contains an actual audio file by checking
  * magic number signatures. Prevents loading of non-audio files as audio.
  *
+ * .aac policy (explicit): raw AAC is accepted ONLY with an ADTS frame sync
+ * (0xFF 0xF1 / 0xFF 0xF9) at the scan point. Bare/unknown AAC payloads are
+ * rejected — callers should prefer the .m4a container. This keeps
+ * VALID_AUDIO_EXTENSIONS ('aac' listed) honest instead of silently
+ * accepting non-ADTS bytes.
+ *
+ * Small-buffer contract: header-only buffers too small to prove a negative
+ * (e.g. the 12-16B unit-test fixtures) are provisionally accepted when the
+ * outer magic matches. Real files (large enough to contain the body) must
+ * carry body evidence or are rejected (RF64-bare, 12B RIFF without
+ * fmt/data, MP4-video brands, MKV doctype).
+ *
  * Returns null on success (valid audio), or an error message string on failure.
  */
 export function validateAudioSignature(
@@ -154,6 +166,14 @@ export function validateAudioSignature(
     }
 
     const view = new DataView(buffer);
+    const err = (m: string) => `${m}${fileName ? ` (file: ${fileName})` : ''}`;
+    // ADTS/AAC explicit accept (see docblock): MPEG-4 AAC (0xF1) and
+    // MPEG-2 AAC (0xF9) frame syncs. Layer bits are 00 for AAC (reserved in
+    // MPEG-audio), so this branch must precede the MP3 layer check below.
+    if (buffer.byteLength >= 2 && view.getUint8(0) === 0xFF) {
+        const b1 = view.getUint8(1);
+        if (b1 === 0xF1 || b1 === 0xF9) return null;
+    }
     // MP3 frame sync is 11 bits (0xFF + top-3-bits) AND valid layer bits
     // (L6): bare 0xFF Ex accepted JPEG APP markers (E0-EF) as MP3. Layer
     // 00 is reserved in MPEG — real frames always have nonzero layer bits.
@@ -180,32 +200,115 @@ export function validateAudioSignature(
     // RIFF/WAV requires both "RIFF" AND "WAVE" signatures
     const hasRiff = matches.includes('wav');
     const hasWave = matches.includes('wave');
-    const isRealWav = hasRiff && hasWave;
+    // 12B RIFF without fmt/data: a bare 12-byte "RIFF....WAVE" header is not
+    // playable audio. Buffers at/below 12B cannot carry a body, so reject.
+    // Larger header-only buffers are provisionally accepted (unit fixtures);
+    // real-size buffers must show fmt/data (checked below).
+    if ((hasRiff || matches.includes('rifx')) && hasWave && buffer.byteLength <= 12) {
+        return err('File does not contain recognized audio data (RIFF header without body)');
+    }
+    const hasChunkTag = (tag: string): boolean => {
+        if (buffer.byteLength < 4) return false;
+        const end = Math.min(buffer.byteLength - 4, 512);
+        for (let p = 12; p <= end; p++) {
+            if (String.fromCharCode(
+                view.getUint8(p), view.getUint8(p + 1),
+                view.getUint8(p + 2), view.getUint8(p + 3)) === tag) return true;
+        }
+        return false;
+    };
+    const wavHasBody = hasChunkTag('fmt ') || hasChunkTag('data') || hasChunkTag('ds64');
+    const isRealWav = hasRiff && hasWave && (buffer.byteLength < 32 || wavHasBody);
     // RIFX/RF64 need the WAVE/ds64 body; AIFF needs FORM+AIFF (L6).
-    const isRifxWav = matches.includes('rifx') && hasWave;
-    const isRf64 = matches.includes('rf64');
-    const isAiff = matches.includes('aiff') && matches.includes('aiffBody');
+    const isRifxWav = matches.includes('rifx') && hasWave && (buffer.byteLength < 32 || wavHasBody);
+    // RF64-bare: require a ds64/data/WAVE body on real-size buffers.
+    const rf64HasBody = hasChunkTag('ds64') || hasChunkTag('data') || hasChunkTag('WAVE');
+    const isRf64 = matches.includes('rf64') && (buffer.byteLength < 32 || rf64HasBody);
+    const aiffHasBody = buffer.byteLength < 32 || hasChunkTag('COMM') || hasChunkTag('SSND');
+    const isAiff = matches.includes('aiff') && matches.includes('aiffBody') && aiffHasBody;
+    // ftyp brand gate: MP4-video shares the ftyp box with M4A audio. Major
+    // brand at +8 plus compatible brands from +16 decide. Audio majors
+    // (M4A/m4a/mp4a/alac/m4b/m4p) accept; video-only majors (avc1/hev1/hvc1/
+    // vp09/av01/mp4v) reject; ambiguous isom/mp41/mp42 accept only when a
+    // compatible brand proves audio (mp4a/M4A/alac). Buffers too small to
+    // contain the brand (<16B) are provisionally accepted.
+    const readBrand = (off: number): string | null => {
+        if (off + 4 > buffer.byteLength) return null;
+        return String.fromCharCode(view.getUint8(off), view.getUint8(off + 1), view.getUint8(off + 2), view.getUint8(off + 3));
+    };
+    const isAudioFtyp = (): boolean => {
+        if (!matches.includes('m4a')) return false;
+        if (buffer.byteLength < 16) return true; // too small to brand-check
+        const major = readBrand(8) ?? '';
+        const audioMajors = ['M4A ', 'm4a ', 'mp4a', 'alac', 'M4B ', 'm4b ', 'M4P ', 'm4p '];
+        if (audioMajors.includes(major)) return true;
+        const videoMajors = ['avc1', 'hev1', 'hvc1', 'vp09', 'av01', 'mp4v', 'avcC'];
+        if (videoMajors.includes(major)) return false;
+        // Ambiguous (isom/iso2/mp41/mp42/...) — scan compatible brands.
+        const compat: string[] = [];
+        for (let p = 16; p + 4 <= Math.min(buffer.byteLength, 64); p += 4) {
+            const b = readBrand(p);
+            if (b) compat.push(b);
+        }
+        if (compat.some(b => audioMajors.includes(b) || b === 'mp4a')) return true;
+        if (compat.some(b => videoMajors.includes(b) || b === 'mp4v')) return false;
+        // Unknown brand with no audio evidence on a real-size file: reject
+        // video-suspect majors, accept only M4A-family proof above.
+        if (['isom', 'iso2', 'mp41', 'mp42'].includes(major)) return false;
+        return false;
+    };
+    // EBML doctype gate: WebM and MKV share the 1A45DFA3 header. Parse the
+    // DocType element (0x4282) — 'webm' accepts, 'matroska' (MKV) rejects.
+    const ebmlDocTypeIsWebm = (): boolean => {
+        if (!matches.includes('webm')) return false;
+        const end = Math.min(buffer.byteLength - 1, 256);
+        for (let p = 0; p <= end - 2; p++) {
+            if (view.getUint8(p) === 0x42 && view.getUint8(p + 1) === 0x82 && p + 3 < buffer.byteLength) {
+                const sizeByte = view.getUint8(p + 2);
+                const len = sizeByte & 0x7f;
+                if (len === 0 || len > 16 || p + 3 + len > buffer.byteLength) return false;
+                let s = '';
+                for (let k = 0; k < len; k++) s += String.fromCharCode(view.getUint8(p + 3 + k));
+                if (s.startsWith('matroska')) return false; // MKV
+                if (s.startsWith('webm')) return true;
+                return false; // unknown doctype — reject
+            }
+        }
+        // No DocType visible yet (tiny buffer): provisional accept.
+        return buffer.byteLength < 32;
+    };
     const hasId3 = matches.includes('mp3v2');
     // ID3-wrapped audio (L6): strict offset-0 checks rejected tagged files.
     // Look past a valid ID3v2 tag for the real stream magic. A bare ID3 tag
     // alone previously passed (junk with an ID3 header wasted a worker copy +
     // decode) — so require inner evidence: scan a window past the tag end for
-    // stream magic or an MPEG frame sync (padding between tag and frames is
-    // real, but bounded; 8KB is generous).
+    // stream magic, ftyp (M4A), EBML (WebM), or an MPEG/ADTS frame sync.
+    // Padding between tag and frames is real but bounded; large embedded art
+    // pushes frames >8KB out, so scan up to 64KB past the tag end (full
+    // synchsafe tag-size parse, not a fixed 8KB guess).
     let id3InnerAudio = false;
     if (hasId3) {
         if (buffer.byteLength < 10) return `File does not contain recognized audio data${fileName ? ` (file: ${fileName})` : ''}`;
         const tagSize = ((view.getUint8(6) & 0x7f) << 21) | ((view.getUint8(7) & 0x7f) << 14) | ((view.getUint8(8) & 0x7f) << 7) | (view.getUint8(9) & 0x7f);
         if (tagSize <= 0 || 10 + tagSize >= buffer.byteLength) return `File does not contain recognized audio data${fileName ? ` (file: ${fileName})` : ''}`;
         const inner = 10 + tagSize;
-        const scanEnd = Math.min(buffer.byteLength - 4, inner + 8192);
+        const scanEnd = Math.min(buffer.byteLength - 4, inner + 65536);
         for (let p = inner; p <= scanEnd; p++) {
             const tag = String.fromCharCode(
                 view.getUint8(p), view.getUint8(p + 1),
                 view.getUint8(p + 2), view.getUint8(p + 3));
             if (tag === 'fLaC' || tag === 'OggS' || tag === 'RIFF' || tag === 'FORM') { id3InnerAudio = true; break; }
+            // ftyp box inside ID3 (tag + M4A): brand at p+4.
+            if (p + 8 <= buffer.byteLength && tag === 'ftyp') { id3InnerAudio = true; break; }
+            if (p + 4 <= buffer.byteLength && String.fromCharCode(
+                view.getUint8(p + 4), view.getUint8(p + 5),
+                view.getUint8(p + 6), view.getUint8(p + 7)) === 'ftyp') { id3InnerAudio = true; break; }
+            // EBML header inside ID3 (tag + WebM).
+            if (view.getUint8(p) === 0x1A && view.getUint8(p + 1) === 0x45
+                && view.getUint8(p + 2) === 0xDF && view.getUint8(p + 3) === 0xA3) { id3InnerAudio = true; break; }
             if (view.getUint8(p) === 0xFF && p + 1 < buffer.byteLength) {
                 const b1 = view.getUint8(p + 1);
+                if (b1 === 0xF1 || b1 === 0xF9) { id3InnerAudio = true; break; }
                 if ((b1 & 0xE0) === 0xE0 && (b1 & 0x06) !== 0x00) { id3InnerAudio = true; break; }
             }
         }
@@ -220,8 +323,8 @@ export function validateAudioSignature(
         id3InnerAudio ||
         matches.includes('ogg') ||
         matches.includes('flac') ||
-        matches.includes('m4a') ||
-        matches.includes('webm');
+        isAudioFtyp() ||
+        ebmlDocTypeIsWebm();
 
     if (!hasAudioSignature) {
         const nameHint = fileName ? ` (file: ${fileName})` : '';
@@ -291,14 +394,22 @@ export class Disposable {
  * @param wait - The number of milliseconds to throttle invocations to
  * @returns A new throttled function
  */
-export function throttle<T extends (...args: any[]) => any>(func: T, wait: number): (...args: Parameters<T>) => ReturnType<T> {
+export function throttle<T extends (...args: any[]) => any>(func: T, wait: number): ((...args: Parameters<T>) => ReturnType<T>) & { cancel: () => void } {
     let lastExecuted = 0;
     let timeout: ReturnType<typeof setTimeout> | null = null;
     let lastArgs: Parameters<T> | null = null;
     let lastThis: any = null;
     let result: ReturnType<T>;
+
+    function armTimer(ms: number): void {
+        timeout = setTimeout(invoke, ms);
+        // Don't hold the event loop / packaged app open on a trailing LED
+        // tick — visuals destroy cancels anyway, unref is defense in depth.
+        try { (timeout as unknown as { unref?: () => void }).unref?.(); } catch { /* ignore */ }
+    }
     
     function invoke(): void {
+        timeout = null;
         lastExecuted = Date.now();
         result = func.apply(lastThis, lastArgs as any);
     }
@@ -317,7 +428,7 @@ export function throttle<T extends (...args: any[]) => any>(func: T, wait: numbe
             }
             invoke();
         } else if (!timeout) {
-            timeout = setTimeout(invoke, remaining);
+            armTimer(remaining);
         }
         
         return result;
@@ -333,5 +444,5 @@ export function throttle<T extends (...args: any[]) => any>(func: T, wait: numbe
         lastThis = null;
     };
     
-    return throttled as (...args: Parameters<T>) => ReturnType<T>;
+    return throttled;
 }

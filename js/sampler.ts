@@ -107,6 +107,18 @@ let bridgeRef: ElectronAPI | null = null;
 let detectBPMFn: ((buffer: AudioBuffer) => Promise<number>) | null = null;
 let masterBPMRef = { value: 0 };
 let tempoSliderRef: HTMLInputElement | null = null;
+/**
+ * Re-resolve the tempo slider from the live DOM on every SYNC start.
+ * The init-time capture goes stale across re-renders/re-inits (the sampler
+ * previously read a detached node forever and SYNC ignored the chopper).
+ */
+function resolveTempoSlider(): HTMLInputElement | null {
+    try {
+        const fresh = document.getElementById('tempoSlider') as HTMLInputElement | null;
+        if (fresh) tempoSliderRef = fresh;
+    } catch { /* ignore */ }
+    return tempoSliderRef;
+}
 /** One-time static wiring guard for initSampler (subscriptions + resize). */
 let samplerStaticWired = false;
 
@@ -707,11 +719,13 @@ export async function loadSampleFromPath(path: string, index: number): Promise<v
 
         logger.info(`[Sampler] Pad ${index}: Got ${arrayBuffer.byteLength} bytes, decoding...`);
 
-        // Use native decoder directly
+        // Use native decoder directly — slice first: decodeAudioData neuters
+        // its input, and the shared/cache-backed buffer must survive retries
+        // (matches loadSampleFile).
         if (!ensureAudio() || !audioCtx) return;
         let audioBuffer: AudioBuffer;
         try {
-            audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+            audioBuffer = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
         } catch (decErr) {
             logger.error(`[Sampler] Pad ${index} path decode failed`, decErr);
             toast.error("KIT SAMPLE UNDECODABLE");
@@ -802,7 +816,8 @@ export function startPad(index: number, opts?: { loop?: boolean }): void {
         const currentVol = padVolumes[index] !== undefined ? padVolumes[index] : DEFAULT_PAD_VOLUME;
         gainNode.gain.setValueAtTime(currentVol, audioCtx.currentTime);
         
-        let rate = tempoSliderRef ? parseFloat(tempoSliderRef.value) : 1;
+        const tempoEl = resolveTempoSlider();
+        let rate = tempoEl ? parseFloat(tempoEl.value) : 1;
         // Selection plays from its start; full sample starts at zero.
         let startOffset = region ? region.start : 0;
         
@@ -815,9 +830,14 @@ export function startPad(index: number, opts?: { loop?: boolean }): void {
             const masterBPS = masterBPMRef.value / 60; // beats per second
             const padBeatDuration = 60 / padBPMs[index]; // one beat in the pad's native time
 
-            // Get current position in the master audio
-            const playerAudio = engine.main.audio;
-            if (playerAudio && playerAudio.currentTime > 0 && !isNaN(playerAudio.duration)) {
+            // Get current position in the master audio — from the channel
+            // that is actually playing (main or crossfade), with a finite
+            // duration guard so a not-yet-loaded deck can't poison the phase.
+            const mainAudio = engine.main.audio;
+            const xAudio = engine.crossfade.audio;
+            const playerAudio = (mainAudio && !mainAudio.paused) ? mainAudio
+                : (xAudio && !xAudio.paused) ? xAudio : mainAudio;
+            if (playerAudio && playerAudio.currentTime > 0 && Number.isFinite(playerAudio.duration) && playerAudio.duration > 0) {
                 const masterBeatPhase = (playerAudio.currentTime * masterBPS) % 1; // 0-1 phase within current beat
                 // Start the pad at the same phase position within its beat cycle
                 startOffset = masterBeatPhase * padBeatDuration;
@@ -993,6 +1013,11 @@ function renderPad(index: number, existing?: HTMLElement): HTMLElement {
         recBtn.addEventListener('mouseup', (e) => { e.stopPropagation(); stopRecording(index); });
         recBtn.addEventListener('mouseleave', (e) => { e.stopPropagation(); stopRecording(index); });
         recBtn.addEventListener('click', (e) => { e.stopPropagation(); }); // Prevent file dialog from opening
+        // Global fallbacks: releasing outside the button (or alt-tabbing
+        // mid-take) previously left the mic running with no way to stop it
+        // short of re-pressing the tiny LED.
+        window.addEventListener('mouseup', () => { try { stopRecording(index); } catch { /* ignore */ } });
+        window.addEventListener('blur', () => { try { stopRecording(index); } catch { /* ignore */ } });
 
         pad.addEventListener('dragover', (e) => { e.preventDefault(); e.stopPropagation(); pad.classList.add('drag-over'); });
         pad.addEventListener('dragleave', (e) => { e.preventDefault(); e.stopPropagation(); pad.classList.remove('drag-over'); });
@@ -1045,8 +1070,7 @@ function renderPad(index: number, existing?: HTMLElement): HTMLElement {
                     }
                 };
                 const onUp = (): void => {
-                    window.removeEventListener('mousemove', onMove);
-                    window.removeEventListener('mouseup', onUp);
+                    cleanupDrag();
                     const a = Math.min(frac0, cur);
                     const b = Math.max(frac0, cur);
                     if ((b - a) * buf.duration < 0.02) {
@@ -1063,8 +1087,25 @@ function renderPad(index: number, existing?: HTMLElement): HTMLElement {
                         logger.error(`[Sampler] Waveform select failed for pad ${index}:`, err);
                     }
                 };
+                // Blur/Esc mid-drag previously leaked the window listeners and
+                // left a phantom selection overlay; both now cancel cleanly.
+                const cleanupDrag = (): void => {
+                    window.removeEventListener('mousemove', onMove);
+                    window.removeEventListener('mouseup', onUp);
+                    window.removeEventListener('blur', onDragCancel);
+                    document.removeEventListener('keydown', onDragKey, true);
+                };
+                const onDragCancel = (): void => {
+                    cleanupDrag();
+                    try { renderWaveform(index); } catch { /* ignore */ }
+                };
+                const onDragKey = (ev: KeyboardEvent): void => {
+                    if (ev.key === 'Escape') onDragCancel();
+                };
                 window.addEventListener('mousemove', onMove);
                 window.addEventListener('mouseup', onUp);
+                window.addEventListener('blur', onDragCancel);
+                document.addEventListener('keydown', onDragKey, true);
             });
         }
 
@@ -1295,7 +1336,7 @@ async function startRecording(index: number): Promise<void> {
 
              try {
                 if (!ensureAudio() || !audioCtx) { toast.error("AUDIO NOT READY"); return; }
-                const decodedBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+                const decodedBuffer = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
                 padBuffers[index] = decodedBuffer;
                 padPaths[index] = `REC_${Date.now()}`;
                 padWaveforms[index] = computeWaveform(decodedBuffer);
@@ -1463,6 +1504,13 @@ async function loadKitDialog(): Promise<void> {
             // fire-and-forget spiked 16 decodes at once (C19 OOM note).
             const withTimeout = <T>(p: Promise<T>, ms: number): Promise<T> =>
                 Promise.race([p, new Promise<T>((_, rej) => setTimeout(() => rej(new Error('kit pad timeout')), ms))]);
+            // Pads absent from the kit previously kept their old samples —
+            // loading a sparser kit over a full one silently merged both.
+            const kitIdx = new Set<number>();
+            for (const p of (kit.pads as KitPad[]).slice(0, NUM_PADS)) {
+                const idx = Number((p as KitPad)?.index);
+                if (Number.isInteger(idx) && idx >= 0 && idx < NUM_PADS) kitIdx.add(idx);
+            }
             for (const p of (kit.pads as KitPad[]).slice(0, NUM_PADS)) {
                 // Validate pad index from untrusted JSON — out-of-range values
                 // would write stray properties past the pad arrays.
@@ -1497,6 +1545,27 @@ async function loadKitDialog(): Promise<void> {
                 }
                 updatePadVisuals(idx);
             }
+            // Clear pads the kit doesn't mention (silent — clearPad() toasts
+            // per pad and would spam one toast per empty slot).
+            let clearedAbsent = 0;
+            for (let i = 0; i < NUM_PADS; i++) {
+                if (kitIdx.has(i)) continue;
+                if (!padBuffers[i] && !padPaths[i]) continue;
+                try { stopPad(i); } catch { /* ignore */ }
+                delete padBuffers[i];
+                delete padPaths[i];
+                delete padWaveforms[i];
+                delete padBeatPositions[i];
+                delete padBPMs[i];
+                delete padSyncState[i];
+                padSelections[i] = null;
+                padLoopStart[i] = -1;
+                padLoopEnd[i] = -1;
+                padPlayState[i] = null;
+                updatePadVisuals(i);
+                clearedAbsent++;
+            }
+            if (clearedAbsent > 0) toast.info(`${clearedAbsent} PAD(S) CLEARED (ABSENT FROM KIT)`);
             document.dispatchEvent(new CustomEvent('ug:dataChanged'));
         }
     } catch (err) {

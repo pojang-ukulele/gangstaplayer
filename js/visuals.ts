@@ -82,6 +82,9 @@ export function destroyVisuals(): void {
         try { cancelAnimationFrame(_rafHandle); } catch { /* ignore */ }
         _rafHandle = null;
     }
+    // Cancel the trailing LED throttle tick (unref'd, but cancel is explicit
+    // so no post-destroy DOM write fires on detached LEDs).
+    try { updateLEDs.cancel(); } catch { /* ignore */ }
     if (_visibilityWired) {
         try { document.removeEventListener('visibilitychange', onVisibilityChange); } catch { /* ignore */ }
         _visibilityWired = false;

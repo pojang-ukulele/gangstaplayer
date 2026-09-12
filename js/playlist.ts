@@ -242,7 +242,10 @@ export function initPlaylist(deps: PlaylistDeps): void {
             container: playlistEl,
             items: state.playlist,
             itemHeight: ITEM_HEIGHT,
-            renderItem: (track, index, existing) => renderTrackRow(track, index, existing)
+            renderItem: (track, index, existing) => renderTrackRow(track, index, existing),
+            // Key rows by track id so reorder/filter recycles by identity,
+            // not by recycled index.
+            keyOf: (track) => (track && track.id) || ''
         });
     }
 }
@@ -267,22 +270,27 @@ let _analysisDropToastAt = 0;
 function enqueueAnalysis(track: Track): void {
     // Bounded queue — bulk imports previously queued N unbounded decodes.
     if (_analysisQueue.length >= 256) {
-        // Silent drop previously left the tail showing "[...] analyzing"
-        // forever with no toast. Mark unknown + notify (throttled).
-        try {
-            const idx = state.playlist.findIndex(t => t.id === track.id);
-            if (idx >= 0) {
-                const next = [...state.playlist];
-                next[idx] = { ...next[idx], bpm: 0 };
-                state.update({ playlist: next });
-            }
-        } catch { /* ignore */ }
+        // Requeue instead of a silent bpm:0: the track keeps its analyzing
+        // state and retries once the queue drains (stale/dequeued tracks are
+        // dropped by the guards). Throttled toast, not a silent mark.
         try {
             const now = Date.now();
             if (now - _analysisDropToastAt > 10000) {
                 _analysisDropToastAt = now;
-                toast.info('ANALYSIS QUEUE FULL — SOME BPM SKIPPED');
+                toast.info('ANALYSIS QUEUE FULL — RETRYING...');
             }
+        } catch { /* ignore */ }
+        try {
+            const retryId = track?.id;
+            const t = setTimeout(() => {
+                try {
+                    if (!retryId) return;
+                    if (!state.playlist.some(x => x.id === retryId)) return;
+                    if (_analysisIds.has(retryId)) return;
+                    enqueueAnalysis(track);
+                } catch { /* ignore */ }
+            }, 2000);
+            (t as unknown as { unref?: () => void })?.unref?.();
         } catch { /* ignore */ }
         return;
     }
@@ -371,9 +379,11 @@ async function analyzeTrackInBackground(track: Track): Promise<void> {
         // Use native decoder (decoder pool workers are unreliable).
         // Bounded: a hung decode previously occupied one of the 2 slots
         // forever, halving throughput for the rest of the session.
+        // Slice before decode: decodeAudioData neuters its input, and a
+        // retry/double-post over the same buffer would see it detached.
         if (!ensureAudio() || !audioCtx) return;
         const audioBuffer = await Promise.race([
-            audioCtx.decodeAudioData(arrayBuffer),
+            audioCtx.decodeAudioData(arrayBuffer.slice(0)),
             new Promise<never>((_, reject) => {
                 const t = setTimeout(() => reject(new Error('decode timeout')), 30000);
                 (t as any)?.unref?.();
@@ -557,6 +567,43 @@ function viewIndexToFullIndex(viewIdx: number): number {
     const t = _filteredView[viewIdx];
     if (!t) return -1;
     return state.playlist.findIndex(x => x.id === t.id);
+}
+
+/**
+ * Drop a stale context-menu target after any playlist mutation — the stored
+ * ctxIndex otherwise points at an unrelated row once rows shift.
+ */
+function invalidateCtxIndex(): void {
+    try {
+        const menu = document.getElementById('contextMenu');
+        if (!menu || menu.dataset.ctxIndex === undefined) return;
+        const idx = parseInt(menu.dataset.ctxIndex);
+        if (!Number.isInteger(idx) || idx < 0 || idx >= state.playlist.length) {
+            delete menu.dataset.ctxIndex;
+        }
+    } catch { /* ignore */ }
+}
+
+/**
+ * Resolve the context-menu target track: prefers the full-list ctxIndex,
+ * falls back to the (possibly filtered) view selection mapped by id so
+ * track actions never operate on the wrong row while filtered.
+ */
+function resolveCtxTrack(): Track | undefined {
+    try {
+        const target = getContextTargetIndex();
+        if (target >= 0 && state.playlist[target]) return state.playlist[target];
+        if (_isFiltering && _filteredView && state.selectedIndices.length) {
+            const vt = _filteredView[state.selectedIndices[0]];
+            if (vt) {
+                const full = state.playlist.find(x => x.id === vt.id);
+                if (full) return full;
+            }
+        }
+        const first = state.selectedIndices[0];
+        if (Number.isInteger(first) && first >= 0) return state.playlist[first];
+    } catch { /* ignore */ }
+    return undefined;
 }
 
 function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HTMLElement {
@@ -924,6 +971,7 @@ export function clearPlaylist(): void {
             isCrossfadeInProgress: false,
             blendingIndex: -1,
         });
+        invalidateCtxIndex();
         try { toast.info('PLAYLIST CLEARED'); } catch { /* ignore */ }
     };
     if (state.isPlaying || state.isCrossfadeInProgress) {
@@ -1106,6 +1154,7 @@ function reorderPlaylist(fromIndex: number, toIndex: number, insertAfter: boolea
             ...(newCur !== curIdx ? { currentTrackIndex: newCur } : {})
         });
     }
+    invalidateCtxIndex();
 }
 
 // === NEW: KEYBOARD NAVIGATION ===
@@ -1206,6 +1255,18 @@ export function removeSelectedTracks(): void {
     
     // Remap currentTrackIndex against the new list — previously deleting the
     // playing track left the index pointing at an unrelated song.
+    // blendingIndex mirrors the same remap (it pointed at unrelated rows
+    // after any removal above it).
+    const blendIndex = state.blendingIndex;
+    const blendRemoved = blendIndex >= 0 && currentSelected.includes(blendIndex);
+    let newBlend = blendIndex;
+    if (blendRemoved) {
+        newBlend = -1;
+    } else if (blendIndex >= 0) {
+        const removedBeforeBlend = currentSelected.filter(idx => idx < blendIndex).length;
+        newBlend = blendIndex - removedBeforeBlend;
+        if (newBlend >= currentPlaylist.length) newBlend = currentPlaylist.length - 1;
+    }
     let newIndex = currentIndex;
     if (playingTrackRemoved) {
         newIndex = -1;
@@ -1215,7 +1276,7 @@ export function removeSelectedTracks(): void {
         try { engine.main.audio.removeAttribute('src'); engine.main.audio.load(); } catch { try { engine.main.audio.src = ""; } catch { /* ignore */ } }
         try { engine.crossfade.audio.pause(); } catch { /* ignore */ }
         try { engine.crossfade.audio.removeAttribute('src'); engine.crossfade.audio.load(); } catch { try { engine.crossfade.audio.src = ""; } catch { /* ignore */ } }
-        try { setBlendingIndex(-1); } catch { /* ignore */ }
+        try { setBlendingIndex(newBlend); } catch { /* ignore */ }
         state.update({ isPlaying: false, masterBPM: 0, isCrossfadeInProgress: false });
     } else if (currentIndex >= 0) {
         const removedBefore = currentSelected.filter(idx => idx < currentIndex).length;
@@ -1233,11 +1294,13 @@ export function removeSelectedTracks(): void {
     const newSelected: number[] = [];
     anchorIndex = currentPlaylist.length > 0 ? newAnchor : -1;
     pivotIndex = currentPlaylist.length > 0 ? newPivot : -1;
-    state.update({ 
-        playlist: currentPlaylist, 
+    state.update({
+        playlist: currentPlaylist,
         selectedIndices: newSelected,
-        ...(newIndex !== state.currentTrackIndex ? { currentTrackIndex: newIndex } : {})
+        ...(newIndex !== state.currentTrackIndex ? { currentTrackIndex: newIndex } : {}),
+        ...(newBlend !== state.blendingIndex ? { blendingIndex: newBlend } : {})
     });
+    invalidateCtxIndex();
 }
 
 let _handlersWired = false;
@@ -1373,15 +1436,11 @@ export function setupPlaylistHandlers(): void {
     if (ctxAnalyzeBPM) ctxAnalyzeBPM.addEventListener('click', () => {
         const target = getContextTargetIndex();
         let indices = state.selectedIndices.length ? [...state.selectedIndices] : (target >= 0 ? [target] : []);
-        // H26: selection is view-relative while filtered — resolve to full
+        // Selection is view-relative while filtered — resolve to full
         // indices by id before reanalyzing the real queue.
         if (_isFiltering && _filteredView) {
             indices = indices
-                .map(vi => {
-                    const t = _filteredView![vi];
-                    if (!t) return -1;
-                    return state.playlist.findIndex(x => x.id === t.id);
-                })
+                .map(vi => viewIndexToFullIndex(vi))
                 .filter(i => i >= 0);
             if (target >= 0 && !indices.includes(target)) indices.push(target);
         }
@@ -1393,15 +1452,7 @@ export function setupPlaylistHandlers(): void {
     });
 
     if (ctxTrackInfo) ctxTrackInfo.addEventListener('click', () => {
-        const target = getContextTargetIndex();
-        // H26: selectedIndices are view-relative while filtered; prefer the
-        // full-list context target, else resolve the view selection by id.
-        let selTrack: Track | undefined;
-        if (_isFiltering && _filteredView && state.selectedIndices.length) {
-            const vt = _filteredView[state.selectedIndices[0]];
-            if (vt) selTrack = state.playlist.find(x => x.id === vt.id);
-        }
-        const track = state.playlist[target] ?? selTrack ?? state.playlist[state.selectedIndices[0]];
+        const track = resolveCtxTrack();
         if (!track) {
             try { toast.info('NO TRACK SELECTED'); } catch { /* ignore */ }
             return;
@@ -1410,13 +1461,7 @@ export function setupPlaylistHandlers(): void {
     });
 
     if (ctxShowInFolder) ctxShowInFolder.addEventListener('click', () => {
-        const target = getContextTargetIndex();
-        let selTrack2: Track | undefined;
-        if (_isFiltering && _filteredView && state.selectedIndices.length) {
-            const vt = _filteredView[state.selectedIndices[0]];
-            if (vt) selTrack2 = state.playlist.find(x => x.id === vt.id);
-        }
-        const track = state.playlist[target] ?? selTrack2 ?? state.playlist[state.selectedIndices[0]];
+        const track = resolveCtxTrack();
         if (!track) return;
         const show = window.fileSystem?.showItemInFolder;
         if (typeof show !== 'function') {
@@ -1431,13 +1476,7 @@ export function setupPlaylistHandlers(): void {
     });
 
     if (ctxCopyPath) ctxCopyPath.addEventListener('click', () => {
-        const target = getContextTargetIndex();
-        let selTrack3: Track | undefined;
-        if (_isFiltering && _filteredView && state.selectedIndices.length) {
-            const vt = _filteredView[state.selectedIndices[0]];
-            if (vt) selTrack3 = state.playlist.find(x => x.id === vt.id);
-        }
-        const track = state.playlist[target] ?? selTrack3 ?? state.playlist[state.selectedIndices[0]];
+        const track = resolveCtxTrack();
         if (!track) return;
         const done = () => { try { toast.success('FILE PATH COPIED'); } catch { /* ignore */ } };
         const fail = () => { try { toast.error('COPY FAILED'); } catch { /* ignore */ } };
@@ -1480,6 +1519,9 @@ export function setupPlaylistHandlers(): void {
         if (!sel.size) { state.update({ selectedIndices: [] }); return; }
         const sorted = [...sel].sort((a, b) => a - b);
         if (sorted[0] <= 0) return;
+        // Anchor/pivot follow their tracks by id (block moves shift
+        // unselected rows by more than one — arithmetic remap is wrong).
+        const beforeIdsUp = state.playlist.map(t => t?.id);
         // Ascending; skip swap when predecessor is also selected so
         // contiguous blocks move together instead of reversing.
         for (const idx of sorted) {
@@ -1495,6 +1537,14 @@ export function setupPlaylistHandlers(): void {
             selectedIndices: [...sel],
             ...(newCur !== state.currentTrackIndex ? { currentTrackIndex: newCur } : {}),
         });
+        const remapUp = (p: number): number => {
+            if (!Number.isInteger(p) || p < 0 || p >= beforeIdsUp.length) return p;
+            const ni = list.findIndex(t => t?.id === beforeIdsUp[p]);
+            return ni >= 0 ? ni : p;
+        };
+        anchorIndex = remapUp(anchorIndex);
+        pivotIndex = remapUp(pivotIndex);
+        invalidateCtxIndex();
     });
 
     if (ctxMoveDown) ctxMoveDown.addEventListener('click', () => {
@@ -1508,6 +1558,8 @@ export function setupPlaylistHandlers(): void {
         if (!sel.size) { state.update({ selectedIndices: [] }); return; }
         const sorted = [...sel].sort((a, b) => b - a);
         if (sorted[0] >= list.length - 1) return;
+        // Anchor/pivot follow their tracks by id (see move-up).
+        const beforeIdsDown = state.playlist.map(t => t?.id);
         // Descending; skip swap when successor is also selected (block move).
         for (const idx of sorted) {
             if (sel.has(idx + 1)) continue;
@@ -1522,5 +1574,13 @@ export function setupPlaylistHandlers(): void {
             selectedIndices: [...sel],
             ...(newCur !== state.currentTrackIndex ? { currentTrackIndex: newCur } : {}),
         });
+        const remapDown = (p: number): number => {
+            if (!Number.isInteger(p) || p < 0 || p >= beforeIdsDown.length) return p;
+            const ni = list.findIndex(t => t?.id === beforeIdsDown[p]);
+            return ni >= 0 ? ni : p;
+        };
+        anchorIndex = remapDown(anchorIndex);
+        pivotIndex = remapDown(pivotIndex);
+        invalidateCtxIndex();
     });
 }

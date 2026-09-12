@@ -8,17 +8,26 @@
  */
 
 declare const sampleRate: number;
-declare function registerProcessor(name: string, processorClass: any): void;
+declare function registerProcessor(name: string, processorClass: unknown): void;
+
+// P3-I decision (documented): wire parameters + per-channel state (NOT dead
+// ladder deletion). The bypass below is an intentional documented passthrough
+// (P1): at default knob positions the crusher/drive/filter are mathematical
+// no-ops, so quanta copy through to save CPU. Non-default positions run the
+// full 2x-oversampled ladder with per-channel state (stateL/stateR + prevL/
+// prevR never shared across channels).
 
 // Define a minimal interface for the class to satisfy the compiler
 interface AudioWorkletProcessorInstance {
     readonly port: MessagePort;
-    process(inputs: Float32Array[][], outputs: Float32Array[][], parameters: Record<string, any>): boolean;
+    process(inputs: Float32Array[][], outputs: Float32Array[][], parameters: Record<string, Float32Array>): boolean;
 }
 
-const GBaseProcessor = (globalThis as any).AudioWorkletProcessor as {
-    new(): AudioWorkletProcessorInstance;
-};
+interface GangstaProcessorGlobals {
+    AudioWorkletProcessor: new () => AudioWorkletProcessorInstance;
+}
+
+const GBaseProcessor = (globalThis as unknown as GangstaProcessorGlobals).AudioWorkletProcessor;
 
 class GangstaProcessor extends GBaseProcessor {
   static get parameterDescriptors() {
@@ -53,15 +62,19 @@ class GangstaProcessor extends GBaseProcessor {
   }
 
   /** Passthrough the unprocessed tail so a mid-block reset degrades to dry
-   * instead of leaving stale/zero samples (click). */
+   * instead of leaving stale/zero samples (click). P1 passthrough: kept
+   * intact — channel-indexed over inputs[0]/outputs[0], never shared. */
   private passthroughFrom(inputs: Float32Array[][], outputs: Float32Array[][], from: number): void {
     try {
-      const count = inputs[0]?.length ?? 0;
-      for (let channel = 0; channel < inputs.length; channel++) {
-        const chanIn = inputs[channel];
-        const chanOut = outputs[channel];
+      const chanIn0 = inputs[0];
+      const chanOut0 = outputs[0];
+      if (!chanIn0 || !chanOut0) return;
+      const count = Math.min(chanIn0.length, chanOut0.length);
+      for (let channel = 0; channel < count; channel++) {
+        const chanIn = chanIn0[channel];
+        const chanOut = chanOut0[channel];
         if (!chanIn || !chanOut) continue;
-        const m = Math.min(chanIn.length, chanOut.length, count);
+        const m = Math.min(chanIn.length, chanOut.length);
         for (let i = from; i < m; i++) chanOut[i] = chanIn[i];
       }
     } catch { /* ignore */ }

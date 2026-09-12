@@ -9,6 +9,12 @@
 // modal) removes the CORRECT modal instead of popping an unrelated top.
 const _focusStack: Array<{ modal: HTMLElement; prev: HTMLElement | null }> = [];
 
+/** Typed trap-wiring flag (no any-cast). Single source for getTopModal —
+// main.ts must import from here instead of keeping a dupe (P3-G). */
+interface TrappableModal extends HTMLElement {
+    __ugTrapWired?: boolean;
+}
+
 function getPlaylistFocusHook(): {
     __ugGetPlaylistFocused?: () => boolean;
     __ugSetPlaylistFocused?: (v: boolean) => void;
@@ -57,7 +63,9 @@ export function openModal(modal: HTMLElement): void {
     } catch { /* non-browser boot */ }
     modal.classList.add('active');
     modal.setAttribute('aria-hidden', 'false');
-    // Focus the first focusable element inside the modal
+    // Focus the first focusable element inside the modal — only if still
+    // open when the timer fires (guarded 50ms: an early close must not yank
+    // focus back into a hidden dialog).
     const firstFocusable = modal.querySelector<HTMLElement>(
         'button, input, select, textarea, [tabindex]:not([tabindex="-1"])'
     );
@@ -70,9 +78,10 @@ export function openModal(modal: HTMLElement): void {
         }, 50);
     }
     // Focus trap: Tab cycles inside the topmost modal instead of escaping
-    // to the deck behind it.
-    if (!(modal as any).__ugTrapWired) {
-        (modal as any).__ugTrapWired = true;
+    // to the deck behind it. Wired per modal (incl. nested) with a typed flag.
+    const trappable = modal as TrappableModal;
+    if (!trappable.__ugTrapWired) {
+        trappable.__ugTrapWired = true;
         modal.addEventListener('keydown', (e) => {
             if (e.key !== 'Tab') return;
             if (!modal.classList.contains('active')) return;
@@ -86,6 +95,10 @@ export function openModal(modal: HTMLElement): void {
             else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
         });
     }
+    // Escape ownership lives solely in main.ts setupGlobalKeyboardShortcuts
+    // (single owner: topmost modal via getTopModal, confirm drains through
+    // its No-button path). modals.ts must NOT install a second document
+    // Escape handler — two owners double-answer No on queued confirms.
 }
 
 /** Topmost open modal in DOM order (last .active wins, not first). */
@@ -139,18 +152,39 @@ export function closeModal(modal: HTMLElement): void {
 type ConfirmReq = { title: string; message: string; onYes: () => void | Promise<void>; onNo?: () => void };
 const _confirmQueue: ConfirmReq[] = [];
 let _confirmOpen = false;
+// Bounded missing-DOM retries: a deleted confirmModal previously re-armed
+// setTimeout(_drainConfirmQueue, 0) forever. After MAX fails, hard-fail loud
+// (console + onNo for the whole queue) instead of recursing.
+let _confirmMissingStreak = 0;
+const MAX_CONFIRM_MISSING = 5;
+
+function _failConfirmQueue(reason: string): void {
+    try { console.error(`[Modals] confirmModal hard fail: ${reason}`); } catch { /* ignore */ }
+    _confirmOpen = false;
+    _confirmMissingStreak = 0;
+    const rest = _confirmQueue.splice(0, _confirmQueue.length);
+    for (const req of rest) {
+        try { req.onNo?.(); } catch { /* ignore */ }
+    }
+}
 
 function _drainConfirmQueue(): void {
     if (_confirmOpen) return;
     const next = _confirmQueue.shift();
-    if (!next) return;
-    const modal = document.getElementById('confirmModal');
+    if (!next) { _confirmMissingStreak = 0; return; }
+    const modal = typeof document !== 'undefined' ? document.getElementById('confirmModal') : null;
     if (!modal) {
         // Missing modal previously wedged the queue — every future confirm hung.
         try { next.onNo?.(); } catch { /* ignore */ }
+        _confirmMissingStreak++;
+        if (_confirmMissingStreak >= MAX_CONFIRM_MISSING) {
+            _failConfirmQueue('confirmModal missing from DOM');
+            return;
+        }
         setTimeout(_drainConfirmQueue, 0);
         return;
     }
+    _confirmMissingStreak = 0;
     const titleEl = document.getElementById('confirmTitle');
     const msgEl = document.getElementById('confirmMessage');
     const yesBtn = document.getElementById('confirmYes');
@@ -161,6 +195,11 @@ function _drainConfirmQueue(): void {
     if (!yesBtn || !noBtn) {
         // Partial DOM must not wedge the queue open.
         try { next.onNo?.(); } catch { /* ignore */ }
+        _confirmMissingStreak++;
+        if (_confirmMissingStreak >= MAX_CONFIRM_MISSING) {
+            _failConfirmQueue('confirmModal buttons missing from DOM');
+            return;
+        }
         setTimeout(_drainConfirmQueue, 0);
         return;
     }

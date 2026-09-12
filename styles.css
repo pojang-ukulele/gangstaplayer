@@ -1,4 +1,7 @@
-@import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&family=VT323&display=swap');
+/* Fonts: offline-first system stack (no render-blocking @import).
+ * The Google Fonts @import previously blocked first render on slow networks
+ * and left pixel-font fallbacks undefined offline. Pixel faces degrade to
+ * monospace system fonts until the user installs them locally. */
 
 :root {
     --bg-color: #111;
@@ -51,7 +54,7 @@
 .title-icon {
     color: var(--neon-green);
     margin-right: 10px;
-    font-family: 'Press Start 2P';
+    font-family: 'Press Start 2P', 'Courier New', monospace;
     font-size: 0.8rem;
 }
 
@@ -141,7 +144,7 @@ body {
 }
 
 h1 {
-    font-family: 'Press Start 2P', cursive;
+    font-family: 'Press Start 2P', 'Courier New', monospace;
     font-size: clamp(1rem, 2.5vw, 2rem);
     color: #2a9e14;
     text-shadow: 2px 2px 0px #000;
@@ -2115,7 +2118,7 @@ input[type=range]:focus-visible {
     margin-top: 5%;
 }
 
-/* === TOAST NOTIFICATIONS === */
+/* === TOAST NOTIFICATIONS (display-only: never intercept deck/modal input) === */
 .toast-container {
     position: fixed;
     bottom: 20px;
@@ -2124,6 +2127,7 @@ input[type=range]:focus-visible {
     display: flex;
     flex-direction: column;
     gap: 10px;
+    pointer-events: none;
 }
 
 .toast {
@@ -2136,7 +2140,14 @@ input[type=range]:focus-visible {
     text-transform: uppercase;
     box-shadow: 0 0 15px var(--neon-green);
     min-width: 250px;
+    pointer-events: none;
     animation: toast-in 0.3s ease-out forwards;
+}
+
+.toast-info {
+    color: #4aa8ff;
+    border-color: #4aa8ff;
+    box-shadow: 0 0 15px #4aa8ff;
 }
 
 .toast-error {
@@ -2151,6 +2162,8 @@ input[type=range]:focus-visible {
     box-shadow: 0 0 15px #39ff14;
 }
 
+/* Fade-out timing matches toast.ts FADE_OUT_MS (500ms): the .fade-out class
+ * is added at duration-expiry and the node is removed after this animation. */
 .toast.fade-out {
     animation: toast-out 0.5s ease-in forwards;
 }
@@ -2163,6 +2176,23 @@ input[type=range]:focus-visible {
 @keyframes toast-out {
     from { transform: translateX(0); opacity: 1; }
     to { transform: translateX(100%); opacity: 0; }
+}
+
+/* Boot failure banner (boot-fallback.js): visible fail-loud instead of blank. */
+#bootError {
+    background: #2a0000;
+    color: #ff8080;
+    border: 1px solid #ff3131;
+    box-shadow: 0 0 15px rgba(255, 49, 49, 0.6);
+    padding: 12px 20px;
+    margin-bottom: 12px;
+    max-width: 1100px;
+    width: 100%;
+    font-family: 'Courier New', Courier, monospace;
+    font-weight: bold;
+}
+#bootError[hidden] {
+    display: none;
 }
 
 /* --- UTILITIES & COMPONENTS EXTRACTED FROM HTML --- */

@@ -21,16 +21,26 @@ export class VirtualScroller<T> {
     private readonly disposables = new Disposable();
     private _onScroll: () => void;
 
+    private keyOf: ((item: T, index: number) => string) | null;
+
     constructor(options: {
         container: HTMLElement;
         items: T[];
         itemHeight: number;
         renderItem: (item: T, index: number, existing?: HTMLElement) => HTMLElement;
+        /**
+         * Stable row identity (e.g. track id). When present, a visible node
+         * whose key no longer matches the item at its index is discarded
+         * and recreated instead of being re-rendered in place — index reuse
+         * after reorder/filter previously showed stale rows for a frame.
+         */
+        keyOf?: (item: T, index: number) => string;
     }) {
         this.container = options.container;
         this.items = options.items;
         this.itemHeight = options.itemHeight;
         this.renderItem = options.renderItem;
+        this.keyOf = typeof options.keyOf === 'function' ? options.keyOf : null;
 
         // Container setup
         this.container.style.position = 'relative';
@@ -104,9 +114,22 @@ export class VirtualScroller<T> {
         const startIdx = Math.max(0, Math.floor(scrollTop / this.itemHeight) - 5);
         const endIdx = Math.min(this.items.length - 1, Math.ceil((scrollTop + viewportHeight) / this.itemHeight) + 5);
 
-        // Remove items no longer visible
+        // Key of the item currently at an index ('': unknown when keyless).
+        const keyAt = (idx: number): string => {
+            if (!this.keyOf) return '';
+            try {
+                const item = this.items[idx];
+                if (item === undefined) return '';
+                return this.keyOf(item, idx) ?? '';
+            } catch { return ''; }
+        };
+        // Remove items no longer visible — or whose key moved away (reorder
+        // swapped in a different item under a recycled index).
         for (const [idx, el] of Array.from(this.visibleItems)) {
             if (idx < startIdx || idx > endIdx || idx >= this.items.length) {
+                el.remove();
+                this.visibleItems.delete(idx);
+            } else if (this.keyOf && (el as HTMLElement).dataset.vsKey !== undefined && (el as HTMLElement).dataset.vsKey !== keyAt(idx)) {
                 el.remove();
                 this.visibleItems.delete(idx);
             } else if (force) {
@@ -138,6 +161,9 @@ export class VirtualScroller<T> {
                     el.style.top = `${idx * this.itemHeight}px`;
                     el.style.width = '100%';
                     el.style.height = `${this.itemHeight}px`;
+                    if (this.keyOf) {
+                        try { el.dataset.vsKey = keyAt(idx); } catch { /* ignore */ }
+                    }
                 }
             }
         }
@@ -155,6 +181,9 @@ export class VirtualScroller<T> {
                 el.style.top = `${i * this.itemHeight}px`;
                 el.style.width = '100%';
                 el.style.height = `${this.itemHeight}px`;
+                if (this.keyOf) {
+                    try { el.dataset.vsKey = keyAt(i); } catch { /* ignore */ }
+                }
                 this.contentEl.appendChild(el);
                 this.visibleItems.set(i, el);
             }
@@ -170,6 +199,9 @@ export class VirtualScroller<T> {
 
     public scrollTo(index: number) {
         if (!Number.isFinite(index)) return;
+        // Empty-list guard: length - 1 is -1 and the old clamp resolved to
+        // index 0 on an empty viewport (scrollTop write into a void list).
+        if (this.items.length === 0) return;
         const clamped = Math.max(0, Math.min(this.items.length - 1, Math.floor(index)));
         this.container.scrollTop = clamped * this.itemHeight;
     }

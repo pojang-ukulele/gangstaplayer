@@ -85,43 +85,89 @@ async function build() {
     // 6. Bundle Worker
     // Worklets/workers must stay classic scripts (registerProcessor / Worker
     // entry) — pin iife explicitly so an esbuild default change can't ship ESM.
+    // Fail loud: a missing entry previously skipped silently and shipped a
+    // build with no audio-worker (renderer dies packaged-only).
+    const workerOutputs = [];
     const workerEntry = resolveEntry('js/workers/audio-worker.js');
-    if (fs.existsSync(workerEntry)) {
-        await esbuild.build({
-            entryPoints: [workerEntry],
-            bundle: true,
-            platform: 'browser',
-            format: 'iife',
-            outfile: path.join(BUILD_DIR, 'js', 'workers', 'audio-worker.js'),
-            minify: MINIFY,
-            sourcemap: SOURCEMAP,
-        });
+    if (!fs.existsSync(workerEntry)) {
+        throw new Error(`Build entry missing: audio-worker at ${workerEntry}`);
     }
+    await esbuild.build({
+        entryPoints: [workerEntry],
+        bundle: true,
+        platform: 'browser',
+        format: 'iife',
+        outfile: path.join(BUILD_DIR, 'js', 'workers', 'audio-worker.js'),
+        minify: MINIFY,
+        sourcemap: SOURCEMAP,
+    });
+    workerOutputs.push(path.join(BUILD_DIR, 'js', 'workers', 'audio-worker.js'));
 
     const processorEntry = resolveEntry('js/workers/gangsta-processor.js');
-    if (fs.existsSync(processorEntry)) {
-        await esbuild.build({
-            entryPoints: [processorEntry],
-            bundle: true,
-            platform: 'browser',
-            format: 'iife',
-            outfile: path.join(BUILD_DIR, 'js', 'workers', 'gangsta-processor.js'),
-            minify: MINIFY,
-            sourcemap: SOURCEMAP,
-        });
+    if (!fs.existsSync(processorEntry)) {
+        throw new Error(`Build entry missing: gangsta-processor at ${processorEntry}`);
     }
+    await esbuild.build({
+        entryPoints: [processorEntry],
+        bundle: true,
+        platform: 'browser',
+        format: 'iife',
+        outfile: path.join(BUILD_DIR, 'js', 'workers', 'gangsta-processor.js'),
+        minify: MINIFY,
+        sourcemap: SOURCEMAP,
+    });
+    workerOutputs.push(path.join(BUILD_DIR, 'js', 'workers', 'gangsta-processor.js'));
 
     const recorderEntry = resolveEntry('js/workers/recorder-processor.js');
-    if (fs.existsSync(recorderEntry)) {
-        await esbuild.build({
-            entryPoints: [recorderEntry],
-            bundle: true,
-            platform: 'browser',
-            format: 'iife',
-            outfile: path.join(BUILD_DIR, 'js', 'workers', 'recorder-processor.js'),
-            minify: MINIFY,
-            sourcemap: SOURCEMAP,
-        });
+    if (!fs.existsSync(recorderEntry)) {
+        throw new Error(`Build entry missing: recorder-processor at ${recorderEntry}`);
+    }
+    await esbuild.build({
+        entryPoints: [recorderEntry],
+        bundle: true,
+        platform: 'browser',
+        format: 'iife',
+        outfile: path.join(BUILD_DIR, 'js', 'workers', 'recorder-processor.js'),
+        minify: MINIFY,
+        sourcemap: SOURCEMAP,
+    });
+    workerOutputs.push(path.join(BUILD_DIR, 'js', 'workers', 'recorder-processor.js'));
+
+    // Post-build existence verification: every worker output must exist and
+    // be non-empty, or the packaged app fails at `new Worker` (dev passes).
+    for (const out of workerOutputs) {
+        let ok = false;
+        try {
+            const st = fs.statSync(out);
+            ok = st.isFile() && st.size > 0;
+        } catch { ok = false; }
+        if (!ok) {
+            throw new Error(`Worker output missing or empty after build: ${out}`);
+        }
+    }
+    console.log(`Verified ${workerOutputs.length} worker output(s).`);
+
+    console.log('Building Boot Fallback...');
+    // CSP-safe classic script (no imports): copied verbatim so a main-module
+    // load failure still surfaces #bootError instead of a blank deck.
+    const bootEntry = resolveEntry('js/boot-fallback.js');
+    if (!fs.existsSync(bootEntry)) {
+        throw new Error(`Build entry missing: boot fallback at ${bootEntry}`);
+    }
+    await esbuild.build({
+        entryPoints: [bootEntry],
+        bundle: false,
+        platform: 'browser',
+        format: 'iife',
+        outfile: path.join(BUILD_DIR, 'js', 'boot-fallback.js'),
+        minify: MINIFY,
+        sourcemap: SOURCEMAP,
+    });
+    {
+        const st = fs.statSync(path.join(BUILD_DIR, 'js', 'boot-fallback.js'));
+        if (!st.isFile() || st.size === 0) {
+            throw new Error('Worker output missing or empty after build: js/boot-fallback.js');
+        }
     }
 
     console.log('Copying Assets...');
@@ -141,9 +187,22 @@ async function build() {
 
     const assetsDir = 'assets';
     if (fs.existsSync(assetsDir)) {
+        // Copy only needed assets: dotfiles/.DS_Store/Thumbs.db never ship,
+        // and heavy unreferenced media (e.g. wallpaper.jpg ~2MB) ships only
+        // when actually referenced by index.html/styles.css.
+        let refs = '';
+        try { refs += fs.readFileSync('index.html', 'utf8'); } catch { /* ignore */ }
+        try { refs += fs.readFileSync('styles.css', 'utf8'); } catch { /* ignore */ }
         const assets = fs.readdirSync(assetsDir);
         for (const asset of assets) {
-            fs.copyFileSync(path.join(assetsDir, asset), path.join(BUILD_DIR, 'assets', asset));
+            if (asset === '.DS_Store' || asset === 'Thumbs.db' || asset.startsWith('.')) continue;
+            const src = path.join(assetsDir, asset);
+            try { if (!fs.statSync(src).isFile()) continue; } catch { continue; }
+            if (asset === 'wallpaper.jpg' && !refs.includes('wallpaper.jpg')) {
+                console.log('Skipping unreferenced wallpaper.jpg (2MB).');
+                continue;
+            }
+            fs.copyFileSync(src, path.join(BUILD_DIR, 'assets', asset));
         }
     }
     for (const file of filesToCopy) {
@@ -158,6 +217,9 @@ async function build() {
 
         if (fs.existsSync(file)) {
             fs.copyFileSync(file, path.join(BUILD_DIR, file));
+        } else if (file === 'icon.png') {
+            // Missing icon breaks installer branding — hard error, not warn.
+            throw new Error('Build asset missing: icon.png is required for packaging.');
         } else {
             console.warn(`Warning: Asset ${file} not found.`);
         }
@@ -285,10 +347,22 @@ function verifyStagedClosure(staged, destRoot) {
         visitedFiles.add(file);
         let src;
         try { src = fs.readFileSync(file, 'utf8'); } catch { return; }
-        // Fresh regex per file: a shared /g regex corrupts lastIndex across
+        // Fresh regexes per file: a shared /g regex corrupts lastIndex across
         // the recursive walk and silently drops most of the closure.
-        for (const m of src.matchAll(new RegExp(requireSrc, 'g'))) {
+        // Covers CJS require(), require.resolve(), ESM static imports and
+        // dynamic import() — a hardcoded staged list breaks packaged-only
+        // when `npm update` adds an ESM-only transitive dep (dev passes).
+        const patterns = [
+            new RegExp(requireSrc, 'g'),
+            /require\s*\.\s*resolve\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
+            /(?:^|[;\s{}])import\s+(?:[^'"]*?\s+from\s+)?['"]([^'"]+)['"]/g,
+            /import\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
+            /export\s+(?:[^'"]*?\s+from\s+)['"]([^'"]+)['"]/g,
+        ];
+        for (const re of patterns) {
+            for (const m of src.matchAll(re)) {
             const spec = m[1];
+            if (!spec) continue;
             if (spec.startsWith('.')) {
                 // Relative file in the same package — its bare requires still
                 // count toward the closure.
@@ -305,6 +379,7 @@ function verifyStagedClosure(staged, destRoot) {
             if (!resolved.includes('node_modules')) continue; // relative/builtin
             needed.add(pkg);
             walkFile(resolved, depth + 1);
+            }
         }
     };
     for (const root of ['better-sqlite3', 'bindings', 'file-uri-to-path', 'form-data']) {

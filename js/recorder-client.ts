@@ -53,11 +53,13 @@ export class HighFidelityRecorder {
     /** Rebuild handler: retap mid-take onto the new chain, or fail loudly. */
     private _onRebuilt(): void {
         if (!this.accepting) return; // idle — next start() resolves the tap fresh
+        // Loud failure is intended when re-attachment is impossible (a silent
+        // WAV must never come back as success). Best-effort retap first: the
+        // take continues on the live chain with the take-start rate in the
+        // header. No success log — continuation is the expected path, not an
+        // event worth surfacing.
         if (this._doRetap()) {
-            // Retap succeeded — re-point take ownership at the live chain.
             try { this._takeSource = this._source(); } catch { /* keep old */ }
-            try { this._takeCtx = audioCtx; } catch { /* keep old */ }
-            logger.warn('[Recorder] Tap re-attached after audio rebuild mid-take');
             return;
         }
         // Retap failed: the take is stuck on a dead context. Stop intake and
@@ -337,9 +339,14 @@ export class HighFidelityRecorder {
         if (finalLen <= 0) throw new Error('No data recorded');
         // Dead/stale taps capture exact silence — handing that back as a WAV
         // looks like a successful take. Fail loudly instead (never silent WAV).
+        // Strided scan: only nonzeroness is needed, so sample every Nth frame
+        // (bounded ~100k probes) instead of a full O(N) pass over up to ~180M
+        // samples on a 30min stereo take.
         let peak = 0;
+        const totalFrames = channels.reduce((n, ch) => n + ch.length, 0);
+        const stride = Math.max(1, Math.floor(totalFrames / 100000));
         for (const ch of channels) {
-            for (let i = 0; i < ch.length; i++) {
+            for (let i = 0; i < ch.length; i += stride) {
                 const a = Math.abs(ch[i]);
                 if (a > peak) peak = a;
                 if (peak > 0) break;

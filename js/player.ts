@@ -54,14 +54,21 @@ class LoadStepTimeoutError extends Error {
 
 function withLoadStepTimeout<T>(promise: Promise<T>, ms: number, step: string): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | null = null;
+    // Generation flag: once the timeout fires, the hung IPC promise is
+    // orphaned — its late settlement is ignored (no leaked resolve/reject
+    // into this load) and its rejection is swallowed to avoid unhandled
+    // rejections from the abandoned read/decode.
+    let timedOut = false;
     return new Promise<T>((resolve, reject) => {
         timer = setTimeout(() => {
             timer = null;
+            timedOut = true;
+            try { promise.catch(() => undefined); } catch { /* ignore */ }
             reject(new LoadStepTimeoutError(step));
         }, ms);
         promise.then(
-            (v) => { if (timer) clearTimeout(timer); resolve(v); },
-            (e) => { if (timer) clearTimeout(timer); reject(e); }
+            (v) => { if (timedOut) return; if (timer) clearTimeout(timer); resolve(v); },
+            (e) => { if (timedOut) return; if (timer) clearTimeout(timer); reject(e); }
         );
     });
 }
@@ -169,10 +176,24 @@ export async function readAudioBytesForPath(filePath: string, trackId?: string):
 /**
  * Revokes a Blob URL after a delay to ensure the browser has finished buffering.
  * Prevents "Source Error" when skipping tracks rapidly.
+ * Bounded: at most MAX_PENDING_REVOKES delayed revokes are held — on
+ * overflow the oldest is revoked synchronously so rapid skipping can't
+ * pin an unbounded number of blobs (or their timers/handles).
  */
+const pendingRevokes: string[] = [];
+const MAX_PENDING_REVOKES = 10;
 function revokeLater(url: string, delay = BLOB_REVOKE_DELAY_MS): void {
     if (!url || !url.startsWith('blob:')) return;
+    if (pendingRevokes.length >= MAX_PENDING_REVOKES) {
+        const oldest = pendingRevokes.shift();
+        if (oldest) {
+            try { URL.revokeObjectURL(oldest); } catch { /* already revoked */ }
+        }
+    }
+    pendingRevokes.push(url);
     setTimeout(() => {
+        const i = pendingRevokes.indexOf(url);
+        if (i >= 0) pendingRevokes.splice(i, 1);
         try {
             URL.revokeObjectURL(url);
             logger.debug(`[Player] Revoked stale URL: ${url}`);
@@ -609,9 +630,24 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
     // Only bail when auto-advancing into the track that's already loaded.
     // (Comparing against audio.src is useless here — src is a blob: URL.)
     if (targetIndex === null && nextIdx === state.currentTrackIndex) return;
+    // Self-blend: an explicit target on the current track restarts it in
+    // place — no IPC re-read, decode, or incoming-deck play.
+    if (targetIndex !== null && targetIndex === state.currentTrackIndex) {
+        logger.debug('[AutoMix] Self-blend target is current track — restarting');
+        try { engine.main.audio.currentTime = 0; } catch { /* ignore */ }
+        try {
+            await engine.main.audio.play();
+            state.update({ isPlaying: true });
+        } catch (e) {
+            logger.warn('[AutoMix] Self-blend restart failed', e);
+        }
+        return;
+    }
 
+    // Flag early (guards re-entry + play/pause), but engage the control lock
+    // only once the incoming deck handshakes — the getSafeUrl read + 8s
+    // loadAsync wait below must stay cancellable (STOP is never locked).
     state.update({ isCrossfadeInProgress: true });
-    updateControlsLock(true);
     const myGen = ++crossfadeGen;
     const expectedId = playlist[nextIdx]?.id;
 
@@ -622,10 +658,7 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
     const safeUrl = await getSafeUrl(playlist[nextIdx].path, false, true, playlist[nextIdx].id);
     if (myGen !== crossfadeGen || !state.isCrossfadeInProgress) return;
     if (!safeUrl) {
-        state.update({ isCrossfadeInProgress: false });
-        updateControlsLock(false);
-        if (setBlendingIndexFn) setBlendingIndexFn(-1);
-        if (autoMixBtn) autoMixBtn.classList.remove('blending');
+        abortCrossfade('next-unreadable');
         toast.error("NEXT TRACK UNREADABLE — CROSSFADE ABORTED");
         return;
     }
@@ -639,13 +672,12 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
     const incomingOk = await engine.crossfade.loadAsync(safeUrl);
     if (myGen !== crossfadeGen || !state.isCrossfadeInProgress) return;
     if (!incomingOk) {
-        state.update({ isCrossfadeInProgress: false });
-        updateControlsLock(false);
-        if (setBlendingIndexFn) setBlendingIndexFn(-1);
-        if (autoMixBtn) autoMixBtn.classList.remove('blending');
+        abortCrossfade('next-unplayable');
         toast.error("NEXT TRACK UNPLAYABLE — CROSSFADE ABORTED");
         return;
     }
+    // Handshake passed — engage the control lock for the automation run.
+    updateControlsLock(true);
 
     // Sonetra AI: pre-warm only. Cached AI transitions are generated in the
     // background for future mixes; live AI-stem playback is NOT implemented
@@ -709,10 +741,7 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
     } catch (e) {
         if (myGen !== crossfadeGen) return;
         logger.error("AutoMix Playback Failed", e);
-        state.update({ isCrossfadeInProgress: false });
-        updateControlsLock(false);
-        if (setBlendingIndexFn) setBlendingIndexFn(-1);
-        if (autoMixBtn) autoMixBtn.classList.remove('blending');
+        abortCrossfade('incoming-play-failed');
         return;
     }
     if (myGen !== crossfadeGen || !state.isCrossfadeInProgress) return;
@@ -953,13 +982,22 @@ function wireChannelHandlers(el: HTMLAudioElement): void {
 
     el.addEventListener('timeupdate', () => {
         if (!isCurrentMain()) return;
-        if (!isDraggingProgress && el.duration) {
-            const progress = (el.currentTime / el.duration) * 100;
+        // Infinity/NaN durations (live streams, undecodable headers) must
+        // never reach the progress bar or the blend gate below.
+        const d = el.duration;
+        const t = el.currentTime;
+        if (!Number.isFinite(d) || d <= 0 || !Number.isFinite(t) || t < 0) return;
+        if (!isDraggingProgress) {
+            const progress = (t / d) * 100;
             if (progressBar) progressBar.value = progress.toString();
-            if (timeDisplay) timeDisplay.innerText = formatTime(el.currentTime);
+            if (timeDisplay) timeDisplay.innerText = formatTime(t);
             const fadeSecs = safeFadeSeconds();
-            if (state.isAutoMixEnabled && !state.isCrossfadeInProgress && el.duration > fadeSecs * 2) {
-                if (el.currentTime >= el.duration - fadeSecs) {
+            // Unified auto-blend gate: same effective-duration cap as
+            // startCrossfade (half the outgoing length), so short tracks
+            // blend early instead of falling through to the ended hard-cut.
+            const effFade = Math.min(fadeSecs, Math.max(0.5, d / 2 - 0.25));
+            if (state.isAutoMixEnabled && !state.isCrossfadeInProgress) {
+                if (t >= d - effFade) {
                     void startCrossfade().catch(() => undefined);
                 }
             }
@@ -970,13 +1008,10 @@ function wireChannelHandlers(el: HTMLAudioElement): void {
         if (!isCurrentMain()) return;
         if (state.isCrossfadeInProgress) return;
         if (state.isAutoMixEnabled) {
-            // Short tracks never reach the timeupdate crossfade threshold
-            // (duration <= 2*trackDuration). Advance instead of stalling dead.
-            if (state.loopMode === 'one') {
-                el.currentTime = 0;
-                el.play().catch(() => undefined);
-                return;
-            }
+            // Short tracks that never reached the timeupdate blend gate
+            // advance here. Gain staging matches a finished blend (loadTrack
+            // resets the deck to unity/neutral EQ), so loudness is parity
+            // with the blended path.
             let nextIndex = state.currentTrackIndex + 1;
             if (nextIndex >= state.playlist.length) {
                 if (state.loopMode === 'all') nextIndex = 0;
@@ -1008,7 +1043,7 @@ function wireChannelHandlers(el: HTMLAudioElement): void {
 
     el.addEventListener('loadedmetadata', () => {
         if (!isCurrentMain()) return;
-        if (totalTimeDisplay && el.duration) {
+        if (totalTimeDisplay && Number.isFinite(el.duration) && el.duration > 0) {
             totalTimeDisplay.innerText = formatTime(el.duration);
         }
     });

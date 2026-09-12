@@ -272,7 +272,7 @@ export async function loadSession(): Promise<void> {
         autoMix: { eqCrossfade: boolean; filterSweep: boolean; hpfSweep: boolean; bpmSync: boolean; trackDuration: number; btnDuration: number; enableAI: boolean };
         masterVolume: number | null;
         tempoValue: number | null;
-        pads: Array<{ buf: AudioBuffer | undefined; path: string; vol: number; bpm: number; sync: boolean; ls: number; le: number }>;
+        pads: Array<{ buf: AudioBuffer | undefined; path: string; vol: number; bpm: number; sync: boolean; ls: number; le: number; wf: unknown }>;
     } | null = null;
     // Generation guard: per-pad loads that time out keep running in the
     // background (no abort). Without this their late resolve overwrites the
@@ -304,6 +304,7 @@ export async function loadSession(): Promise<void> {
                 padSyncState[i] = p.sync;
                 padLoopStart[i] = p.ls;
                 padLoopEnd[i] = p.le;
+                try { (padWaveforms as unknown as unknown[])[i] = p.wf; } catch { /* ignore */ }
             });
             // Rollback previously restored playlist+pads but left the restored
             // EQ/fade/volume/tempo in place — a mixed old/new desync.
@@ -335,6 +336,17 @@ export async function loadSession(): Promise<void> {
                     const slider = grid?.children[i]?.querySelector('.pad-slider') as HTMLInputElement | null;
                     if (slider) slider.value = String(p.vol);
                 });
+            } catch { /* ignore */ }
+            // Waveforms were cleared pre-load and never restored — pads stayed
+            // visually empty after rollback. Repaint from restored peaks.
+            try {
+                void import('./sampler').then((m) => {
+                    rollback!.pads.forEach((p, i) => {
+                        try {
+                            if (p.wf !== undefined) m.renderWaveform(i);
+                        } catch { /* ignore */ }
+                    });
+                }).catch(() => undefined);
             } catch { /* ignore */ }
         } catch { /* best-effort */ }
     };
@@ -396,6 +408,7 @@ export async function loadSession(): Promise<void> {
             sync: !!padSyncState[i],
             ls: padLoopStart[i] ?? -1,
             le: padLoopEnd[i] ?? -1,
+            wf: (padWaveforms as unknown as unknown[])[i],
         }));
         rollback = {
             playlist: [...state.playlist],
@@ -511,6 +524,9 @@ export async function loadSession(): Promise<void> {
                                 padVolumes[idx] = snap.vol;
                                 padBPMs[idx] = snap.bpm;
                                 padSyncState[idx] = snap.sync;
+                                padLoopStart[idx] = snap.ls;
+                                padLoopEnd[idx] = snap.le;
+                                try { (padWaveforms as unknown as unknown[])[idx] = snap.wf; } catch { /* ignore */ }
                             }
                         } catch { /* ignore */ }
                     }
