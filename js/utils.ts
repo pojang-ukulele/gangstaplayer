@@ -380,8 +380,6 @@ export class Disposable {
         }
         this.cleanups.length = 0;
     }
-
-    get isDisposed(): boolean { return this.disposed; }
 }
 
 // ==================== TIMING UTILITIES ====================

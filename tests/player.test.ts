@@ -120,11 +120,18 @@ jest.mock('../js/audio-engine', () => ({
     engine: mockEngine,
 }));
 
-// --- Mock worker-client ---
-jest.mock('../js/worker-client', () => ({
-    detectBPMWorker: jest.fn().mockResolvedValue(120),
-    bufferToWaveWorker: jest.fn(),
-}));
+// --- Mock worker-client (requireActual spread: resolveBpmPersist stays real
+// so the deck skip-persist path is reachable; BPM detection mocked) ---
+jest.mock('../js/worker-client', () => {
+    const actual = jest.requireActual('../js/worker-client');
+    return {
+        ...actual,
+        detectBPMWorker: jest.fn().mockResolvedValue(120),
+        detectBPMWithConfidence: jest.fn().mockResolvedValue({ bpm: 120, confidence: 'high', needsReview: false }),
+        resolveBpmPersist: actual.resolveBpmPersist,
+        bufferToWaveWorker: jest.fn(),
+    };
+});
 
 // --- Mock toast ---
 jest.mock('../js/toast', () => ({
@@ -383,5 +390,32 @@ describe('Player — guarded functions (no DOM, no crash)', () => {
         expect(mockEngine.main.reset).toHaveBeenCalledTimes(1);
         expect(mockEngine.main.loadAsync).toHaveBeenCalled();
         expect(state.currentTrackIndex).toBe(0);
+    });
+
+    test('loadTrack with missing BPM + needs-review keeps prior (no 0 write)', async () => {
+        // Deck skip-persist path: fixture bpm 0 → confidence gate reachable
+        // only because the mock now provides detectBPMWithConfidence.
+        const wc = jest.requireMock('../js/worker-client') as {
+            detectBPMWithConfidence: jest.Mock;
+        };
+        wc.detectBPMWithConfidence.mockResolvedValueOnce({ bpm: null, confidence: 'low', needsReview: true });
+        mockFileSystem.readFile.mockResolvedValueOnce(new ArrayBuffer(1024));
+        const mockDecodedBuffer = {
+            numberOfChannels: 2,
+            sampleRate: 44100,
+            length: 44100,
+            duration: 1,
+            getChannelData: jest.fn().mockReturnValue(new Float32Array(44100)),
+        };
+        mockAudioCtx.decodeAudioData.mockResolvedValueOnce(mockDecodedBuffer);
+
+        await loadTrack(1);
+        // Drain the fire-and-forget BPM IIFE (detection + persist decision).
+        await new Promise((r) => setTimeout(r, 0));
+        await new Promise((r) => setTimeout(r, 0));
+
+        expect(wc.detectBPMWithConfidence).toHaveBeenCalled();
+        expect(state.playlist[1].bpm).toBe(0);
+        expect(state.masterBPM).toBe(0);
     });
 });

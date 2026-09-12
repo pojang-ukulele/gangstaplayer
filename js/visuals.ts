@@ -77,21 +77,6 @@ export function initVisuals(): void {
     masterLoop();
 }
 
-export function destroyVisuals(): void {
-    if (_rafHandle !== null) {
-        try { cancelAnimationFrame(_rafHandle); } catch { /* ignore */ }
-        _rafHandle = null;
-    }
-    // Cancel the trailing LED throttle tick (unref'd, but cancel is explicit
-    // so no post-destroy DOM write fires on detached LEDs).
-    try { updateLEDs.cancel(); } catch { /* ignore */ }
-    if (_visibilityWired) {
-        try { document.removeEventListener('visibilitychange', onVisibilityChange); } catch { /* ignore */ }
-        _visibilityWired = false;
-    }
-    _visualsInit = false;
-}
-
 function setupScrews(): void {
     const screws = document.querySelectorAll<HTMLElement>('.screw');
     screws.forEach(screw => {
@@ -166,9 +151,11 @@ function masterLoop(): void {
     // covers the race where the tab hides between scheduling and execution.
     if (document.hidden) return;
     const an = analyser;
-    const buf = ensureDataArray();
+    let buf = ensureDataArray();
     if (an && buf) {
-        try { an.getByteFrequencyData(buf as unknown as Uint8Array<ArrayBuffer>); } catch { /* ignore */ }
+        // A throwing analyser must idle on fresh silence, never on a stale
+        // buffer — stale bytes freeze the bars at a fake level.
+        try { an.getByteFrequencyData(buf as unknown as Uint8Array<ArrayBuffer>); } catch { buf = null; }
     }
     dataArray = buf;
     
@@ -228,9 +215,28 @@ function masterLoop(): void {
 }
 
 
+/** Startup sound outcome: pre-gesture boot plays into a suspended context
+ * (silent). One post-gesture retry is armed on failure, then never again. */
+let _startupSoundOk = false;
+let _startupSoundRetryArmed = false;
+function armStartupSoundRetry(): void {
+    if (_startupSoundOk || _startupSoundRetryArmed) return;
+    _startupSoundRetryArmed = true;
+    const retry = (): void => {
+        _startupSoundRetryArmed = false;
+        if (_startupSoundOk) return;
+        try { playStartupSound(); } catch { /* ignore */ }
+    };
+    try {
+        document.addEventListener('pointerdown', retry, { once: true });
+        document.addEventListener('keydown', retry, { once: true });
+    } catch { _startupSoundRetryArmed = false; }
+}
+
 export function playStartupSound(): void {
     logger.info("[Visuals] Triggering startup sound...");
-    
+    if (_startupSoundOk) return;
+
     resumeAudioContext().then(() => {
         const soundPath = 'assets/gun-load.wav';
         logger.info(`[Visuals] Fetching startup sound from: ${soundPath}`);
@@ -267,6 +273,7 @@ export function playStartupSound(): void {
                     };
                 } catch { /* ignore */ }
                 source.start(0);
+                _startupSoundOk = true;
                 logger.info("[Visuals] Startup sound playback started.");
             })
             .catch((e: any) => {
@@ -276,11 +283,18 @@ export function playStartupSound(): void {
                     const audio = new Audio(soundPath);
                     const masterVolEl = document.getElementById('masterVol') as HTMLInputElement | null;
                     audio.volume = STARTUP_SOUND_VOLUME * (masterVolEl ? Math.min(1, Math.max(0, parseFloat(masterVolEl.value) || 1)) : 1);
-                    audio.play().catch((pErr: any) => logger.error(`[Visuals] Native Audio Fallback failed: ${pErr.message || String(pErr)}`));
+                    audio.play().then(() => { _startupSoundOk = true; }).catch((pErr: any) => {
+                        logger.error(`[Visuals] Native Audio Fallback failed: ${pErr.message || String(pErr)}`);
+                        armStartupSoundRetry();
+                    });
                 } catch (fallbackErr: any) {
                     logger.error(`[Visuals] All startup sound attempts failed: ${fallbackErr.message || String(fallbackErr)}`);
+                    armStartupSoundRetry();
                 }
             });
-    }).catch(e => logger.error(`[Visuals] Audio Context Resume failed: ${e.message}`));
+    }).catch(e => {
+        logger.error(`[Visuals] Audio Context Resume failed: ${e.message}`);
+        armStartupSoundRetry();
+    });
 }
 

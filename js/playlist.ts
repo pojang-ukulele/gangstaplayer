@@ -1,5 +1,5 @@
 import { audioCtx, ensureAudio } from './audio';
-import { detectBPMWorker } from './worker-client';
+import { detectBPMWithConfidence, resolveBpmPersist } from './worker-client';
 import { state, Track } from './state';
 import { VirtualScroller } from './reactive/ui';
 import { validateAudioSignature } from './utils';
@@ -8,7 +8,7 @@ import { abortCrossfade, cacheDroppedAudio, getDroppedAudioFile, readAudioBytesF
 import { showConfirm } from './modals';
 import { toast } from './toast';
 import { logger } from './logger';
-import { MAX_FILE_SIZE_BYTES, NUM_PADS } from './constants';
+import { MAX_FILE_SIZE_BYTES, MAX_PLAYLIST_SEARCH_RESULTS, NUM_PADS, VALID_AUDIO_EXTENSIONS } from './constants';
 import './types';
 
 interface PlaylistDeps {
@@ -139,7 +139,7 @@ export function initPlaylist(deps: PlaylistDeps): void {
                                 const name = (t?.name || '').toLowerCase();
                                 const p = (t?.path || '').toLowerCase();
                                 return name.includes(qLower) || p.includes(qLower);
-                            }).map(t => ({ ...t }));
+                            }).map(t => ({ ...t })).slice(0, MAX_PLAYLIST_SEARCH_RESULTS);
                         }
                         if (myGen !== _searchGen) return;
                     } catch {
@@ -367,6 +367,9 @@ async function analyzeTrackInBackground(track: Track): Promise<void> {
         const validationError = validateAudioSignature(arrayBuffer, track.name);
         if (validationError) {
             console.warn(`[Playlist] Analysis skipped for ${track.name}: ${validationError}`);
+            // P4 deferral (oracle non-blocking): hard-failure bpm:0 writes not
+            // yet routed through resolveBpmPersist — keep-prior would leave
+            // reanalyzed rows stuck at "analyzing"; uniform-catch is future work.
             const failIdx = state.playlist.findIndex(t => t.id === track.id);
             if (failIdx >= 0) {
                 const failNext = [...state.playlist];
@@ -390,13 +393,29 @@ async function analyzeTrackInBackground(track: Track): Promise<void> {
             }),
         ]);
 
-        const bpm = await detectBPMWorker(audioBuffer);
-        
+        const analysis = await detectBPMWithConfidence(audioBuffer);
+
         // Drop stale work: track cleared/deleted/replaced while decoding.
         // Verify against the live list (id + path) before any write.
         const preIdx = state.playlist.findIndex(t => t.id === track.id);
         if (preIdx < 0) return;
         if (state.playlist[preIdx].path !== track.path) return;
+
+        // Confidence gate: a needs-review result must not persist bpm:0
+        // over a good cached value — keep the prior BPM, record only the
+        // measured duration, and skip the DB upsert.
+        const decision = resolveBpmPersist(analysis, state.playlist[preIdx]?.bpm);
+        if (!decision.persisted || decision.bpm === undefined) {
+            console.warn(`[Playlist] BPM needs review for ${track.name} — kept prior value`);
+            const durIdx = state.playlist.findIndex(t => t.id === track.id);
+            if (durIdx >= 0 && state.playlist[durIdx].path === track.path) {
+                const durNext = [...state.playlist];
+                durNext[durIdx] = { ...durNext[durIdx], duration: audioBuffer.duration };
+                state.update({ playlist: durNext });
+            }
+            return;
+        }
+        const bpm = decision.bpm;
 
         // 2. Persist to DB with fresh analysis values
         if (db) {
@@ -420,6 +439,8 @@ async function analyzeTrackInBackground(track: Track): Promise<void> {
         state.update({ playlist: live });
     } catch (e) {
         console.warn(`[Playlist] BPM analysis skipped for ${track.name}`);
+        // P4 deferral (oracle non-blocking): see validation-failure path above —
+        // catch-path bpm:0 not routed through resolveBpmPersist (future work).
         const idx = state.playlist.findIndex(t => t.id === track.id);
         if (idx >= 0) {
             const next = [...state.playlist];
@@ -446,7 +467,7 @@ export function addTracksToPlaylist(files: File[]): void {
     const uuid = (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function')
         ? () => crypto.randomUUID()
         : () => `id-${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
-    const AUDIO_EXTS = new Set(['wav', 'mp3', 'ogg', 'flac', 'm4a', 'aac', 'webm']);
+    const AUDIO_EXTS = new Set<string>(VALID_AUDIO_EXTENSIONS as readonly string[]);
     let rejected = 0;
     let dupes = 0;
     files.forEach((file) => {

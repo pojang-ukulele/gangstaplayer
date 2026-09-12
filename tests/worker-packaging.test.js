@@ -50,7 +50,9 @@ describe('worker packaging (path checks only)', () => {
 
     test('P0 repro (FAILS now): packaged app can load js/workers at runtime', () => {
         const pkg = readPackageJson();
-        const unpacked = JSON.stringify(pkg.asarUnpack || []);
+        // electron-builder reads build.asarUnpack only — the dead top-level
+        // asarUnpack key was removed, so assert against the live location.
+        const unpacked = JSON.stringify(pkg.build?.asarUnpack || []);
         const files = JSON.stringify(pkg.build?.files || []);
         // BUG: asarUnpack covers only the better-sqlite3 native binding, so
         // the bundled worker scripts stay inside the asar where Worker /

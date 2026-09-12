@@ -41,11 +41,6 @@
     "minimatch": "^10.2.2",
     "glob": "^11.0.1"
   },
-  "asarUnpack": [
-    "node_modules/better-sqlite3/build/Release/*.node",
-    "js/workers/*.js",
-    "js/boot-fallback.js"
-  ],
   "build": {
     "appId": "com.gangsta.playerpro3",
     "productName": "Gangsta Player Pro 3",

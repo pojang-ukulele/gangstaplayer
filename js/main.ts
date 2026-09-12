@@ -1,6 +1,6 @@
 // === MAIN ENTRY POINT ===
 // Gangsta Player Pro 3 - Modular Architecture
-import { resumeAudioContext, masterGain, audioCtx, bufferToWave, initWorklets, ensureAudio, onAudioRebuilt } from './audio';
+import { resumeAudioContext, masterGain, audioCtx, initWorklets, ensureAudio, onAudioRebuilt } from './audio';
 import { enableMIDI, initMIDI } from './midi';
 import {
     initSampler, createPadGrid, setupPadKeyboardHandlers, getPadGrid,
@@ -15,7 +15,7 @@ import {
     getPlayerAudio, stopPlayback, getPlaybackMode, setPlaybackMode,
     getLoopMode, setLoopMode, disposePlayerUrls
 } from './player';
-import { detectBPMWorker } from './worker-client';
+import { detectBPMWithConfidence } from './worker-client';
 import { initPlaylist, setupPlaylistHandlers, renderPlaylist, setBlendingIndex, handlePlaylistNavigation } from './playlist';
 import { initSettings } from './settings';
 import { initVisuals, playStartupSound } from './visuals';
@@ -580,7 +580,7 @@ async function initApp() {
 
     initSampler({
         fsBridge, bridge,
-        detectBPM: detectBPMWorker,
+        detectBPM: detectBPMWithConfidence,
         masterBPMRef: getMasterBPMRef(),
         tempoSliderRef: getTempoSlider() as HTMLInputElement
     });

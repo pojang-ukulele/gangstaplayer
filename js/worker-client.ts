@@ -248,6 +248,41 @@ export function detectBPMWithConfidence(audioBuffer: AudioBuffer, options?: { th
 export function detectBPMWorker(audioBuffer: AudioBuffer, options?: { threshold?: number; minStepSeconds?: number }): Promise<number> {
     return detectBPMWithConfidence(audioBuffer, options).then((r) => (r.needsReview || r.bpm === null ? 0 : r.bpm));
 }
+
+export interface BpmPersistDecision {
+    /** BPM to store: the fresh value when usable, otherwise the prior value. */
+    bpm: number | undefined;
+    /** True when the fresh analysis was usable and should be cached. */
+    persisted: boolean;
+    /** True when the fresh analysis needs review and must NOT be cached. */
+    needsReview: boolean;
+}
+
+/**
+ * Skip-persist policy for BPM results (single source of truth for all
+ * deck/playlist/pad callers): a low-confidence / -1 / null / 0 fresh result
+ * resolves to the PRIOR value with persisted:false so a bogus analyzed 0
+ * never clobbers a good cached BPM in DB or state. Accepts the legacy
+ * number shape too (<=0 counts as needs-review).
+ */
+export function resolveBpmPersist(
+    fresh: BpmAnalysis | number | null | undefined,
+    priorBpm?: number | null
+): BpmPersistDecision {
+    const prior = typeof priorBpm === 'number' && Number.isFinite(priorBpm) && priorBpm > 0
+        ? priorBpm
+        : undefined;
+    let bpm: number | null = null;
+    if (typeof fresh === 'number') {
+        if (Number.isFinite(fresh) && fresh > 0) bpm = fresh;
+    } else if (fresh && typeof fresh === 'object') {
+        if (!fresh.needsReview && typeof fresh.bpm === 'number' && Number.isFinite(fresh.bpm) && fresh.bpm > 0) {
+            bpm = fresh.bpm;
+        }
+    }
+    if (bpm !== null) return { bpm, persisted: true, needsReview: false };
+    return { bpm: prior, persisted: false, needsReview: true };
+}
 /**
  * Convert an AudioBuffer (or pre-built channel object) to a WAV Blob using a worker.
  */

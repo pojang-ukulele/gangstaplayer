@@ -7,11 +7,13 @@ import { toast } from './toast';
 import { logger } from './logger';
 import { normalizeToArrayBuffer, validateAudioSignature } from './utils';
 import type { FileSystemAPI, ElectronAPI } from './types';
+import { resolveBpmPersist } from './worker-client';
+import type { BpmAnalysis } from './worker-client';
 
 interface SamplerDeps {
     fsBridge: FileSystemAPI;
     bridge: ElectronAPI;
-    detectBPM: (buffer: AudioBuffer) => Promise<number>;
+    detectBPM: (buffer: AudioBuffer) => Promise<BpmAnalysis | number>;
     masterBPMRef: { value: number };
     tempoSliderRef: HTMLInputElement;
 }
@@ -96,7 +98,7 @@ function releaseGain(gain: GainNode): void {
     // node twice and the reuse double-connected it.
     if (_gainPool.includes(gain)) return;
     // Return to pool (limit pool size)
-    if (_gainPool.length < (POOL_SIZE || 32)) {
+    if (_gainPool.length < POOL_SIZE) {
         _gainPool.push(gain);
     }
 }
@@ -104,7 +106,7 @@ function releaseGain(gain: GainNode): void {
 let padGrid: HTMLElement | null = null;
 let fsBridgeRef: FileSystemAPI | null = null;
 let bridgeRef: ElectronAPI | null = null;
-let detectBPMFn: ((buffer: AudioBuffer) => Promise<number>) | null = null;
+let detectBPMFn: ((buffer: AudioBuffer) => Promise<BpmAnalysis | number>) | null = null;
 let masterBPMRef = { value: 0 };
 let tempoSliderRef: HTMLInputElement | null = null;
 /**
@@ -666,11 +668,16 @@ export async function loadSampleFile(file: File, index: number): Promise<void> {
         // BPM failure must not masquerade as sample-load failure (buffer is playable).
         if (detectBPMFn) {
             try {
-                const bpm = await detectBPMFn(audioBuffer);
+                const raw = await detectBPMFn(audioBuffer);
                 if (gen !== _padLoadGen[index]) return;
-                padBPMs[index] = bpm;
-                padBeatPositions[index] = computeBeatPositions(bpm, audioBuffer.duration);
-                logger.info(`[Sampler] Pad ${index} BPM: ${bpm}, beats: ${padBeatPositions[index].length}`);
+                const decision = resolveBpmPersist(raw, padBPMs[index]);
+                if (!decision.persisted || decision.bpm === undefined) {
+                    logger.warn(`[Sampler] Pad ${index} BPM needs review — kept prior value`);
+                } else {
+                    padBPMs[index] = decision.bpm;
+                    padBeatPositions[index] = computeBeatPositions(decision.bpm, audioBuffer.duration);
+                    logger.info(`[Sampler] Pad ${index} BPM: ${decision.bpm}, beats: ${padBeatPositions[index].length}`);
+                }
             } catch (bpmErr) {
                 logger.warn(`[Sampler] Pad ${index} BPM detection skipped`, bpmErr);
             }
@@ -744,10 +751,15 @@ export async function loadSampleFromPath(path: string, index: number): Promise<v
         updatePadVisuals(index);
         if (detectBPMFn) {
             try {
-                const bpm = await detectBPMFn(audioBuffer);
+                const raw = await detectBPMFn(audioBuffer);
                 if (gen !== _padLoadGen[index]) return;
-                padBPMs[index] = bpm;
-                padBeatPositions[index] = computeBeatPositions(bpm, audioBuffer.duration);
+                const decision = resolveBpmPersist(raw, padBPMs[index]);
+                if (!decision.persisted || decision.bpm === undefined) {
+                    logger.warn(`[Sampler] Pad ${index} BPM needs review — kept prior value`);
+                } else {
+                    padBPMs[index] = decision.bpm;
+                    padBeatPositions[index] = computeBeatPositions(decision.bpm, audioBuffer.duration);
+                }
             } catch (bpmErr) {
                 logger.warn(`[Sampler] Pad ${index} BPM detection skipped`, bpmErr);
             }
@@ -1348,9 +1360,14 @@ async function startRecording(index: number): Promise<void> {
                 // Recorded pads previously kept stale waveform/BPM — SYNC stayed dead.
                 if (detectBPMFn) {
                     try {
-                        const bpm = await detectBPMFn(decodedBuffer);
-                        padBPMs[index] = bpm;
-                        padBeatPositions[index] = computeBeatPositions(bpm, decodedBuffer.duration);
+                        const raw = await detectBPMFn(decodedBuffer);
+                        const decision = resolveBpmPersist(raw, padBPMs[index]);
+                        if (!decision.persisted || decision.bpm === undefined) {
+                            logger.warn(`[Sampler] Pad ${index} BPM needs review — kept prior value`);
+                        } else {
+                            padBPMs[index] = decision.bpm;
+                            padBeatPositions[index] = computeBeatPositions(decision.bpm, decodedBuffer.duration);
+                        }
                     } catch { /* BPM is best-effort */ }
                 }
                 document.dispatchEvent(new CustomEvent('ug:dataChanged'));

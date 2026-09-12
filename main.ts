@@ -6,7 +6,7 @@ import { createHash } from 'crypto';
 import sonetraBridge, { addAllowedAudioFile, isAllowedAudioDirForPath, isAllowedAudioFile } from './sonetra-bridge';
 import { getDbManager, initDbManager } from './db-manager';
 import { logManager, LogLevel } from './log-manager';
-import { MAX_FILE_SIZE_BYTES, VALID_AUDIO_EXTENSIONS } from './js/constants';
+import { MAX_FILE_SIZE_BYTES, MAX_PLAYLIST_SEARCH_RESULTS, VALID_AUDIO_EXTENSIONS } from './js/constants';
 
 const READABLE_EXTENSIONS = new Set([...VALID_AUDIO_EXTENSIONS, 'json']);
 
@@ -123,6 +123,14 @@ const SAVE_ALLOWED_EXTS = new Set(['json', 'wav']);
 // config.json controls the Sonetra pythonPath (C3 chain) and gangsta.db-journal
 // is live DB state — neither may ever be a save target.
 const SAVE_BLOCKED_BASENAMES = new Set(['gangsta.db', 'gangsta.db-wal', 'gangsta.db-shm', 'gangsta.db-journal', 'gangsta_log.txt', 'config.json']);
+/**
+ * Blocked-basename check, OS-canonicalized: Windows silently strips trailing
+ * dots/spaces, so `gangsta.db.` / `config.json ` open the internal file.
+ * Strip them (plus case-fold) before the Set lookup.
+ */
+function isBlockedSaveBasename(p: string): boolean {
+  return SAVE_BLOCKED_BASENAMES.has(path.basename(p).toLowerCase().replace(/[. ]+$/, ''));
+}
 // Non-dialog writes into userData/recordings are allowlisted to session-shaped
 // names only — arbitrary recordings/*.json/*.wav overwrite without a dialog
 // (e.g. clobbering another session) is rejected. Dialog-approved paths bypass
@@ -150,7 +158,7 @@ function isSessionShapedSaveName(p: string, ext: string): boolean {
 function isSavePathAllowed(p: string): boolean {
   const ext = path.extname(p).replace('.', '').toLowerCase();
   if (!SAVE_ALLOWED_EXTS.has(ext)) return false;
-  if (SAVE_BLOCKED_BASENAMES.has(path.basename(p).toLowerCase())) return false;
+  if (isBlockedSaveBasename(p)) return false;
   // Block ADS streams (incl. :$DATA past the drive prefix) and UNC paths
   // that confuse allowlist checks (both \\server\share and //server/share forms).
   if (isAdsOrUncPath(p)) return false;
@@ -159,7 +167,7 @@ function isSavePathAllowed(p: string): boolean {
     try {
       const real = fs.realpathSync.native(p);
       if (real !== p) {
-        if (SAVE_BLOCKED_BASENAMES.has(path.basename(real).toLowerCase())) return false;
+        if (isBlockedSaveBasename(real)) return false;
         // Resolved target must itself be allowlisted (dialog set or recordings dir).
         if (!hasDialogPath(real)) {
           const userDataPath = app.getPath('userData');
@@ -402,7 +410,7 @@ function registerIpcHandlers(): void {
       // path. Only admit kit-shaped paths so junk picks can't evict legit
       // approvals from the 64-entry LRU.
       const ext = path.extname(v).replace('.', '').toLowerCase();
-      if (ext === 'json' && !SAVE_BLOCKED_BASENAMES.has(path.basename(v).toLowerCase())) {
+      if (ext === 'json' && !isBlockedSaveBasename(v)) {
         addDialogPath(v);
       }
     }
@@ -425,7 +433,7 @@ function registerIpcHandlers(): void {
     const v = validatePath(filePath);
     if (v) {
       const ext = path.extname(v).replace('.', '').toLowerCase();
-      if (ext === 'json' && !SAVE_BLOCKED_BASENAMES.has(path.basename(v).toLowerCase())) {
+      if (ext === 'json' && !isBlockedSaveBasename(v)) {
         addDialogPath(v);
       }
     }
@@ -461,7 +469,7 @@ function registerIpcHandlers(): void {
     const v = validatePath(filePath);
     if (v) {
       const ext = path.extname(v).replace('.', '').toLowerCase();
-      if (ext === 'wav' && !SAVE_BLOCKED_BASENAMES.has(path.basename(v).toLowerCase())) {
+      if (ext === 'wav' && !isBlockedSaveBasename(v)) {
         addDialogPath(v);
       }
     }
@@ -519,7 +527,7 @@ function registerIpcHandlers(): void {
         const lst = fs.lstatSync(validated);
         if (lst.isSymbolicLink()) {
           const real = fs.realpathSync.native(validated);
-          if (!isSavePathAllowed(real) || SAVE_BLOCKED_BASENAMES.has(path.basename(real).toLowerCase())) {
+          if (!isSavePathAllowed(real) || isBlockedSaveBasename(real)) {
             logToDisk('ERROR', `Security: Blocked symlink write ${validated} -> ${real}`);
             return false;
           }
@@ -557,7 +565,7 @@ function registerIpcHandlers(): void {
           logToDisk('ERROR', `Security: Blocked symlink write ${validated} -> ${real}`);
           return false;
         }
-        if (SAVE_BLOCKED_BASENAMES.has(path.basename(real).toLowerCase())) {
+        if (isBlockedSaveBasename(real)) {
           logToDisk('ERROR', `Security: Blocked write to internal file via symlink ${real}`);
           return false;
         }
@@ -585,7 +593,7 @@ function registerIpcHandlers(): void {
         // write; fstat above already pinned type. Verify containment.
         let openReal = validated;
         try { openReal = fs.realpathSync.native(validated); } catch { /* use validated */ }
-        if (SAVE_BLOCKED_BASENAMES.has(path.basename(openReal).toLowerCase())) {
+        if (isBlockedSaveBasename(openReal)) {
           logToDisk('ERROR', `Security: Blocked write to internal file ${validated}`);
           return false;
         }
@@ -616,16 +624,23 @@ function registerIpcHandlers(): void {
   // Consent burst window (see fs:consent-file): bounded sliding window of
   // request timestamps, pruned on every call so it can't grow unbounded.
   const consentBurst: number[] = [];
+  const MAX_CONSENT_BURST = 64;
+  const MAX_CONSENT_BURST_TRACKED = 128;
   ipcMain.handle('fs:consent-file', async (_event, pathStr: string) => {
     // Burst-tolerant throttle: a global 100ms gate previously dropped most of
     // a 50-file DnD burst (and let attacker spam starve legit drops). Allow a
     // 64-file burst per second — validation is a statSync + map insert — then
-    // throttle. The 256-entry cap still bounds memory.
+    // throttle. The 256-entry consentedReadFiles cap still bounds memory.
+    // Check-before-push: the current request counts against the NEXT window,
+    // and the array itself is hard-capped so a burst can't pile entries.
     const now = Date.now();
-    consentBurst.push(now);
     while (consentBurst.length > 0 && now - consentBurst[0] > 1000) consentBurst.shift();
-    if (consentBurst.length > 64) {
+    if (consentBurst.length >= MAX_CONSENT_BURST) {
       if (rateLimited('fs:consent-file', 100)) return false;
+    }
+    consentBurst.push(now);
+    if (consentBurst.length > MAX_CONSENT_BURST_TRACKED) {
+      consentBurst.splice(0, consentBurst.length - MAX_CONSENT_BURST_TRACKED);
     }
     if (typeof pathStr !== 'string' || !pathStr || pathStr.length > 32760) return false;
     const validated = validatePath(pathStr);
@@ -941,7 +956,10 @@ function registerIpcHandlers(): void {
       const q = String(query ?? '').slice(0, 256);
       const db = getDbManager();
       if (!db) return [];
-      return db.searchTracks(q);
+      // IPC surface cap: the renderer filter view never needs more than the
+      // playlist search budget (DB itself caps lower; this is the contract).
+      const rows = db.searchTracks(q);
+      return Array.isArray(rows) ? rows.slice(0, MAX_PLAYLIST_SEARCH_RESULTS) : [];
     } catch (e) {
       logToDisk('ERROR', `DB search failed: ${e}`);
       return [];
@@ -1030,9 +1048,16 @@ function shutdownMain(reason: string): Promise<void> {
   shuttingDown = true;
   shutdownPromise = (async () => {
     try { dialogReturnedPaths.clear(); } catch { /* ignore */ }
+    // A { success:false } stop leaves a live uvicorn behind (port zombie)
+    // that blocks the next launch — log it loudly instead of exiting silent.
+    let sonetraStopped = false;
     try {
-      await sonetraBridge.stopServer().catch(() => undefined);
-    } catch { /* ignore */ }
+      const res = await sonetraBridge.stopServer().catch(() => null);
+      sonetraStopped = !!res && (res as { success?: boolean }).success === true;
+    } catch { sonetraStopped = false; }
+    if (!sonetraStopped) {
+      try { logToDisk('ERROR', `Shutdown (${reason}): Sonetra stopServer failed — uvicorn may still be running (zombie); port 8765 may stay bound`); } catch { /* ignore */ }
+    }
     try {
       getDbManager()?.close();
     } catch (e) {

@@ -2,7 +2,7 @@
 import { audioCtx, resumeAudioContext, masterGain, ensureAudio } from './audio';
 import { settings, isAiEnabled } from './settings';
 import { state, Track, PlaybackMode, LoopMode } from './state';
-import { detectBPMWorker } from './worker-client';
+import { detectBPMWithConfidence, resolveBpmPersist } from './worker-client';
 import { toast } from './toast';
 import { engine } from './audio-engine';
 import { logger } from './logger';
@@ -497,23 +497,31 @@ export async function loadTrack(index: number): Promise<void> {
                 return; // cancelled
             }
 
-            // 1. Detect BPM if missing
+            // 1. Detect BPM if missing (confidence-gated: a needs-review
+            // result keeps the prior value instead of caching a bogus 0).
             if (!hasBpm) {
-                const detectedValue = await detectBPMWorker(audioBuffer);
+                const analysis = await detectBPMWithConfidence(audioBuffer);
                 if (_loadTrackId !== loadId) {
                     hideSpinnerIfCurrent(loadId);
                     return; // cancelled
                 }
                 const pIdx = state.playlist.findIndex(t => t.id === track.id);
-                if (pIdx >= 0) {
-                    const next = [...state.playlist];
-                    next[pIdx] = { ...next[pIdx], bpm: detectedValue };
-                    state.update({ masterBPM: detectedValue, playlist: next });
+                const prior = pIdx >= 0 ? state.playlist[pIdx]?.bpm : track.bpm;
+                const decision = resolveBpmPersist(analysis, prior);
+                if (!decision.persisted || decision.bpm === undefined) {
+                    logger.warn(`[Player] BPM needs review for ${track.name} — kept prior value`);
                 } else {
-                    state.update({ masterBPM: detectedValue });
+                    const bpm = decision.bpm;
+                    if (pIdx >= 0) {
+                        const next = [...state.playlist];
+                        next[pIdx] = { ...next[pIdx], bpm };
+                        state.update({ masterBPM: bpm, playlist: next });
+                    } else {
+                        state.update({ masterBPM: bpm });
+                    }
+                    logger.info(`[Player] Async analysis complete: ${bpm} BPM`);
                 }
                 if (renderPlaylistFn) renderPlaylistFn();
-                logger.info(`[Player] Async analysis complete: ${detectedValue} BPM`);
             }
 
             // Hide spinner now that analysis is done
@@ -1207,7 +1215,7 @@ function hideSpinnerIfCurrent(loadId: number): void {
 }
 
 function formatTime(seconds: number): string {
-    if (!seconds || isNaN(seconds)) return "0:00";
+    if (!Number.isFinite(seconds) || seconds <= 0) return "0:00";
     const m = Math.floor(seconds / 60);
     const s = Math.floor(seconds % 60);
     return `${m}:${s.toString().padStart(2, '0')}`;

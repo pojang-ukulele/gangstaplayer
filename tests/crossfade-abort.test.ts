@@ -116,10 +116,16 @@ jest.mock('../js/audio-engine', () => ({
     engine: mockEngine,
 }));
 
-jest.mock('../js/worker-client', () => ({
-    detectBPMWorker: jest.fn().mockResolvedValue(120),
-    bufferToWaveWorker: jest.fn(),
-}));
+jest.mock('../js/worker-client', () => {
+    const actual = jest.requireActual('../js/worker-client');
+    return {
+        ...actual,
+        detectBPMWorker: jest.fn().mockResolvedValue(120),
+        detectBPMWithConfidence: jest.fn().mockResolvedValue({ bpm: 120, confidence: 'high', needsReview: false }),
+        resolveBpmPersist: actual.resolveBpmPersist,
+        bufferToWaveWorker: jest.fn(),
+    };
+});
 jest.mock('../js/toast', () => ({
     toast: { success: jest.fn(), error: jest.fn(), info: jest.fn() },
 }));

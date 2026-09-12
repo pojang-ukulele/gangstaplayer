@@ -20,7 +20,6 @@ export class HighFidelityRecorder {
     // stop()/dispose() disconnect THAT stored tap, never the current
     // _source() (which may belong to a rebuilt chain mid-take).
     private _takeSource: AudioNode | null = null;
-    private _takeCtx: AudioContext | null = null;
     private _takeNode: AudioWorkletNode | null = null;
     /** Set when a mid-take rebuild killed the tap — stop() rejects loudly. */
     private _tapDead = false;
@@ -192,7 +191,6 @@ export class HighFidelityRecorder {
         // Take-start ownership: stop()/dispose() tear down THIS tap, even if
         // the live chain is rebuilt mid-take.
         try { this._takeSource = this._source(); } catch { this._takeSource = null; }
-        try { this._takeCtx = audioCtx; } catch { this._takeCtx = null; }
         this._takeNode = this.node;
         this._tapDead = false;
         this._tapDeadReason = '';
@@ -270,7 +268,6 @@ export class HighFidelityRecorder {
             this._sink = null;
         } catch { /* already disconnected */ }
         this._takeSource = null;
-        this._takeCtx = null;
         this._takeNode = null;
 
         // Loud failures — never hand back a silent/partial WAV as success.
@@ -391,7 +388,6 @@ export class HighFidelityRecorder {
         try { this._sink?.disconnect(); } catch { /* ignore */ }
         this._sink = null;
         this._takeSource = null;
-        this._takeCtx = null;
         this._takeNode = null;
         if (this.node) {
             this.node = null;

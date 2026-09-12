@@ -17,7 +17,7 @@ import {
     loadSampleFromPath
 } from './sampler';
 import { openModal, closeModal, showConfirm } from './modals';
-import { AUTO_SAVE_INTERVAL_MS, MIN_SAVE_INTERVAL_MS, NUM_PADS } from './constants';
+import { AUTO_SAVE_INTERVAL_MS, MAX_SNAPSHOTS, MIN_SAVE_INTERVAL_MS, NUM_PADS } from './constants';
 
 // === Constants ===
 
@@ -115,8 +115,8 @@ function removeFromStorage(key: string): void {
 }
 
 // Archive retention: unbounded `_archive_${Date.now()}` keys previously grew
-// without limit against the ~5MB quota. Keep newest 3, expire after 14d.
-export const MAX_SNAPSHOT_ARCHIVES = 3;
+// without limit against the ~5MB quota. Keep newest MAX_SNAPSHOTS, expire after 14d.
+export const MAX_SNAPSHOT_ARCHIVES = MAX_SNAPSHOTS;
 export const SNAPSHOT_ARCHIVE_TTL_MS = 14 * 24 * 60 * 60 * 1000;
 function archivePrefix(): string {
     return `${STORAGE_KEY}_archive_`;

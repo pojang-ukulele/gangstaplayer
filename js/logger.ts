@@ -1,7 +1,6 @@
 /**
  * Gangsta Logger Module
  * Features:
- *   - Runtime log level switching (no restart needed)
  *   - In-memory ring buffer for the Console UI
  *   - Disk persistence via Electron Bridge
  */
@@ -9,13 +8,6 @@
 import './types';
 
 type LogLevel = 'DEBUG' | 'INFO' | 'WARN' | 'ERROR';
-
-const LOG_LEVEL_SEVERITY: Record<LogLevel, number> = {
-    DEBUG: 0,
-    INFO: 1,
-    WARN: 2,
-    ERROR: 3,
-};
 
 const MAX_LOG_ENTRIES = 500;
 
@@ -28,7 +20,6 @@ interface LogEntry {
 
 class GangstaLogger {
     private ringBuffer: LogEntry[] = [];
-    private minLevel: LogLevel = 'DEBUG';
     private sessionId: string;
     /** DEBUG disk writes stay off unless explicitly enabled (flag). */
     private debugDiskEnabled = false;
@@ -84,15 +75,6 @@ class GangstaLogger {
     /** Session id attached to every persisted line + ring entry. */
     getSessionId(): string {
         return this.sessionId;
-    }
-    /** Set minimum log level at runtime (blocks lower severity) */
-    setLogLevel(level: LogLevel): void {
-        this.minLevel = level;
-    }
-
-    /** Get current minimum log level */
-    getLogLevel(): LogLevel {
-        return this.minLevel;
     }
 
     /** Returns a copy of the in-memory ring buffer */
@@ -186,15 +168,7 @@ class GangstaLogger {
         }
     }
 
-    private _shouldLog(level: LogLevel): boolean {
-        return LOG_LEVEL_SEVERITY[level] >= LOG_LEVEL_SEVERITY[this.minLevel];
-    }
-
     private _log(level: LogLevel, message: string): void {
-        if (!this._shouldLog(level)) {
-            return;
-        }
-
         const timestamp = new Date().toLocaleTimeString('en-US', { hour12: false });
         const entry: LogEntry = { level, message, timestamp, sessionId: this.sessionId };
         this._storeLog(entry);

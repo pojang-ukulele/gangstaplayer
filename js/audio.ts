@@ -1,5 +1,4 @@
 import { VISUALIZER_FFT_SIZE } from './constants';
-import { bufferToWaveWorker } from './worker-client';
 
 // Extend window to support webkitAudioContext
 declare global {
@@ -100,16 +99,6 @@ export async function resumeAudioContext(): Promise<void> {
     } catch (e) {
         console.error("Error resuming AudioContext:", e);
     }
-}
-
-/**
- * Convert AudioBuffer to a Blob (WAV) - Offloaded to Worker
- */
-export async function bufferToWave(ab: AudioBuffer): Promise<Blob> {
-    if (!ab || typeof ab.length !== 'number' || ab.length <= 0 || !Number.isFinite(ab.length)) {
-        throw new Error('bufferToWave: empty or detached buffer');
-    }
-    return await bufferToWaveWorker(ab, ab.length);
 }
 
 let isWorkletRegistered = false;
