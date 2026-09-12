@@ -24,8 +24,49 @@ export function normalizeToArrayBuffer(data: any): ArrayBuffer {
     // exclusive buffer because decodeAudioData detaches its input. Zero-copy
     // was evaluated and rejected — pooled IPC allocations (byteOffset !== 0)
     // and detach aliasing make the 1x transient copy the safe price.
+    // IPC contract: string / plain {length} / detached / resizable payloads
+    // throw INVALID_IPC_PAYLOAD (never a zero-filled buffer) so callers can
+    // catch + toast instead of feeding garbage to decodeAudioData/workers.
+    if (typeof data === 'string') {
+        throw new Error('normalizeToArrayBuffer: INVALID_IPC_PAYLOAD (string payload rejected)');
+    }
     if (isArrayBuffer(data)) {
-        return data.slice(0);
+        try {
+            if ((data as ArrayBuffer).byteLength === 0) {
+                // Empty may be legit, but a detached buffer also reports 0.
+                // Detached slice throws — probe without allocating.
+                let detached = false;
+                try {
+                    // Structured-clone detached buffers throw on slice.
+                    (data as ArrayBuffer).slice(0, 0);
+                } catch {
+                    detached = true;
+                }
+                // Extra detached signal: transfer already neutered it.
+                if (detached) {
+                    throw new Error('normalizeToArrayBuffer: INVALID_IPC_PAYLOAD (detached ArrayBuffer)');
+                }
+                // Resizable ArrayBuffer with 0 length that can grow is not a
+                // stable decode input — reject so callers copy explicitly.
+                const resizable = (data as unknown as { resizable?: boolean }).resizable;
+                if (resizable === true) {
+                    throw new Error('normalizeToArrayBuffer: INVALID_IPC_PAYLOAD (resizable ArrayBuffer)');
+                }
+                return (data as ArrayBuffer).slice(0);
+            }
+            const resizable = (data as unknown as { resizable?: boolean }).resizable;
+            if (resizable === true) {
+                throw new Error('normalizeToArrayBuffer: INVALID_IPC_PAYLOAD (resizable ArrayBuffer)');
+            }
+        } catch (e: any) {
+            if (String(e?.message ?? '').includes('INVALID_IPC_PAYLOAD')) throw e;
+            throw new Error(`normalizeToArrayBuffer: INVALID_IPC_PAYLOAD (${String(e?.message ?? e)})`);
+        }
+        try {
+            return (data as ArrayBuffer).slice(0);
+        } catch (e: any) {
+            throw new Error(`normalizeToArrayBuffer: INVALID_IPC_PAYLOAD (${String(e?.message ?? e)})`);
+        }
     }
     // SharedArrayBuffer cannot be passed to decodeAudioData — copy it.
     if (isSharedArrayBuffer(data)) {
@@ -38,24 +79,32 @@ export function normalizeToArrayBuffer(data: any): ArrayBuffer {
     if (data && typeof data === 'object') {
         // Node.js Buffer extends Uint8Array — check its buffer property
         if (data.buffer && isArrayBuffer(data.buffer)) {
-            return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+            // Detached backing store must fail loud, never yield zero-buffer.
+            try {
+                if (data.buffer.byteLength === 0 && data.byteLength > 0) {
+                    throw new Error('normalizeToArrayBuffer: INVALID_IPC_PAYLOAD (detached backing store)');
+                }
+                const out = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
+                if (out.byteLength === 0 && data.byteLength > 0) {
+                    throw new Error('normalizeToArrayBuffer: INVALID_IPC_PAYLOAD (zero-buffer for non-empty input)');
+                }
+                return out;
+            } catch (e: any) {
+                if (String(e?.message ?? '').includes('INVALID_IPC_PAYLOAD')) throw e;
+                throw new Error(`normalizeToArrayBuffer: INVALID_IPC_PAYLOAD (${String(e?.message ?? e)})`);
+            }
         }
         // If it's array-like but not a TypedArray, try to convert efficiently.
         // Bound: crafted {length: 1e9} objects previously allocated blindly.
+        // Contract: plain {length} objects are not valid IPC payloads — reject
+        // with INVALID_IPC_PAYLOAD instead of returning a zero-filled buffer.
         if (typeof data.length === 'number' && data.length > 0) {
-            if (!Number.isInteger(data.length) || data.length > MAX_FILE_SIZE_BYTES) {
-                throw new Error('normalizeToArrayBuffer: array-like length out of bounds');
-            }
-            const bytes = new Uint8Array(data.length);
-            for (let i = 0; i < data.length; i++) {
-                bytes[i] = data[i];
-            }
-            return bytes.buffer;
+            throw new Error('normalizeToArrayBuffer: INVALID_IPC_PAYLOAD (array-like object rejected)');
         }
     }
     // Unrecognized format — throw instead of silently producing garbage
     throw new Error(
-        `normalizeToArrayBuffer: Unsupported data type (${typeof data}, ` +
+        `normalizeToArrayBuffer: INVALID_IPC_PAYLOAD Unsupported data type (${typeof data}, ` +
         `${data?.constructor?.name ?? 'unknown'}). Expected ArrayBuffer or TypedArray.`
     );
 }

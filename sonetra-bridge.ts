@@ -290,9 +290,10 @@ class SonetraBridge {
         }
     }
 
-    /** Register a callback for restart/status events */
+    /** Register a callback for restart/status events (deduped — same fn never added twice) */
     onStatusChange(cb: SonetraStatusCallback): void {
-        this._statusCallbacks.push(cb);
+        if (typeof cb !== 'function') return;
+        if (!this._statusCallbacks.includes(cb)) this._statusCallbacks.push(cb);
     }
 
     /** Remove a previously registered status callback */
@@ -672,6 +673,8 @@ class SonetraBridge {
     /**
      * Kill the running process while preserving "was running" state, so the
      * close handler treats it as a crash and auto-restarts.
+     * Verified-exit only: isRunning stays true until the 'close' event
+     * confirms the child is gone (never set false on access-denied).
      */
     private _forceKill(): void {
         const proc = this.serverProcess;
@@ -687,13 +690,37 @@ class SonetraBridge {
         } catch { alreadyDead = false; }
         if (alreadyDead) return;
         if (process.platform === 'win32' && proc.pid) {
-            const killer = spawn('taskkill', ['/pid', String(proc.pid), '/f', '/t']);
+            const pid = proc.pid;
+            const killer = spawn('taskkill', ['/pid', String(pid), '/f', '/t']);
             killer.on('error', (e) => {
                 console.warn('[Sonetra] taskkill failed:', e.message);
                 try { proc.kill(); } catch { /* already dead */ }
             });
+            // Verify-exit: taskkill access-denied leaves the child alive —
+            // never mark isRunning=false here; the 'close' event owns that.
+            // Escalate after 3s if still alive.
+            killer.on('close', (code) => {
+                try {
+                    if (code !== 0 && proc.exitCode === null) {
+                        console.warn(`[Sonetra] taskkill exit ${code} — child may still run (no isRunning=false)`);
+                    }
+                } catch { /* ignore */ }
+            });
+            setTimeout(() => {
+                try {
+                    if (proc.exitCode === null) {
+                        try { proc.kill(); } catch { /* ignore */ }
+                    }
+                } catch { /* ignore */ }
+            }, 3000).unref?.();
         } else {
             try { proc.kill('SIGTERM'); } catch { /* already dead */ }
+            // SIGKILL escalation: SIGTERM-immune child must not linger.
+            setTimeout(() => {
+                try {
+                    if (proc.exitCode === null) proc.kill('SIGKILL');
+                } catch { /* ignore */ }
+            }, 3000).unref?.();
         }
     }
 
@@ -710,17 +737,54 @@ class SonetraBridge {
     private _resolvePythonCmd(): string {
         let pythonCmd = '';
 
+        // Allowlist: venv / portable / system only. An arbitrary
+        // config.json pythonPath (e.g. C:\evil\python.exe) is rejected
+        // without confirm — it is a Python-execution RCE vector.
         if (typeof this.config.pythonPath === 'string' && this.config.pythonPath) {
+            const raw = this.config.pythonPath;
+            // Bare system commands (no path separators) are allowlisted.
+            const bare = !raw.includes('/') && !raw.includes('\\') && !raw.includes(path.sep);
+            if (bare && ['py', 'python', 'python3'].includes(raw.toLowerCase())) {
+                console.log(`[Sonetra] Using config system Python: ${raw}`);
+                return raw;
+            }
             try {
-                const resolved = path.resolve(this.config.pythonPath);
+                const resolved = path.resolve(raw);
                 const base = path.basename(resolved).toLowerCase();
                 const isPythonBin = base === 'python.exe' || base === 'python' || base === 'py' || base.startsWith('python3');
-                if (isPythonBin && fs.existsSync(resolved) && fs.statSync(resolved).isFile()) {
-                    pythonCmd = resolved;
-                    console.log(`[Sonetra] Using config Python: ${pythonCmd}`);
-                    return pythonCmd;
-                } else if (!isPythonBin) {
+                if (!isPythonBin) {
                     console.warn('[Sonetra] Ignoring config pythonPath with non-python basename');
+                } else if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) {
+                    console.warn('[Sonetra] Ignoring config pythonPath (not a file)');
+                } else {
+                    // Must live in venv, portable, or system allowlist dirs.
+                    const allowDirs: string[] = [];
+                    try {
+                        if (this.sonetraPath) {
+                            allowDirs.push(path.resolve(path.join(this.sonetraPath, 'venv')));
+                        }
+                    } catch { /* ignore */ }
+                    try { allowDirs.push(path.resolve(path.join(__dirname, '..', 'python-embed'))); } catch { /* ignore */ }
+                    try { allowDirs.push(path.resolve(path.join(__dirname, 'python-embed'))); } catch { /* ignore */ }
+                    try { allowDirs.push(path.resolve(path.join(this._getResourcesPath(), 'python-embed'))); } catch { /* ignore */ }
+                    try { allowDirs.push(path.resolve(path.join(__dirname, 'python'))); } catch { /* ignore */ }
+                    const insensitive = process.platform === 'win32' || process.platform === 'darwin';
+                    const inAllow = allowDirs.some(d => {
+                        const dc = insensitive ? d.toLowerCase() : d;
+                        const rc = insensitive ? resolved.toLowerCase() : resolved;
+                        return rc === dc || rc.startsWith(dc + path.sep);
+                    });
+                    // System installs (WindowsApps, System32, /usr/bin) allowed.
+                    const sysPrefixes = process.platform === 'win32'
+                        ? ['c:\\windows', 'c:\\program files', 'c:\\program files (x86)']
+                        : ['/usr/bin', '/usr/local/bin', '/opt'];
+                    const lower = resolved.toLowerCase();
+                    const inSystem = sysPrefixes.some(s => lower.startsWith(insensitive ? s.toLowerCase() : s));
+                    if (inAllow || inSystem) {
+                        console.log(`[Sonetra] Using config Python: ${resolved}`);
+                        return resolved;
+                    }
+                    console.warn(`[Sonetra] Rejecting config pythonPath outside allowlist: ${resolved}`);
                 }
             } catch { /* fall through to bundled/system */ }
         }
@@ -842,6 +906,19 @@ class SonetraBridge {
                 }
             }
             await Promise.race([exited, new Promise<void>((r) => setTimeout(r, 2000).unref?.() ?? r())]);
+            // Verified-exit: only mark stopped after the child is confirmed
+            // gone. taskkill access-denied / SIGTERM-immune leaves exitCode
+            // null — never set isRunning=false on a live child.
+            let verifiedDead = false;
+            try {
+                verifiedDead = proc.exitCode !== null;
+            } catch { verifiedDead = false; }
+            if (!verifiedDead) {
+                console.warn('[Sonetra] stopServer: child still alive after kill (access-denied?) — keeping isRunning=true');
+                this.serverProcess = proc;
+                this._intentionalStop = false;
+                return { success: false };
+            }
             this.serverProcess = null;
             this.isRunning = false;
             this._intentionalStop = false;

@@ -48,8 +48,11 @@ export const settings: Readonly<Settings> = _settings;
 /**
  * Update settings with partial patch and auto-save to localStorage.
  * This is the ONLY way to mutate settings that guarantees persistence.
+ * Fullscreen actuation happens only when the patch explicitly contains
+ * fullScreen (user toggle gesture) — slider-drag saves never actuate.
  */
 export function updateSettings(patch: Partial<Settings>): void {
+    const hadFullscreen = patch && Object.prototype.hasOwnProperty.call(patch, 'fullScreen');
     if (patch.autoMix && typeof patch.autoMix === 'object') {
         const { autoMix, ...rest } = patch;
         Object.assign(_settings, rest);
@@ -57,7 +60,7 @@ export function updateSettings(patch: Partial<Settings>): void {
     } else {
         Object.assign(_settings, patch);
     }
-    saveSettings(); // persist immediately
+    saveSettings(hadFullscreen ? { actuateFullscreen: true } : undefined); // persist immediately
 }
 
 let setAutoMixEnabledFn: ((enabled: boolean) => void) | null = null;
@@ -196,7 +199,7 @@ export function applySettingsToUI(): void {
     } catch { /* ignore */ }
 }
 
-export function saveSettings(): void {
+export function saveSettings(opts?: { actuateFullscreen?: boolean }): void {
     try {
         const fullScreenToggle = document.getElementById('fullScreenToggle') as HTMLInputElement;
         const mixOptEQCrossfade = document.getElementById('mixOptEQCrossfade') as HTMLInputElement;
@@ -237,10 +240,22 @@ export function saveSettings(): void {
         if (existing && typeof existing === 'object' && existing['midiDeviceName'] !== undefined) {
             (merged as Record<string, unknown>)['midiDeviceName'] = existing['midiDeviceName'];
         }
-        localStorage.setItem('ug_settings', JSON.stringify(merged));
+        try {
+            localStorage.setItem('ug_settings', JSON.stringify(merged));
+        } catch (quotaErr) {
+            // Quota/private-mode failures must surface (not silent) so the
+            // user knows persistence is off.
+            logger.error('Save Settings Error (quota?)', quotaErr);
+            try { toast.error('SETTINGS NOT SAVED (STORAGE FULL?)'); } catch { /* ignore */ }
+            throw quotaErr;
+        }
 
-        // Actuate Full Screen
-        if (bridge && bridge.setFullScreen) bridge.setFullScreen(_settings.fullScreen);
+        // Actuate Full Screen only on explicit toggle (gesture) — never on
+        // slider-drag saves. Callers pass { actuateFullscreen: true } only
+        // from the fullscreen toggle handler / updateSettings fullScreen patch.
+        if (opts?.actuateFullscreen && bridge && bridge.setFullScreen) {
+            try { bridge.setFullScreen(_settings.fullScreen); } catch { /* ignore */ }
+        }
     } catch (e) {
         // Quota/private-mode failures previously threw out of every settings write.
         logger.error('Save Settings Error', e);
@@ -302,10 +317,19 @@ export function setupSettingsHandlers(): void {
     // Auto-save on any change (via updateSettings so persistence is unified).
     // Route AutoMix checkbox changes into the player engine — previously the
     // settings UI never actuated it (dead setAutoMixEnabledFn signal).
-    const inputs = ['fullScreenToggle', 'mixOptEQCrossfade', 'mixOptFilterSweep', 'mixOptHPFSweep', 'mixOptBPMSync', 'mixOptEnableAI'];
+    // Fullscreen actuates only on its explicit toggle (user gesture) — other
+    // inputs + slider drags persist without touching fullscreen.
+    const inputs = ['mixOptEQCrossfade', 'mixOptFilterSweep', 'mixOptHPFSweep', 'mixOptBPMSync', 'mixOptEnableAI'];
     inputs.forEach(id => {
         const el = document.getElementById(id);
         if (el) el.addEventListener('change', () => updateSettings({}));
+    });
+    const fullToggle = document.getElementById('fullScreenToggle') as HTMLInputElement | null;
+    if (fullToggle) fullToggle.addEventListener('change', () => {
+        try {
+            if (bridge && bridge.setFullScreen) bridge.setFullScreen(fullToggle.checked);
+        } catch { /* ignore */ }
+        updateSettings({ fullScreen: fullToggle.checked });
     });
     const autoMixBtn = document.getElementById('autoMixBtn');
     const mixAiCb = document.getElementById('mixOptEnableAI') as HTMLInputElement | null;

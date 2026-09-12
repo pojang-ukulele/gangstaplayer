@@ -160,6 +160,9 @@ function collectSnapshot(reason?: string): CrashSnapshot {
 let _restoring = false;
 
 function saveSnapshot(reason?: string): void {
+    // Suppressed during restore — the restore's own state writes must not
+    // re-dirty and resurrect snapshots mid-restore.
+    if (_restoring) return;
     const now = Date.now();
     // beforeunload must bypass the throttle — otherwise a crash within 10s of
     // the last save loses up to ~40s of work.
@@ -171,18 +174,53 @@ function saveSnapshot(reason?: string): void {
     // landed before touching history — a quota failure must never destroy
     // the previous newest (STORAGE_KEY) or its backups.
     const stagingKey = `${STORAGE_KEY}_staging`;
-    if (!saveToStorage(stagingKey, snapshot)) {
-        logger.warn('[CrashRecovery] Snapshot save failed (quota?) — history untouched, will retry');
-        // Silent warn-only previously left the user believing autosave was on
-        // while nothing persisted (e.g. 2000-track playlist over the 1.5MB
-        // cap). Surface it, throttled — every-30s nagging would be worse.
+    const failToast = (msg: string) => {
         try {
             const now2 = Date.now();
             if (now2 - _saveFailToastAt > 5 * 60 * 1000) {
                 _saveFailToastAt = now2;
-                toast.error('AUTOSAVE FAILED (STORAGE FULL?) — CRASH PROTECTION OFF');
+                toast.error(msg);
             }
         } catch { /* ignore */ }
+    };
+    const markOverCapWarning = () => {
+        try { localStorage.setItem('ug_crash_snapshot_warning', String(Date.now())); } catch { /* ignore */ }
+    };
+    if (!saveToStorage(stagingKey, snapshot)) {
+        // Over-cap fallback: full snapshot (pads + waveforms paths) exceeds
+        // 1.5MB — retry playlist-only (no pads, truncated playlist) so crash
+        // protection degrades instead of dying. Persistent warning flag lets
+        // the UI surface degraded mode across reloads.
+        logger.warn('[CrashRecovery] Snapshot save failed (quota?) — trying playlist-only fallback');
+        try {
+            const minimal: CrashSnapshot = {
+                ...snapshot,
+                pads: {},
+                playlist: snapshot.playlist.slice(0, 200),
+                reason: `${snapshot.reason || 'periodic'}:minimal`,
+            };
+            if (saveToStorage(stagingKey, minimal)) {
+                const stagedMin = loadFromStorage(stagingKey);
+                if (stagedMin) {
+                    const prev0m = loadFromStorage(STORAGE_KEY);
+                    if (prev0m) saveToStorage(getSnapshotKey(1), prev0m);
+                    if (saveToStorage(STORAGE_KEY, stagedMin)) {
+                        removeFromStorage(stagingKey);
+                        _lastSaveTime = now;
+                        _hasUnsavedChanges = false;
+                        markOverCapWarning();
+                        logger.warn('[CrashRecovery] Saved playlist-only fallback snapshot (pads dropped — storage over-cap)');
+                        failToast('AUTOSAVE DEGRADED (STORAGE FULL?) — PADS NOT SAVED');
+                        return;
+                    }
+                }
+            }
+        } catch { /* fallback best-effort */ }
+        logger.warn('[CrashRecovery] Snapshot save failed (quota?) — history untouched, will retry');
+        // Silent warn-only previously left the user believing autosave was on
+        // while nothing persisted (e.g. 2000-track playlist over the 1.5MB
+        // cap). Surface it, throttled — every-30s nagging would be worse.
+        failToast('AUTOSAVE FAILED (STORAGE FULL?) — CRASH PROTECTION OFF');
         return;
     }
     const staged = loadFromStorage(stagingKey);
@@ -254,6 +292,64 @@ export async function restoreSnapshot(): Promise<boolean> {
     }
 
     _restoring = true;
+    // Stage-then-commit backup (matches session.ts:365-388 rollback): capture
+    // live pads/playlist BEFORE any mutation so a failed pad reload can
+    // restore them. Never clearSnapshots on partial success — archive instead.
+    const liveBackup = {
+        playlist: [...state.playlist],
+        selectedIndices: [...state.selectedIndices],
+        currentTrackIndex: state.currentTrackIndex,
+        masterBPM: state.masterBPM,
+        loopMode: state.loopMode,
+        playbackMode: state.playbackMode,
+        isAutoMixEnabled: state.isAutoMixEnabled,
+        blendingIndex: state.blendingIndex,
+        isPlaying: state.isPlaying,
+        isCrossfadeInProgress: state.isCrossfadeInProgress,
+        pads: Array.from({ length: NUM_PADS }, (_, i) => ({
+            buf: (padBuffers as unknown as unknown[])[i],
+            path: padPaths[i] ?? '',
+            vol: padVolumes[i] ?? 0.75,
+            bpm: padBPMs[i] ?? 0,
+            sync: !!padSyncState[i],
+            ls: padLoopStart[i] ?? -1,
+            le: padLoopEnd[i] ?? -1,
+        })),
+    };
+    const restoreLive = () => {
+        try {
+            state.update({
+                playlist: liveBackup.playlist,
+                selectedIndices: liveBackup.selectedIndices,
+                currentTrackIndex: liveBackup.currentTrackIndex,
+                masterBPM: liveBackup.masterBPM,
+                loopMode: liveBackup.loopMode,
+                playbackMode: liveBackup.playbackMode,
+                isAutoMixEnabled: liveBackup.isAutoMixEnabled,
+                blendingIndex: liveBackup.blendingIndex,
+                isPlaying: false,
+                isCrossfadeInProgress: false,
+            });
+            liveBackup.pads.forEach((p, i) => {
+                try {
+                    (padBuffers as unknown as unknown[])[i] = p.buf;
+                    padPaths[i] = p.path;
+                    padVolumes[i] = p.vol;
+                    padBPMs[i] = p.bpm;
+                    padSyncState[i] = p.sync;
+                    padLoopStart[i] = p.ls;
+                    padLoopEnd[i] = p.le;
+                } catch { /* ignore */ }
+            });
+        } catch { /* best-effort */ }
+    };
+    const archiveSnapshot = () => {
+        try {
+            const raw = localStorage.getItem(STORAGE_KEY);
+            if (raw) localStorage.setItem(`${STORAGE_KEY}_archive_${Date.now()}`, raw);
+        } catch { /* ignore */ }
+    };
+    let hadFailure = false;
     try {
         // Stop the live deck BEFORE swapping the list (M18) — restoring
         // while the old track plays leaves audio pointing at a playlist
@@ -271,9 +367,13 @@ export async function restoreSnapshot(): Promise<boolean> {
             try { engine.crossfade.audio.removeAttribute('src'); engine.crossfade.audio.load(); }
             catch { try { engine.crossfade.audio.src = ''; } catch { /* ignore */ } }
         } catch { /* ignore */ }
-        state.update({ isPlaying: false, isCrossfadeInProgress: false, blendingIndex: -1, masterBPM: 0 });
-        // 1. Restore playlist (validated + bounded like session restore —
-        // untrusted localStorage must not OOM the renderer).
+        // Stage playlist (validated) but commit only after pads prove loadable.
+        let stagedPlaylist: Track[] | null = null;
+        let stagedIndex = -1;
+        let stagedBPM = 0;
+        // 1. Stage playlist (validated + bounded like session restore —
+        // untrusted localStorage must not OOM the renderer). Committed only
+        // after pads prove loadable (stage-then-commit).
         if (Array.isArray(snapshot.playlist)) {
             const clean = snapshot.playlist
                 .filter((t): t is Track => !!t && typeof (t as Track).id === 'string' && typeof (t as Track).name === 'string' && typeof (t as Track).path === 'string')
@@ -286,15 +386,13 @@ export async function restoreSnapshot(): Promise<boolean> {
                     bpm: t.bpm === undefined ? undefined : (Number.isFinite(Number(t.bpm)) ? Math.min(300, Math.max(0, Number(t.bpm))) : 0),
                 }));
             const cur = typeof snapshot.currentTrackIndex === 'number' ? snapshot.currentTrackIndex : -1;
-            state.update({
-                playlist: clean,
-                currentTrackIndex: cur >= 0 && cur < clean.length ? cur : -1,
-                masterBPM: typeof snapshot.masterBPM === 'number' && Number.isFinite(snapshot.masterBPM) ? snapshot.masterBPM : 0,
-            });
+            stagedPlaylist = clean;
+            stagedIndex = cur >= 0 && cur < clean.length ? cur : -1;
+            stagedBPM = typeof snapshot.masterBPM === 'number' && Number.isFinite(snapshot.masterBPM) ? snapshot.masterBPM : 0;
         }
 
-        // 2. Restore UI state (clamped + allowlisted — corrupt localStorage
-        // previously poisoned gain/tempo and injected invalid enums).
+        // 2. Stage UI updates (committed only on full success).
+        let stagedUiUpdates: Record<string, unknown> | null = null;
         if (snapshot.ui) {
             const clamp = (v: unknown, lo: number, hi: number): number | null => {
                 const n = typeof v === 'number' ? v : parseFloat(String(v));
@@ -329,20 +427,22 @@ export async function restoreSnapshot(): Promise<boolean> {
             if (typeof snapshot.ui.isAutoMixEnabled === 'boolean') {
                 updates.isAutoMixEnabled = snapshot.ui.isAutoMixEnabled;
             }
-            if (Object.keys(updates).length > 0) state.update(updates);
+            if (Object.keys(updates).length > 0) stagedUiUpdates = updates;
         }
 
         // 3. Restore sampler pads — H30: fail fast on missing files, per-pad
         // timeout (8s) plus an overall budget (60s) with cooperative cancel
         // so 16 missing files can't stall startup for minutes.
+        // Stage-then-commit: live pads are backed up above; cleared here for
+        // the load attempt, restored on any failure (no partial clobber).
         const withTimeout = <T>(p: Promise<T>, ms: number): Promise<T> =>
             Promise.race([p, new Promise<T>((_, rej) => setTimeout(() => rej(new Error('pad restore timeout')), ms))]);
         const PER_PAD_RESTORE_MS = 8000;
         const OVERALL_RESTORE_BUDGET_MS = 60000;
         const restoreStart = Date.now();
         _restoreCancelled = false;
-        // Clear live pads FIRST: a 2-pad snapshot over a 16-pad kit previously
-        // left 14 stale pads playable (ghost audio after crash restore).
+        // Clear live pads for the attempt (ghost-audio fix): restored on
+        // failure via restoreLive() below.
         for (let i = 0; i < NUM_PADS; i++) {
             try { (padBuffers as any)[i] = undefined; } catch { /* ignore */ }
             try { padPaths[i] = ''; } catch { /* ignore */ }
@@ -352,24 +452,28 @@ export async function restoreSnapshot(): Promise<boolean> {
             try { padLoopStart[i] = -1; } catch { /* ignore */ }
             try { padLoopEnd[i] = -1; } catch { /* ignore */ }
         }
-        const padKeys = Object.keys(snapshot.pads);
+        // Pause live state swap until pads prove loadable.
+        state.update({ isPlaying: false, isCrossfadeInProgress: false, blendingIndex: -1 });
+        const padKeys = Object.keys(snapshot.pads || {});
         if (padKeys.length > 0) {
             for (const key of padKeys) {
                 if (_restoreCancelled) {
-                    logger.info('[CrashRecovery] Pad restore cancelled — skipping remaining pads');
+                    logger.info('[CrashRecovery] Pad restore cancelled — rolling back to live kit');
+                    hadFailure = true;
                     break;
                 }
                 if (Date.now() - restoreStart > OVERALL_RESTORE_BUDGET_MS) {
-                    logger.warn('[CrashRecovery] Pad restore budget exceeded — skipping remaining pads');
+                    logger.warn('[CrashRecovery] Pad restore budget exceeded — rolling back to live kit');
+                    hadFailure = true;
                     break;
                 }
                 const idx = parseInt(key);
-                const p = snapshot.pads[idx];
+                const p = (snapshot.pads as Record<number, { path: string; vol: number; bpm: number; sync: boolean; loopStart?: number; loopEnd?: number }>)[idx];
                 if (!p || !Number.isInteger(idx) || idx < 0 || idx >= NUM_PADS) continue;
-                // Fail fast: empty/overlong paths can never load — skip
-                // without spending a timeout on them.
+                // Fail fast: empty/overlong paths can never load.
                 if (typeof p.path !== 'string' || !p.path || p.path.length > 32760) {
                     logger.warn(`[CrashRecovery] Pad ${idx} skipped (missing path)`);
+                    hadFailure = true;
                     continue;
                 }
                 // Don't claim padPaths before the file proves loadable —
@@ -384,6 +488,7 @@ export async function restoreSnapshot(): Promise<boolean> {
                     if (typeof p.loopEnd === 'number' && Number.isFinite(p.loopEnd) && p.loopEnd > 0) padLoopEnd[idx] = p.loopEnd;
                 } catch (err: unknown) {
                     logger.warn(`[CrashRecovery] Pad ${idx} reload failed: ${(err as Error)?.message || err}`);
+                    hadFailure = true;
                     continue;
                 }
                 // Restore volume slider UI
@@ -393,6 +498,30 @@ export async function restoreSnapshot(): Promise<boolean> {
                 if (slider) slider.value = padVolumes[idx].toString();
             }
         }
+        if (hadFailure || _restoreCancelled) {
+            // Partial success must never clobber live or clear history —
+            // archive the snapshot and restore the live kit/playlist.
+            restoreLive();
+            archiveSnapshot();
+            try {
+                const { renderPlaylist } = await import('./playlist');
+                renderPlaylist();
+            } catch { /* ignore */ }
+            logger.warn('[CrashRecovery] Restore incomplete — live kit preserved, snapshot archived');
+            toast.error('RESTORE INCOMPLETE — LIVE KIT PRESERVED');
+            return false;
+        }
+        // Commit staged playlist + UI only after all pads succeeded.
+        if (stagedPlaylist) {
+            state.update({
+                playlist: stagedPlaylist,
+                currentTrackIndex: stagedIndex,
+                masterBPM: stagedBPM,
+            });
+        } else {
+            state.update({ isPlaying: false, isCrossfadeInProgress: false, blendingIndex: -1, masterBPM: 0 });
+        }
+        if (stagedUiUpdates) state.update(stagedUiUpdates);
 
         // 4. Trigger playlist render
         try {
@@ -412,6 +541,7 @@ export async function restoreSnapshot(): Promise<boolean> {
         logger.info(`[CrashRecovery] Restored snapshot from ${ts}`);
         return true;
     } catch (e) {
+        try { restoreLive(); } catch { /* ignore */ }
         logger.error('[CrashRecovery] Restore failed', e);
         toast.error("RESTORE FAILED");
         return false;

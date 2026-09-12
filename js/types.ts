@@ -4,6 +4,7 @@
  */
 
 // === Electron IPC API ===
+// Mirrors preload.ts bridges exactly (see preload.ts for validation caps).
 export interface ElectronAPI {
     minimize(): void;
     maximize(): void;
@@ -14,25 +15,35 @@ export interface ElectronAPI {
     saveKit(): Promise<string | null | undefined>;
     saveSessionDialog(): Promise<string | null | undefined>;
     loadKit(): Promise<string | null | undefined>;
+    // Bounded path disclosure only for user-picked File objects (dialog/DnD).
     getPathForFile(file: File): string;
     saveAudioDialog(): Promise<string | null | undefined>;
     openSampleDialog(): Promise<string | null | undefined>;
-    generateCrashReport(snapshot: any): Promise<string | null | undefined>;
+    generateCrashReport(snapshot: unknown): Promise<string | null | undefined>;
 }
 
 export interface FileSystemAPI {
+    // main returns Buffer|null (Node); renderer sees Uint8Array|null.
     readFile(filePath: string): Promise<Uint8Array | null>;
     consentFile(filePath: string): Promise<boolean>;
+    // main returns boolean success (false on reject/rate-limit).
     saveFile(filePath: string, data: Uint8Array): Promise<boolean>;
     showItemInFolder(filePath: string): Promise<boolean>;
-    appendLog(level: string, message: string): Promise<void>;
+    appendLog(level: string, message: string): Promise<boolean>;
     getLogPath(): Promise<string>;
 }
 
 export interface SonetraAPI {
-    getCachedTransition(track1Path: string, track2Path: string): Promise<{ success: boolean; audioBuffer?: any; error?: string }>;
+    getCachedTransition(track1Path: string, track2Path: string): Promise<{ success: boolean; audioBuffer?: Uint8Array | null; error?: string }>;
     precomputeTransition(track1Path: string, track2Path: string): Promise<{ success: boolean; cached?: boolean; error?: string }>;
     onRestartStatus(callback: (status: unknown) => void): () => void;
+    // Main-owned lifecycle (no renderer IPC — main process only).
+    // Declared for main-process typing, not exposed via preload (H4).
+    startServer?(): Promise<{ success: boolean; port?: number; error?: string }>;
+    stopServer?(): Promise<{ success: boolean }>;
+    restartServer?(): Promise<{ success: boolean; error?: string }>;
+    analyzeTrack?(trackPath: string): Promise<{ success: boolean; analysis?: unknown; error?: string }>;
+    createTransition?(a: string, b: string, style?: string): Promise<{ success: boolean; audioBuffer?: Uint8Array | null; error?: string }>;
 }
 
 export interface DatabaseAPI {
@@ -55,6 +66,7 @@ declare global {
 }
 
 // === IPC Channels ===
+// Must match main.ts registerIpcHandlers + preload.ts invokes.
 export type IpcChannels = 
     | 'app:minimize'
     | 'app:maximize'
@@ -67,6 +79,7 @@ export type IpcChannels =
     | 'dialog:load-kit'
     | 'dialog:save-audio'
     | 'dialog:open-sample'
+    | 'dialog:save-session'
     | 'fs:save-file'
     | 'fs:read-file'
     | 'fs:consent-file'
@@ -75,11 +88,10 @@ export type IpcChannels =
     | 'fs:get-log-path'
     | 'sonetra:get-cached-transition'
     | 'sonetra:precompute-transition'
+    | 'sonetra:restart-status'
     | 'db:upsert-track'
     | 'db:get-track'
     | 'db:search-tracks'
-    | 'db:get-all-tracks'
-    | 'dialog:save-session'
-    | 'sonetra:restart-status';
+    | 'db:get-all-tracks';
 
 export {};

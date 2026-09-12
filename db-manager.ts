@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import * as fs from 'fs';
 import * as path from 'path';
 import { app } from 'electron';
-import { MAX_PLAYLIST_SEARCH_RESULTS } from './js/constants';
+import { VALID_AUDIO_EXTENSIONS } from './js/constants';
 
 function safeParse(json: string | null | undefined, fallback: any): any {
     if (!json) return fallback;
@@ -72,6 +72,41 @@ export class DatabaseManager {
             throw new Error('upsertTrack: field too long');
         }
         if (String(track.id).length > 256) throw new Error('upsertTrack: id too long');
+        // Ext gate: DB tracks must be audio (plus ADS/UNC rejection).
+        const ext = path.extname(track.path).replace('.', '').toLowerCase();
+        if (!(VALID_AUDIO_EXTENSIONS as readonly string[]).includes(ext)) {
+            throw new Error(`upsertTrack: non-audio extension (.${ext})`);
+        }
+        if (track.path.includes('\0')) throw new Error('upsertTrack: illegal path');
+        const drive = /^[a-zA-Z]:[\\/]/.exec(track.path);
+        const rest = drive ? track.path.slice(drive[0].length) : track.path;
+        if (rest.includes(':') || track.path.includes(':$DATA')) throw new Error('upsertTrack: ADS path rejected');
+        if (track.path.startsWith('\\\\') || track.path.startsWith('//')) throw new Error('upsertTrack: UNC path rejected');
+        // Consent gate (best-effort in main without IPC round-trip): allow
+        // only consented files, dialog approvals, recordings, or allowlisted
+        // audio dirs. Direct DB import avoids circular main imports by lazy
+        // require — failures closed (deny) only when the bridge is loadable.
+        try {
+            // eslint-disable-next-line @typescript-eslint/no-var-requires
+            const bridge = require('./sonetra-bridge') as typeof import('./sonetra-bridge');
+            const consented = bridge.isAllowedAudioFile(track.path) || bridge.isAllowedAudioDirForPath(track.path);
+            if (!consented) {
+                // Recordings + dialog paths are also legit; check lexically.
+                let inRecordings = false;
+                try {
+                    const userDataPath = app.getPath('userData');
+                    const recDir = path.resolve(path.join(userDataPath, 'recordings'));
+                    const rel = path.relative(recDir, path.resolve(track.path));
+                    const insensitive = process.platform === 'win32' || process.platform === 'darwin';
+                    const relCmp = insensitive ? rel.toLowerCase() : rel;
+                    inRecordings = !!rel && !relCmp.startsWith('..') && !path.isAbsolute(rel);
+                } catch { /* ignore */ }
+                if (!inRecordings) throw new Error('upsertTrack: file not consented');
+            }
+        } catch (e: any) {
+            if (String(e?.message ?? '').includes('not consented')) throw e;
+            // Bridge unavailable (tests) — ext gate above still applies.
+        }
         let metadataJson = '{}';
         try {
             const md = track.metadata ?? {};
@@ -158,14 +193,13 @@ export class DatabaseManager {
         // Escape LIKE wildcards so user input like "50%" doesn't match everything
         const escaped = String(query ?? '').slice(0, 256).replace(/[\\%_]/g, ch => '\\' + ch);
         const wildcard = `%${escaped}%`;
+        // Bulk surface excludes metadata (256KB x rows = IPC OOM) and caps
+        // at 200 rows — getTrackByPath keeps metadata for single-track needs.
         const stmt = this.db.prepare(
-            `SELECT * FROM tracks WHERE name LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\'
-             ORDER BY name ASC LIMIT ${MAX_PLAYLIST_SEARCH_RESULTS}`
+            `SELECT id, path, name, duration, bpm FROM tracks WHERE name LIKE ? ESCAPE '\\' OR path LIKE ? ESCAPE '\\'
+             ORDER BY name ASC LIMIT 200`
         );
-        return stmt.all(wildcard, wildcard).map((row: any) => {
-            if (row.metadata) row.metadata = safeParse(row.metadata, {});
-            return row;
-        });
+        return stmt.all(wildcard, wildcard);
     }
 
     public close() {

@@ -11,7 +11,7 @@
 import './types';
 import { state, Track, LoopMode, PlaybackMode } from './state';
 import { settings, saveSettings, applySettingsToUI, updateAutoMix } from './settings';
-import { NUM_PADS } from './constants';
+import { NUM_PADS, VALID_AUDIO_EXTENSIONS } from './constants';
 import { toast } from './toast';
 import { logger } from './logger';
 import {
@@ -56,24 +56,42 @@ function fallbackHashHex(data: string): string {
     // 64 hex chars to match SHA-256 shape (corruption-evidence only).
     return (mix(h1) + mix(h2) + mix(h1 ^ h2) + mix(h1 + h2) + mix(h1 ^ 0x9e3779b9) + mix(h2 ^ 0x85ebca6b) + mix(h1 + h2 + 1) + mix(h2 + h1 + 2)).slice(0, 64);
 }
+// FNV fallback is corruption-evidence only (weak:true) — not collision
+// resistant. Saved sessions mark signatureWeak so verify can warn.
+let _lastHashWeak = false;
+let _lastHashWasStrong = false;
 async function sha256Hex(data: string): Promise<string> {
     try {
         const subtle = (typeof crypto !== 'undefined' ? (crypto as Crypto).subtle : undefined);
         // M29: crypto.subtle is undefined in non-secure contexts (file://).
-        if (!subtle || typeof subtle.digest !== 'function') return fallbackHashHex(data);
+        if (!subtle || typeof subtle.digest !== 'function') {
+            _lastHashWeak = true;
+            return fallbackHashHex(data);
+        }
         const digest = await subtle.digest('SHA-256', new TextEncoder().encode(data));
+        _lastHashWasStrong = true;
         return Array.from(new Uint8Array(digest))
             .map(b => b.toString(16).padStart(2, '0'))
             .join('');
     } catch {
+        _lastHashWeak = true;
         return fallbackHashHex(data);
     }
 }
-
-async function verifyChecksum(data: string, expected: string): Promise<boolean> {
+// FNV fallback is corruption-evidence only (weak:true) — not collision
+// resistant. Saved sessions mark signatureWeak so verify can warn.
+async function verifyChecksum(data: string, expected: string, wasWeak?: boolean): Promise<boolean> {
     try {
         if (!/^[0-9a-f]{64}$/i.test(expected)) return false;
+        if (wasWeak) {
+            logger.warn('[Session] Checksum uses weak FNV fallback (non-secure context) — tamper-evidence reduced');
+        }
+        _lastHashWeak = false;
+        _lastHashWasStrong = false;
         const actual = await sha256Hex(data);
+        if (_lastHashWeak) {
+            logger.warn('[Session] Verified with weak FNV fallback — integrity evidence reduced');
+        }
         return actual.toLowerCase() === expected.toLowerCase();
     } catch {
         return false;
@@ -108,6 +126,7 @@ interface SessionData {
     version: number;
     name: string;
     signature?: string; // SHA-256 corruption-evidence checksum (not a secret)
+    signatureWeak?: boolean; // true when FNV fallback was used (weak integrity)
     kit: {
         pads: SessionPad[];
     };
@@ -199,7 +218,13 @@ export async function saveSession(): Promise<void> {
         };
 
         // Corruption-evidence checksum over canonical form (key-sorted, whitespace-insensitive).
+        _lastHashWeak = false;
+        _lastHashWasStrong = false;
         session.signature = await sha256Hex(canonicalize(session));
+        session.signatureWeak = _lastHashWeak ? true : undefined;
+        if (_lastHashWeak) {
+            logger.warn('[Session] Saved with weak FNV checksum (non-secure context) — integrity evidence reduced');
+        }
 
         const fs = window.fileSystem;
         if (fs?.saveFile) {
@@ -342,7 +367,7 @@ export async function loadSession(): Promise<void> {
 
         // Verify checksum (corruption evidence only — not attacker-proof)
         if (session.signature) {
-            const isValid = await verifyChecksum(canonicalize(session), session.signature);
+            const isValid = await verifyChecksum(canonicalize(session), session.signature, session.signatureWeak);
             if (!isValid) {
                 logger.error('[Session] Checksum mismatch - file is corrupt or was edited outside the app');
                 toast.error("SESSION CORRUPTED - LOAD ABORTED");
@@ -416,9 +441,14 @@ export async function loadSession(): Promise<void> {
             masterBPM: 0,
         });
 
-        // 2. Load playlist (validated, bounded — crafted files must not OOM)
+        // 2. Load playlist (validated, bounded — crafted files must not OOM).
+        // Ext + slice gate: playlist paths must be audio with bounded length.
         if (Array.isArray(session.playlist)) {
-            const clean = session.playlist.filter(isValidTrack).slice(0, 2000).map(t => ({
+            const clean = session.playlist.filter(isValidTrack).filter(t => {
+                const p = String(t.path).slice(0, 32760);
+                const ext = p.split('.').pop()?.toLowerCase() ?? '';
+                return (VALID_AUDIO_EXTENSIONS as readonly string[]).includes(ext);
+            }).slice(0, 2000).map(t => ({
                 id: String(t.id).slice(0, 128),
                 name: String(t.name).slice(0, 512),
                 path: String(t.path).slice(0, 32760),
@@ -459,6 +489,12 @@ export async function loadSession(): Promise<void> {
                 const idx = Number((p as SessionPad)?.index);
                 const ppath = typeof (p as SessionPad)?.path === 'string' ? (p as SessionPad).path.slice(0, 32760) : '';
                 if (!ppath || !Number.isInteger(idx) || idx < 0 || idx >= NUM_PADS) continue;
+                // Ext gate: pad samples must be audio (slice already bounded).
+                const pext = ppath.split('.').pop()?.toLowerCase() ?? '';
+                if (!(VALID_AUDIO_EXTENSIONS as readonly string[]).includes(pext)) {
+                    logger.warn(`[Session] Pad ${idx} skipped (non-audio ext .${pext})`);
+                    continue;
+                }
                 if (loadGen !== sessionLoadGen) break; // rolled back mid-loop — stop writing
                 const orig = loadSampleFromPath(ppath, idx);
                 // Late-resolve guard: the timed-out load keeps decoding in the
@@ -557,7 +593,15 @@ export async function loadSession(): Promise<void> {
                 state.update({ playbackMode: session.ui.playbackMode as 'continuous' | 'single' });
             }
             if (typeof session.ui.isAutoMixEnabled === 'boolean') {
-                state.update({ isAutoMixEnabled: session.ui.isAutoMixEnabled });
+                // Actuate through the player engine (not raw state) so the
+                // deck/loop-one interlock actually applies.
+                try {
+                    const { setAutoMixEnabled } = await import('./player');
+                    if (typeof setAutoMixEnabled === 'function') setAutoMixEnabled(session.ui.isAutoMixEnabled);
+                    else state.update({ isAutoMixEnabled: session.ui.isAutoMixEnabled });
+                } catch {
+                    state.update({ isAutoMixEnabled: session.ui.isAutoMixEnabled });
+                }
             }
         }
 

@@ -25,7 +25,21 @@ contextBridge.exposeInMainWorld('electronAPI', {
   saveSessionDialog: () => ipcRenderer.invoke('dialog:save-session'),
   loadKit: () => ipcRenderer.invoke('dialog:load-kit'),
   saveAudioDialog: () => ipcRenderer.invoke('dialog:save-audio'),
-  getPathForFile: (file: File) => webUtils.getPathForFile(file),
+  // Bounded path disclosure: only for user-picked File objects from
+  // dialog/DnD (Electron File with a real disk path). Never call with
+  // renderer-crafted strings — returns '' for anything else so the bridge
+  // cannot be used as an unbounded path oracle.
+  getPathForFile: (file: File) => {
+    try {
+      if (!file || typeof file !== 'object') return '';
+      // Must look like a user-picked File (name + size + Electron path).
+      const f = file as File & { path?: unknown };
+      if (typeof f.name !== 'string' || !f.name) return '';
+      return webUtils.getPathForFile(file);
+    } catch {
+      return '';
+    }
+  },
   setFullScreen: (flag: boolean) => ipcRenderer.send('app:set-fullscreen', flag),
   openSampleDialog: () => ipcRenderer.invoke('dialog:open-sample'),
   appReadyToShow: () => ipcRenderer.send('app:ready-to-show'),

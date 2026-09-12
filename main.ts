@@ -67,7 +67,9 @@ function hasDialogPath(p: string): boolean {
  * - Must be a non-empty string
  * - Must not contain null bytes
  * - Must be absolute
- * - Must not contain directory traversal (after normalization, resolved path must match)
+ * - NOTE: ".." collapse alone never proves safety — validatePath only
+ *   canonicalizes; every caller must still pass the result through an
+ *   allowlist gate (isSavePathAllowed / isReadPathAllowed / consent).
  */
 function validatePath(p: string): string | null {
   if (!p || typeof p !== 'string') return null;
@@ -83,10 +85,42 @@ function validatePath(p: string): string | null {
   return path.resolve(normalized);
 }
 
+/**
+ * ADS + UNC gate (Windows-safe, no flag reliance).
+ * Rejects NTFS alternate-data-stream suffixes (`beat.wav:hidden`,
+ * `beat.wav:$DATA` via `:$DATA`) and stream dir components
+ * (`recordings:evil\beat.wav`), plus UNC (`\\server\share`, `//server/share`).
+ * A drive-letter prefix does NOT exempt later colons — any colon past the
+ * `C:\` prefix rejects.
+ */
+function isAdsOrUncPath(p: string): boolean {
+  if (p.startsWith('\\\\') || p.startsWith('//')) return true;
+  if (p.includes(':$DATA')) return true;
+  const m = /^[a-zA-Z]:[\\/]/.exec(p);
+  const rest = m ? p.slice(m[0].length) : p;
+  if (rest.includes(':')) return true;
+  return false;
+}
+
 const SAVE_ALLOWED_EXTS = new Set(['json', 'wav']);
 // config.json controls the Sonetra pythonPath (C3 chain) and gangsta.db-journal
 // is live DB state — neither may ever be a save target.
 const SAVE_BLOCKED_BASENAMES = new Set(['gangsta.db', 'gangsta.db-wal', 'gangsta.db-shm', 'gangsta.db-journal', 'gangsta_log.txt', 'config.json']);
+// Non-dialog writes into userData/recordings are allowlisted to session-shaped
+// names only — arbitrary recordings/*.json/*.wav overwrite without a dialog
+// (e.g. clobbering another session) is rejected. Dialog-approved paths bypass
+// this (first branch below).
+function isSessionShapedSaveName(p: string, ext: string): boolean {
+  const base = path.basename(p);
+  if (ext === 'json') {
+    // Dedicated session dialog emits GangstaSession_<ts>.session.json
+    return base.endsWith('.session.json') && base.startsWith('GangstaSession_');
+  }
+  if (ext === 'wav') {
+    return base.startsWith('Master_Rec_');
+  }
+  return false;
+}
 
 /**
  * Returns true if the path is allowed for writing.
@@ -100,10 +134,9 @@ function isSavePathAllowed(p: string): boolean {
   const ext = path.extname(p).replace('.', '').toLowerCase();
   if (!SAVE_ALLOWED_EXTS.has(ext)) return false;
   if (SAVE_BLOCKED_BASENAMES.has(path.basename(p).toLowerCase())) return false;
-  // Block ADS streams and UNC paths that confuse allowlist checks
-  // (both \\server\share and //server/share forms).
-  if (p.includes(':') && !/^[a-zA-Z]:[\\/]/.test(p)) return false;
-  if (p.startsWith('\\\\') || p.startsWith('//')) return false;
+  // Block ADS streams (incl. :$DATA past the drive prefix) and UNC paths
+  // that confuse allowlist checks (both \\server\share and //server/share forms).
+  if (isAdsOrUncPath(p)) return false;
   if (hasDialogPath(p)) {
     // Resolve symlinks: a dialog path swapped for a symlink to gangsta.db/logs must not pass.
     try {
@@ -133,7 +166,11 @@ function isSavePathAllowed(p: string): boolean {
   // Case-insensitive only where the FS is (Windows/macOS); Linux stays exact.
   const insensitive = process.platform === 'win32' || process.platform === 'darwin';
   const relCmp = insensitive ? rel.toLowerCase() : rel;
-  if (rel && !relCmp.startsWith('..') && !path.isAbsolute(rel)) return true;
+  if (rel && !relCmp.startsWith('..') && !path.isAbsolute(rel)) {
+    // Non-dialog recordings writes must be session-shaped (see above).
+    if (!isSessionShapedSaveName(resolvedReal, ext)) return false;
+    return true;
+  }
   return false;
 }
 
@@ -158,8 +195,7 @@ function addConsentedReadFile(p: string): boolean {
   if (!validated) return false;
   const ext = path.extname(validated).replace('.', '').toLowerCase();
   if (!READABLE_EXTENSIONS.has(ext)) return false;
-  if (validated.includes(':') && !/^[a-zA-Z]:[\\/]/.test(validated)) return false;
-  if (validated.startsWith('\\\\') || validated.startsWith('//')) return false;
+  if (isAdsOrUncPath(validated)) return false;
   try {
     let real = validated;
     try { real = fs.realpathSync.native(validated); } catch { /* use validated */ }
@@ -210,8 +246,7 @@ function isConsentedReadFile(p: string): boolean {
 function isReadPathAllowed(p: string): boolean {
   const ext = path.extname(p).replace('.', '').toLowerCase();
   if (!READABLE_EXTENSIONS.has(ext)) return false;
-  if (p.includes(':') && !/^[a-zA-Z]:[\\/]/.test(p)) return false;
-  if (p.startsWith('\\\\') || p.startsWith('//')) return false;
+  if (isAdsOrUncPath(p)) return false;
   // 1) Exact per-file consent (DnD drop registered via fs:consent-file).
   if (isConsentedReadFile(p)) return true;
   try {
@@ -460,16 +495,30 @@ function registerIpcHandlers(): void {
             return false;
           }
         } else {
-          // Parent-dir check: a symlinked recordings subdir must not pass.
-          // Best-effort only (target may not exist yet); final-component +
-          // post-open fstat checks below are authoritative.
+          // Parent-dir realpath check: a symlinked recordings subdir
+          // (recordings/linkdir -> outside) passes the lexical inside-check
+          // while the real path escapes. Enforce realpath containment for
+          // non-dialog writes; dialog-approved paths bypass (user-approved).
+          // Windows-safe: no O_NOFOLLOW reliance — realpath + post-open
+          // fstat + realpath location check below are authoritative.
           try {
             const realParent = fs.realpathSync.native(path.dirname(validated));
             const userDataPath = app.getPath('userData');
             const recDir = path.resolve(path.join(userDataPath, 'recordings'));
             let recReal = recDir;
             try { recReal = fs.realpathSync.native(recDir); } catch { /* ignore */ }
-            void realParent; void recReal;
+            if (!hasDialogPath(validated)) {
+              const relP = path.relative(recReal, realParent);
+              const insensitiveP = process.platform === 'win32' || process.platform === 'darwin';
+              const relPCmp = insensitiveP ? relP.toLowerCase() : relP;
+              // realParent must be recReal itself or inside it; equal-lexical
+              // but escaped-real rejects here.
+              const parentInside = relP === '' || (!relPCmp.startsWith('..') && !path.isAbsolute(relP));
+              if (!parentInside) {
+                logToDisk('ERROR', `Security: Blocked write with escaped parent ${validated} (realParent ${realParent})`);
+                return false;
+              }
+            }
           } catch { /* target may not exist yet — lexical check already passed */ }
         }
       } catch { /* target may not exist yet — lexical check already passed */ }
@@ -484,10 +533,11 @@ function registerIpcHandlers(): void {
           return false;
         }
       } catch { /* target may not exist yet — lexical check already passed */ }
-      // Open with O_NOFOLLOW where the OS supports it so a symlink swapped
-      // in between the checks above and the write fails instead of
-      // redirecting (C5). Post-open fstat re-verifies target: regular file,
-      // non-internal basename. fsync before close for WAL-adjacent durability.
+      // Open + fstat + realpath(fd) location check (Windows-safe: no
+      // O_NOFOLLOW reliance — O_NOFOLLOW is a no-op on Windows). Post-open
+      // fstat re-verifies target: regular file, non-internal basename, and
+      // realpath containment in dialog set or recordings dir. fsync before
+      // close for WAL-adjacent durability.
       let fd: number | undefined;
       try {
         const c = fs.constants as unknown as { O_WRONLY?: number; O_CREAT?: number; O_TRUNC?: number; O_NOFOLLOW?: number };
@@ -501,8 +551,17 @@ function registerIpcHandlers(): void {
           logToDisk('ERROR', `Security: Blocked write to non-file ${validated}`);
           return false;
         }
-        if (SAVE_BLOCKED_BASENAMES.has(path.basename(fs.realpathSync.native(validated)).toLowerCase())) {
+        // Realpath-via-path after open (fd location check): the open fd pins
+        // the target so a swap between open and realpath cannot redirect the
+        // write; fstat above already pinned type. Verify containment.
+        let openReal = validated;
+        try { openReal = fs.realpathSync.native(validated); } catch { /* use validated */ }
+        if (SAVE_BLOCKED_BASENAMES.has(path.basename(openReal).toLowerCase())) {
           logToDisk('ERROR', `Security: Blocked write to internal file ${validated}`);
+          return false;
+        }
+        if (!hasDialogPath(validated) && !hasDialogPath(openReal) && !isSavePathAllowed(openReal)) {
+          logToDisk('ERROR', `Security: Blocked write with post-open escape ${validated} -> ${openReal}`);
           return false;
         }
         fs.writeSync(fd, data, 0, data.byteLength);
@@ -762,8 +821,13 @@ function registerIpcHandlers(): void {
     }
     // Dedupe concurrent precomputes for the same key — previously N parallel
     // invokes all missed and fired N duplicate 100MB uploads.
+    // Concurrency cap: max 2 in-flight precomputes, rest rejected 429 so a
+    // burst cannot queue unbounded 100MB uploads (DoS).
     if (inFlightPrecompute.has(cacheKey)) {
       return { success: false, error: 'Precompute already in flight' };
+    }
+    if (inFlightPrecompute.size >= 2) {
+      return { success: false, error: '429 Too Many Requests (precompute queue full)' };
     }
     inFlightPrecompute.add(cacheKey);
     try {
@@ -792,6 +856,25 @@ function registerIpcHandlers(): void {
     if (rateLimited('db:upsert-track', 50)) return null;
     try {
       if (!track || typeof track !== 'object') return null;
+      // Ext + consent gate: DB must not become an exfil channel for
+      // non-audio paths. Audio ext required; consented file, dialog approval,
+      // or allowlisted dir required.
+      if (typeof track.path === 'string' && track.path) {
+        const ext = path.extname(track.path).replace('.', '').toLowerCase();
+        if (!VALID_AUDIO_EXTENSIONS.includes(ext as never)) {
+          logToDisk('ERROR', `Security: Blocked db:upsert-track with non-audio ext ${track.path}`);
+          return null;
+        }
+        if (isAdsOrUncPath(track.path)) {
+          logToDisk('ERROR', `Security: Blocked db:upsert-track with ADS/UNC ${track.path}`);
+          return null;
+        }
+        const v = validatePath(track.path);
+        if (!v || !isReadPathAllowed(v)) {
+          logToDisk('ERROR', `Security: Blocked db:upsert-track without consent ${track.path}`);
+          return null;
+        }
+      }
       const db = getDbManager();
       if (!db) return null;
       return db.upsertTrack(track);
@@ -899,19 +982,27 @@ function createWindow() {
 
 // Idempotent full cleanup (C1): previously only win 'close' cleaned up, so
 // Cmd+Q / dock quit / taskkill / macOS close-then-quit leaked a dirty WAL and
-// orphaned uvicorn. Every quit path funnels through here.
+// orphaned uvicorn. Every quit path funnels through here. Awaits stopServer()
+// so the Python child is reaped before exit; before-quit holds the quit with
+// preventDefault until done.
 let shuttingDown = false;
-function shutdownMain(reason: string): void {
-  if (shuttingDown) return;
+let shutdownPromise: Promise<void> | null = null;
+function shutdownMain(reason: string): Promise<void> {
+  if (shutdownPromise) return shutdownPromise;
   shuttingDown = true;
-  try { dialogReturnedPaths.clear(); } catch { /* ignore */ }
-  try {
-    getDbManager()?.close();
-  } catch (e) {
-    try { logToDisk('ERROR', `DB close failed (${reason}): ${e}`); } catch { /* ignore */ }
-  }
-  try { logManager.close(); } catch { /* ignore */ }
-  void sonetraBridge.stopServer().catch(() => undefined);
+  shutdownPromise = (async () => {
+    try { dialogReturnedPaths.clear(); } catch { /* ignore */ }
+    try {
+      await sonetraBridge.stopServer().catch(() => undefined);
+    } catch { /* ignore */ }
+    try {
+      getDbManager()?.close();
+    } catch (e) {
+      try { logToDisk('ERROR', `DB close failed (${reason}): ${e}`); } catch { /* ignore */ }
+    }
+    try { logManager.close(); } catch { /* ignore */ }
+  })();
+  return shutdownPromise;
 }
 
 app.whenReady().then(() => {
@@ -929,22 +1020,28 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
 
-app.on('before-quit', () => {
-  shutdownMain('before-quit');
+app.on('before-quit', (e) => {
+  if (shuttingDown && shutdownPromise) return;
+  e.preventDefault();
+  void shutdownMain('before-quit').finally(() => {
+    try { app.exit(0); } catch { try { app.quit(); } catch { /* ignore */ } }
+  });
 });
 
 app.on('will-quit', () => {
-  shutdownMain('will-quit');
+  void shutdownMain('will-quit');
 });
 
 process.on('SIGINT', () => {
-  shutdownMain('SIGINT');
-  try { app.quit(); } catch { /* ignore */ }
+  void shutdownMain('SIGINT').finally(() => {
+    try { app.quit(); } catch { /* ignore */ }
+  });
 });
 
 process.on('SIGTERM', () => {
-  shutdownMain('SIGTERM');
-  try { app.quit(); } catch { /* ignore */ }
+  void shutdownMain('SIGTERM').finally(() => {
+    try { app.quit(); } catch { /* ignore */ }
+  });
 });
 
 app.on('activate', () => {
@@ -965,8 +1062,11 @@ process.on('uncaughtException', (error) => {
   try {
     logToDisk('ERROR', `UNCAUGHT EXCEPTION: ${(error as Error)?.stack || error}`);
   } catch { /* ignore */ }
-  try { getDbManager()?.close(); } catch { /* ignore */ }
-  logManager.generatePostMortem({ type: 'CRASH_UNCAUGHT_EXCEPTION' })
+  // Crash path must also reap the Python child and checkpoint the DB —
+  // otherwise an exception leaves an orphaned uvicorn + dirty WAL.
+  void sonetraBridge.stopServer().catch(() => undefined).finally(() => {
+    try { getDbManager()?.close(); } catch { /* ignore */ }
+    logManager.generatePostMortem({ type: 'CRASH_UNCAUGHT_EXCEPTION' })
     .then((report) => console.error(`GURU ERROR: Crash report generated at ${report}`))
     .catch((e) => console.error(`GURU ERROR: Failed to write crash report: ${e}`))
     .finally(() => {
@@ -974,6 +1074,7 @@ process.on('uncaughtException', (error) => {
       try { logManager.close(); } catch { /* ignore */ }
       try { app.exit(1); } catch { try { process.exit(1); } catch { /* ignore */ } }
     });
+  });
 });
 // Burst-tracked so a rejecting loop can't silently accumulate handles.
 // Rejections are counted per-minute-window; a sustained burst flushes a
