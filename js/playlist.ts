@@ -898,9 +898,6 @@ export function renderPlaylist(): void {
     if (vScroller) vScroller.refresh(true);
 }
 
-export function isPlaylistFocused(): boolean { return playlistFocused; }
-export function setPlaylistFocused(v: boolean): void { playlistFocused = v; }
-
 export function selectAllTracks(): void {
     // H26: select the visible view while filtered, full list otherwise.
     const n = (_isFiltering && _filteredView) ? _filteredView.length : state.playlist.length;

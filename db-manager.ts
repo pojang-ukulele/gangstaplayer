@@ -153,41 +153,6 @@ export class DatabaseManager {
         return stmt.all();
     }
 
-    // KIT OPERATIONS
-    public saveKit(id: string, name: string, path: string, data: any) {
-        if (typeof id !== 'string' || typeof name !== 'string' || typeof path !== 'string') {
-            throw new Error('saveKit: invalid args');
-        }
-        if (id.length > 256 || name.length > 512 || path.length > 32760) {
-            throw new Error('saveKit: field too long');
-        }
-        let dataJson = '{}';
-        try {
-            const s = JSON.stringify(data ?? {});
-            if (s.length > 1024 * 1024) throw new Error('saveKit: data too large');
-            dataJson = s;
-        } catch (e: any) {
-            if (String(e?.message ?? '').includes('too large')) throw e;
-            throw new Error('saveKit: data not serializable');
-        }
-        const stmt = this.db.prepare(`
-            INSERT INTO kits (id, name, path, data)
-            VALUES (@id, @name, @path, @data)
-            ON CONFLICT(path) DO UPDATE SET
-                name = excluded.name,
-                data = excluded.data,
-                last_saved = CURRENT_TIMESTAMP
-        `);
-        return stmt.run({ id, name, path, data: dataJson });
-    }
-
-    public loadKit(path: string) {
-        const stmt = this.db.prepare('SELECT * FROM kits WHERE path = ?');
-        const row: any = stmt.get(path);
-        if (row && row.data) row.data = safeParse(row.data, null);
-        return row;
-    }
-
     // SEARCH / FILTER
     public searchTracks(query: string) {
         // Escape LIKE wildcards so user input like "50%" doesn't match everything

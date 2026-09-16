@@ -10,7 +10,7 @@
 
 import './types';
 import { state, Track, LoopMode, PlaybackMode } from './state';
-import { settings, saveSettings, applySettingsToUI, updateAutoMix } from './settings';
+import { settings, applySettingsToUI, updateAutoMix } from './settings';
 import { NUM_PADS, VALID_AUDIO_EXTENSIONS } from './constants';
 import { toast } from './toast';
 import { logger } from './logger';

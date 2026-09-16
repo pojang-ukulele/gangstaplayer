@@ -36,7 +36,6 @@ let midiStatusEl: HTMLElement | null = null;
 let liveMidiAccess: WebMidi.MIDIAccess | null = null;
 let staleFallbackNotifiedFor = '';
 
-export function getSelectedMidiId(): string { return selectedMidiId; }
 export function setSelectedMidiDevice(id: string, name = ''): void {
     selectedMidiId = typeof id === 'string' && id ? id.slice(0, 256) : 'all';
     if (name) selectedMidiName = name.slice(0, 256);
@@ -331,27 +330,6 @@ function onMIDIFailure(): void {
     try { state.update({ isMidiActive: false }); } catch { /* ignore */ }
 }
 
-// H28: undo snapshot for stolen bindings — a learn that steals another
-// pad/control's note/CC can be reverted instead of autosaving silently.
-let _midiUndoBackup: { padMidiMap: Record<number, number>; controlMidiMap: Record<number, string> } | null = null;
-
-export function undoMidiLearn(): boolean {
-    if (!_midiUndoBackup) return false;
-    const backup = _midiUndoBackup;
-    _midiUndoBackup = null;
-    state.update({ padMidiMap: { ...backup.padMidiMap }, controlMidiMap: { ...backup.controlMidiMap } });
-    try { toast.info('MIDI BINDING RESTORED'); } catch { /* ignore */ }
-    logger.info('[MIDI Learn] Binding steal undone');
-    return true;
-}
-
-function stashMidiUndo(): void {
-    _midiUndoBackup = {
-        padMidiMap: { ...state.padMidiMap },
-        controlMidiMap: { ...state.controlMidiMap },
-    };
-}
-
 /**
  * Steal-confirm generation: showConfirm is queued/async, so a steal prompt
  * can outlive its learn session (Esc cancel, 10s timeout, newer learn). The
@@ -366,7 +344,6 @@ function cancelMidiLearn(): void {
 }
 
 function applyPadBind(data1: number, padId: number): void {
-    stashMidiUndo();
     const newMap = { ...state.padMidiMap };
     // 1. Remove ANY existing mapping for this specific note (stealing)
     for (const [note, padIdx] of Object.entries(newMap)) {
@@ -389,7 +366,6 @@ function applyControlBind(data1: number, ctrlId: string): void {
         cancelMidiLearn();
         return;
     }
-    stashMidiUndo();
     const newMap = { ...state.controlMidiMap };
     // 1. Unbind CC from others
     for (const [cc, ctrlId_] of Object.entries(newMap)) {
@@ -454,8 +430,7 @@ function handleMidiLearn(cmd: number, data1: number) {
     if (target.type === 'pad') {
         const padId = target.id as number;
         const victim = state.padMidiMap[data1];
-        // H28: stealing another pad's note must not autosave silently —
-        // require explicit confirm and keep an undo snapshot.
+        // H28: stealing another pad's note requires explicit confirm.
         if (Number.isInteger(victim) && victim !== padId) {
             const victimPad = victim as number;
             try {

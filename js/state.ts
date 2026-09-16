@@ -243,16 +243,6 @@ class ReactiveStore implements AppStateData {
             midiLearnTarget: this._data.midiLearnTarget ? { ...this._data.midiLearnTarget } : null,
         };
     }
-
-    /** Immutable element replace — in-place track.bpm mutation is invisible to update(). */
-    replaceTrack(id: string, patch: Partial<Track>): boolean {
-        const idx = this._data.playlist.findIndex(t => t.id === id);
-        if (idx < 0) return false;
-        const next = [...this._data.playlist];
-        next[idx] = { ...next[idx], ...patch };
-        this.update({ playlist: next } as Partial<AppStateData>);
-        return true;
-    }
 }
 
 export const state = new ReactiveStore();

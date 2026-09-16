@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased] — "Dead-code cleanup (2026-09-16)"
+
+### 🧹 2026-09-16 batch (verified: `tsc --noEmit` clean, Jest 142/142)
+
+- **Main (`db-manager.ts`, `sonetra-bridge.ts`)**: removed `DatabaseManager.saveKit/loadKit` (kits persist via dialog + fs) and `addAllowedAudioDir()` (0 refs); deleted orphan scripts `build-prod.js`, `check-versions.js` (no package.json/code refs, superseded by `scripts/build.js`).
+- **Renderer core (`js/state.ts`, `js/playlist.ts`, `js/types.ts`)**: removed `replaceTrack()`, `isPlaylistFocused()/setPlaylistFocused()` (internal var + window hooks kept), and `IpcChannels` type (0 imports).
+- **Renderer secondary (`js/midi.ts`, `js/crash-recovery.ts`, `js/logger.ts`, `js/session.ts`, `js/main.ts`)**: removed `getSelectedMidiId`, `undoMidiLearn` path, unused `openModal/closeModal` import, `setDebugDiskEnabled()/getSessionId()`, unused `saveSettings` / `createPadGrid` imports.
+- README needs no changes (no user-facing behavior changed).
+
 ## [Unreleased] — "Paranoid Audit Round 4 (2026-09-11)"
 
 ### 🛠️ 2026-09-11 batch (verified: `tsc --noEmit` clean, Jest 99/99)

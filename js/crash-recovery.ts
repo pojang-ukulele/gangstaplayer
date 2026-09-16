@@ -16,7 +16,7 @@ import {
     padLoopStart, padLoopEnd, padWaveforms,
     loadSampleFromPath
 } from './sampler';
-import { openModal, closeModal, showConfirm } from './modals';
+import { showConfirm } from './modals';
 import { AUTO_SAVE_INTERVAL_MS, MAX_SNAPSHOTS, MIN_SAVE_INTERVAL_MS, NUM_PADS } from './constants';
 
 // === Constants ===

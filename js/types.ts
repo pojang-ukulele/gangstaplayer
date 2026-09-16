@@ -65,33 +65,4 @@ declare global {
     }
 }
 
-// === IPC Channels ===
-// Must match main.ts registerIpcHandlers + preload.ts invokes.
-export type IpcChannels = 
-    | 'app:minimize'
-    | 'app:maximize'
-    | 'app:close'
-    | 'app:set-fullscreen'
-    | 'app:ready-to-show'
-    | 'app:open-external'
-    | 'app:generate-crash-report'
-    | 'dialog:save-kit'
-    | 'dialog:load-kit'
-    | 'dialog:save-audio'
-    | 'dialog:open-sample'
-    | 'dialog:save-session'
-    | 'fs:save-file'
-    | 'fs:read-file'
-    | 'fs:consent-file'
-    | 'fs:show-item-in-folder'
-    | 'fs:append-log'
-    | 'fs:get-log-path'
-    | 'sonetra:get-cached-transition'
-    | 'sonetra:precompute-transition'
-    | 'sonetra:restart-status'
-    | 'db:upsert-track'
-    | 'db:get-track'
-    | 'db:search-tracks'
-    | 'db:get-all-tracks';
-
 export {};

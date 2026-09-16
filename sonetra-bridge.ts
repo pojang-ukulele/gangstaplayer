@@ -230,26 +230,6 @@ function isSafeAudioPath(filePath: string): { safe: boolean; resolved?: string; 
     }
 }
 
-// Allow directory list to be extended at runtime (e.g., from config)
-export function addAllowedAudioDir(dir: string): void {
-    if (typeof dir !== 'string' || !dir || dir.length > 32760) return;
-    if (dir.includes('\0')) return;
-    let resolved: string;
-    try { resolved = path.resolve(path.normalize(dir)); } catch { return; }
-    try {
-        const st = fs.statSync(resolved);
-        if (!st.isDirectory()) return;
-    } catch { return; }
-    // Refuse system roots and cap list size — one dialog pick must not whitelist System32.
-    const lower = resolved.toLowerCase();
-    const blocked = ['c:\\windows', 'c:\\windows\\system32', 'c:\\program files', 'c:\\', 'c:/', '/', '/etc', '/sys', '/proc'];
-    if (blocked.some(b => lower === b || lower.startsWith(b + path.sep))) return;
-    if (lower.length <= 3 && /^[a-z]:[\\/]?$/.test(lower)) return;
-    if (ALLOWED_AUDIO_DIRS.length >= 64) return;
-    if (ALLOWED_AUDIO_DIRS.some(d => path.resolve(d).toLowerCase() === lower)) return;
-    ALLOWED_AUDIO_DIRS.push(resolved);
-}
-
 /** Callback signature for restart/status events */
 export type SonetraStatusCallback = (status: { 
     event: 'started' | 'stopped' | 'crashed' | 'restarting' | 'restarted' | 'failed';

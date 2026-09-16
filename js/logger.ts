@@ -67,16 +67,6 @@ class GangstaLogger {
 
     // ==================== PUBLIC API ====================
 
-    /** Enable/disable DEBUG persistence to disk (default off — flag-gated). */
-    setDebugDiskEnabled(on: boolean): void {
-        this.debugDiskEnabled = !!on;
-    }
-
-    /** Session id attached to every persisted line + ring entry. */
-    getSessionId(): string {
-        return this.sessionId;
-    }
-
     /** Returns a copy of the in-memory ring buffer */
     getLogs(): LogEntry[] {
         return [...this.ringBuffer];

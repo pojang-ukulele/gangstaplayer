@@ -3,7 +3,7 @@
 import { resumeAudioContext, masterGain, audioCtx, initWorklets, ensureAudio, onAudioRebuilt } from './audio';
 import { enableMIDI, initMIDI } from './midi';
 import {
-    initSampler, createPadGrid, setupPadKeyboardHandlers, getPadGrid,
+    initSampler, setupPadKeyboardHandlers, getPadGrid,
     startPad, stopPad, stopAllPads, loadSampleFromPath, toggleSync,
     padBuffers, activeVoices, padVolumes, padSyncState, padBPMs,
     padLoopStart, padLoopEnd,
