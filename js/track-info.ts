@@ -110,7 +110,14 @@ export async function openTrackInfo(track: Track): Promise<void> {
     // Lazy probe fills duration/sample-rate without blocking the modal.
     if (track.duration <= 0 || true) {
         void probeAudio(track).then((probe) => {
-            if (!probe || _currentTrackId !== track.id) return;
+            if (_currentTrackId !== track.id) return;
+            if (!probe) {
+                logger.debug(`[TrackInfo] Probe unavailable for ${track.name}`);
+                setText('infoSampleRate', 'UNAVAILABLE');
+                const liveDur = state.playlist.find((t) => t.id === track.id)?.duration ?? track.duration;
+                if (!(liveDur > 0)) setText('infoDuration', 'UNKNOWN');
+                return;
+            }
             // Track may have been re-analyzed while probing — prefer live state.
             const live = state.playlist.find((t) => t.id === track.id);
             const dur = live && live.duration > 0 ? live.duration : probe.duration;
@@ -145,7 +152,7 @@ async function saveTags(): Promise<void> {
     state.update({ playlist: next });
 
     try {
-        await window.database?.upsertTrack({
+        const saved = await window.database?.upsertTrack({
             id: next[idx].id,
             path: next[idx].path,
             name: next[idx].name,
@@ -153,6 +160,11 @@ async function saveTags(): Promise<void> {
             bpm: next[idx].bpm ?? 0,
             metadata,
         });
+        if (!saved) {
+            logger.warn(`[TrackInfo] Tag persist returned falsy for ${next[idx].name} — tags kept in memory only`);
+            toast.error('TAGS SAVE FAILED');
+            return;
+        }
         toast.success('TAGS SAVED');
         logger.info(`[TrackInfo] Tags saved for ${next[idx].name}`);
     } catch (e) {

@@ -132,12 +132,16 @@
 
 ### Using the Sampler Pads
 
-1. **Load a Sample:** Right-click any pad → "LOAD SAMPLE", drag & drop an audio file, or click an empty pad.
-2. **Play:** Hold the corresponding key (`1-4`, `Q-R`, `A-F`, `Z-V`) or hold the mouse on the pad. Release to stop.
-3. **Record:** Hold `CTRL` + pad key or click the [REC] button on a pad to record from your mic.
-4. **Sync:** Right-click a loaded pad → "SYNC" to match its tempo to the master track. The pad's BPM is auto-detected, and playback starts beat-aligned with the playlist. A checkmark (✓) indicates SYNC is active; click SYNC again to deactivate.
-5. **MIDI Learn:** Right-click a pad → "MIDI LEARN" (when MIDI is active), then press a note on your controller to bind it.
-6. **Key Bind:** Right-click a pad → "KEY BIND", then press any key to reassign the trigger key.
+1. **Load a Sample:** Right-click any pad → "LOAD SAMPLE", drag & drop an audio file, or click an empty pad. While decoding, the strip pulses `LOADING` in place.
+2. **Play:** Hold the corresponding key (`1-4`, `Q-R`, `A-F`, `Z-V`) or hold the mouse on the pad. Release to stop. Pressing an empty/unready pad flashes red instead of failing silently.
+3. **Select on the Waveform:** Drag across a pad's waveform strip to select a region — it becomes the pad's active loop area. Hold-press inside an existing selection to loop-audition it until release.
+4. **Zoom Loupe:** Hold `SHIFT` while pressing/dragging the strip to open a 3× zoom editor at your cursor. It stays open while `SHIFT` is held so you can reselect freely.
+5. **Beat Snap & Arm:** Hold `CTRL` (with `SHIFT`) to show beat markers and magnetically snap both edges to the BPM grid. `SHIFT`+`CTRL`-drag arms the span as the pad's persistent region (gold glow, lit ticks).
+6. **Record:** Hold `CTRL` + pad key or click the [REC] button on a pad to record from your mic.
+7. **Sync:** Right-click a loaded pad → "SYNC" to match its tempo to the master track. The pad's BPM is auto-detected, and playback starts beat-aligned with the playlist. A checkmark (✓) indicates SYNC is active; click SYNC again to deactivate.
+8. **MIDI Learn:** Right-click a pad → "MIDI LEARN" (when MIDI is active), then press a note on your controller to bind it.
+9. **Key Bind:** Right-click a pad → "KEY BIND", then press any key to reassign the trigger key.
+10. **Offline Fonts:** The pixel UI fonts (VT323, Press Start 2P) are bundled locally — no network needed, no install required.
 
 ### Auto-Mix Mode
 

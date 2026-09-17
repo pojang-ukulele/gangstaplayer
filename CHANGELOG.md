@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased] — "Waveform-first pads + error-signaling audit fixes (2026-09-17)"
+
+### 🎛️ Sampler pads go waveform-first (verified: `tsc --noEmit` clean)
+
+- **Offline pixel fonts**: VT323 + Press Start 2P bundled under `assets/fonts/` with `@font-face`; `scripts/build.js` now copies asset subdirectories. GUI no longer falls back to Courier/monospace (offline-first, CSP `font-src 'self'` kept).
+- **Stable pad grid**: `repeat(4, minmax(0, 1fr))` + `min-width: 0` containment chain — long filenames ellipsis-clip instead of stretching their column; squares stay uniform loaded or empty.
+- **Waveform selection + hold-to-loop**: drag on the strip selects the active region; press-hold inside it (220 ms, 5 px drag threshold) loop-auditions until release. Pads are momentary hold-to-play everywhere (mouse/keyboard/MIDI choke on release; window-mouseup fallback covers drag-off release).
+- **Zoom loupe**: `SHIFT`-hold opens a 3× waveform editor at the cursor; stays open while `SHIFT` is held for reselection. `CTRL` gates beat markers + magnetic snap (½-beat / 12 px radius); `SHIFT`+`CTRL`-drag arms the span as the persistent region (gold glow, lit ticks).
+- **Loading state**: strip shows pulsing `LOADING` (same typography/position as `EMPTY`, generation-guarded against rapid re-drops); dead presses flash red instead of failing silently; selection commits stay toast-quiet.
+- **Pad menu**: right-click menu removed then restored per feedback (load/sync/loop presets/snap toggle/MIDI/key/clear/unselect with per-state gating); stale `RIGHT-CLICK FOR OPTIONS` hover tooltip + help texts updated to waveform-first wording.
+
+### 🛡️ Error-signaling audit fixes (verified: `tsc --noEmit` clean)
+
+- **Kit/pads fail loud**: `saveKit` checks the write result (`KIT SAVE FAILED (WRITE REJECTED)`); `loadSampleFromPath` returns boolean with failure toasts mirroring `loadSampleFile`; pad-click/load-menu callers guarded; kit loop aggregates `KIT LOADED (n FAILED)`.
+- **Log storms keep evidence**: ERROR/WARN bypass the 50 ms `fs:append-log` gate; resolved `false` counts as disk failure with one bounded retry.
+- **DB null/empty checked**: `TAGS SAVE FAILED` on rejected persist, `UNAVAILABLE` probe fallback instead of stuck `PROBING...`, playlist keeps prior view + logs on DB failure.
+- **Dialog throttle distinct from cancel**: `'__THROTTLED__'` sentinel → `DIALOG BUSY — TRY AGAIN`; crash-report failures log + toast instead of vanishing.
+- **Gesture diagnostics**: arm-downgrade/menu-import/loupe/micro-drag reasons logged at debug; known limit — rate-limited DB `[]` still renders empty (full `{ok,rows}` disambiguation is future work).
+
 ## [Unreleased] — "Dead-code cleanup (2026-09-16)"
 
 ### 🧹 2026-09-16 batch (verified: `tsc --noEmit` clean, Jest 142/142)

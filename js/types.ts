@@ -3,8 +3,14 @@
  * Single source of truth for IPC contracts and global augmentations.
  */
 
+// Dialog throttle sentinel: main returns this string (NOT null) when a
+// dialog open is rate-limited. Real user-cancel / missing window stay null.
+// Callers must check `=== DIALOG_THROTTLED` before truthiness (it is truthy).
+export const DIALOG_THROTTLED = '__THROTTLED__';
+
 // === Electron IPC API ===
 // Mirrors preload.ts bridges exactly (see preload.ts for validation caps).
+// Dialog methods resolve DIALOG_THROTTLED on rate-limit, null on real cancel.
 export interface ElectronAPI {
     minimize(): void;
     maximize(): void;

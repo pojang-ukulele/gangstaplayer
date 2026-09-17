@@ -134,14 +134,14 @@
                 <div class="help-section">
                     <h3>FEATURES</h3>
                     <ul>
-                        <li><strong>LOAD SAMPLE:</strong> Right-click any pad and select "LOAD SAMPLE" to load audio.
+                        <li><strong>LOAD SAMPLE:</strong> Click an empty pad to load audio.
                             You can also drag & drop files onto pads.</li>
                         <li><strong>RECORD PAD:</strong> Click the small [REC] button on a pad or use CTRL+Key shortcut.
                             Records your mic/input to that pad.</li>
                         <li><strong>MASTER REC:</strong> The big [REC] button records the ENTIRE OUTPUT (mix) to a
                             high-quality WAV file.</li>
-                        <li><strong>SYNC:</strong> Right-click a loaded pad and select "SYNC" to match its tempo to the
-                            Main Deck. A ✓ checkmark shows when SYNC is active.</li>
+                        <li><strong>SYNC:</strong> Drag on a pad's waveform to select an area — it loops
+                            as the pad's active region. Hold SHIFT while dragging to snap to beats.</li>
                         <li><strong>CHOPPER & SCREWER:</strong> The slider controls global playback speed. Slow it down
                             for that screw effect. Magnetic snap at 100%.</li>
                         <li><strong>AI AUTO-MIX:</strong> Seamlessly mixes between tracks with pro DJ effects.
@@ -378,6 +378,7 @@
         <div class="context-item hidden" id="ctxSetLoopStart" role="menuitem" tabindex="-1">SET LOOP START (SHIFT+CLICK)</div>
         <div class="context-item hidden" id="ctxSetLoopEnd" role="menuitem" tabindex="-1">SET LOOP END (CTRL+CLICK)</div>
         <div class="context-item hidden" id="ctxClearLoop" role="menuitem" tabindex="-1">CLEAR LOOP</div>
+        <div class="context-item hidden" id="ctxSnapToBeat" role="menuitem" tabindex="-1">SNAP TO BEAT ✓</div>
         <div class="context-item hidden" id="ctxUnselectArea" role="menuitem" tabindex="-1">UNSELECT AREA</div>
         <div class="context-divider"></div>
         <div class="context-item" id="ctxPadMidiLearn" role="menuitem" tabindex="-1">MIDI LEARN (BIND CONTROLLER)</div>
@@ -415,6 +416,17 @@
             <div class="flex-row-gap justify-center">
                 <button id="confirmYes" class="btn btn-restore" aria-label="Confirm">YES</button>
                 <button id="confirmNo" class="btn automix-btn-full" aria-label="Cancel">NO</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- NEW: Waveform zoom loupe (Shift+hold/drag on a pad strip; managed by sampler.ts) -->
+    <div id="waveZoomPopup" class="modal wave-zoom-popup" role="dialog" aria-modal="false" aria-hidden="true" aria-label="Waveform zoom">
+        <div class="wave-zoom-box">
+            <div class="wave-zoom-title">PAD</div>
+            <div class="wave-zoom-body">
+                <canvas class="wave-zoom-canvas"></canvas>
+                <div class="wave-zoom-selection hidden"></div>
             </div>
         </div>
     </div>

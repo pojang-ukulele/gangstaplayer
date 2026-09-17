@@ -194,10 +194,29 @@ async function build() {
         try { refs += fs.readFileSync('index.html', 'utf8'); } catch { /* ignore */ }
         try { refs += fs.readFileSync('styles.css', 'utf8'); } catch { /* ignore */ }
         const assets = fs.readdirSync(assetsDir);
+        const copyAssetRecursive = (src, dest) => {
+            const st = fs.statSync(src);
+            if (st.isDirectory()) {
+                fs.mkdirSync(dest, { recursive: true });
+                for (const entry of fs.readdirSync(src)) {
+                    if (entry === '.DS_Store' || entry === 'Thumbs.db' || entry.startsWith('.')) continue;
+                    copyAssetRecursive(path.join(src, entry), path.join(dest, entry));
+                }
+                return;
+            }
+            if (!st.isFile()) return;
+            fs.copyFileSync(src, dest);
+        };
         for (const asset of assets) {
             if (asset === '.DS_Store' || asset === 'Thumbs.db' || asset.startsWith('.')) continue;
             const src = path.join(assetsDir, asset);
-            try { if (!fs.statSync(src).isFile()) continue; } catch { continue; }
+            let st;
+            try { st = fs.statSync(src); } catch { continue; }
+            if (st.isDirectory()) {
+                copyAssetRecursive(src, path.join(BUILD_DIR, 'assets', asset));
+                continue;
+            }
+            if (!st.isFile()) continue;
             if (asset === 'wallpaper.jpg' && !refs.includes('wallpaper.jpg')) {
                 console.log('Skipping unreferenced wallpaper.jpg (2MB).');
                 continue;

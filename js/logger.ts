@@ -36,13 +36,25 @@ class GangstaLogger {
     // console + a ring marker (memory copy is intact — only disk is blind).
     private _diskFailStreak = 0;
 
-    private _persist(level: string, message: string): void {
+    private _persist(level: string, message: string, isRetry = false): void {
         try {
             const fs = (window as unknown as { fileSystem?: { appendLog: (l: string, m: string) => Promise<unknown> } }).fileSystem;
             if (!fs?.appendLog) return;
             // Attach sessionId to every persisted line (never bare counts).
+            // A resolved `false` means main rate-limited the write: treat as
+            // disk failure (streak++, ring entry kept) and retry once. Only a
+            // truthy resolve resets the streak.
             fs.appendLog(level, `[${this.sessionId}] ${message}`).then(
-                () => { this._diskFailStreak = 0; },
+                (ok: unknown) => {
+                    if (ok === false) {
+                        this._noteDiskFailure();
+                        if (!isRetry) {
+                            try { setTimeout(() => this._persist(level, message, true), 250); } catch { /* ignore */ }
+                        }
+                    } else {
+                        this._diskFailStreak = 0;
+                    }
+                },
                 () => { this._noteDiskFailure(); }
             );
         } catch { this._noteDiskFailure(); }
@@ -125,6 +137,14 @@ class GangstaLogger {
                 return reportPath;
             } catch (e) {
                 console.error('[Logger] Failed to generate crash report', e);
+                try { this.error('CRASH REPORT FAILED — see log', e); } catch { /* ignore */ }
+                // Dynamic import: toast.ts imports logger, so a static import
+                // here would cycle. Failure toast is best-effort only.
+                try {
+                    void import('./toast').then((m) => {
+                        try { m.toast.error('CRASH REPORT FAILED — see log'); } catch { /* ignore */ }
+                    }).catch(() => undefined);
+                } catch { /* ignore */ }
             }
         }
         return undefined;

@@ -90,13 +90,17 @@ export function initPlaylist(deps: PlaylistDeps): void {
             if (_isFiltering) return; // a search view is active — never clobber it
             // Don't clobber tracks the user added while the DB read was in flight.
             if (state.playlist.length > 0) return;
-            if (tracks && tracks.length > 0) {
+            if (Array.isArray(tracks) && tracks.length > 0) {
                 // Selection indices were computed against the pre-load list
                 state.update({ playlist: tracks, selectedIndices: [] });
                 anchorIndex = -1;
                 pivotIndex = -1;
+            } else if (!Array.isArray(tracks)) {
+                logger.warn('[Playlist] DB getAllTracks returned non-array — kept prior view');
+            } else {
+                logger.debug('[Playlist] DB getAllTracks returned empty — kept prior view');
             }
-        }).catch(() => { /* DB failure must not break the playlist UI */ });
+        }).catch((e) => { logger.warn('[Playlist] DB initial load failed — kept prior view', e); });
     }
 
     const setFiltering = (v: boolean) => { _isFiltering = v; };
@@ -130,7 +134,11 @@ export function initPlaylist(deps: PlaylistDeps): void {
                         if (db) {
                             const results = await db.searchTracks(q);
                             if (myGen !== _searchGen) return; // stale keystroke, drop
-                            list = Array.isArray(results) ? [...results] : [];
+                            if (!Array.isArray(results)) {
+                                logger.warn('[Playlist] DB search returned non-array — kept prior view');
+                                return;
+                            }
+                            list = [...results];
                         } else {
                             // No-DB fallback must still filter — previously it
                             // showed the full unfiltered list, ignoring query.
@@ -142,9 +150,12 @@ export function initPlaylist(deps: PlaylistDeps): void {
                             }).map(t => ({ ...t })).slice(0, MAX_PLAYLIST_SEARCH_RESULTS);
                         }
                         if (myGen !== _searchGen) return;
-                    } catch {
+                    } catch (e) {
                         if (myGen !== _searchGen) return;
-                        list = [];
+                        // DB failure must not wipe the visible list to
+                        // "no matches" — keep the prior view instead.
+                        logger.warn(`[Playlist] DB search failed for "${q}" — kept prior view`, e);
+                        return;
                     }
                     if (myGen !== _searchGen) return;
                     // H27: merge in-memory tracks the DB missed (just added
@@ -177,7 +188,8 @@ export function initPlaylist(deps: PlaylistDeps): void {
                     state.update({ selectedIndices: [] });
                     if (vScroller) vScroller.updateItems(state.playlist);
                 }
-            } catch {
+            } catch (e) {
+                logger.warn('[Playlist] Search failed — kept prior view', e);
                 return; // DB error must not wipe the visible list
             }
             anchorIndex = -1;
@@ -324,7 +336,19 @@ async function analyzeTrackInBackground(track: Track): Promise<void> {
         
         // 1. Check DB Cache first
         if (db) {
-            const cached = await db.getTrack(track.path);
+            let cached: any = null;
+            try {
+                cached = await db.getTrack(track.path);
+            } catch (e) {
+                // IPC/DB failure (not a cache miss): a full decode here would
+                // burn a decode slot and risk overwriting known-good in-memory
+                // state, so keep the prior state and skip the redundant work.
+                logger.debug(`[Playlist] DB cache lookup failed for ${track.name} — kept prior state`, e);
+                return;
+            }
+            if (!cached) {
+                logger.debug(`[Playlist] No DB cache for ${track.name} — analyzing from disk`);
+            }
             if (cached && cached.bpm > 0) {
                 const idx = state.playlist.findIndex(t => t.id === track.id);
                 const next = [...state.playlist];
@@ -419,13 +443,20 @@ async function analyzeTrackInBackground(track: Track): Promise<void> {
 
         // 2. Persist to DB with fresh analysis values
         if (db) {
-            await db.upsertTrack({
-                id: track.id,
-                path: track.path,
-                name: track.name,
-                duration: audioBuffer.duration,
-                bpm
-            });
+            try {
+                const persisted = await db.upsertTrack({
+                    id: track.id,
+                    path: track.path,
+                    name: track.name,
+                    duration: audioBuffer.duration,
+                    bpm
+                });
+                if (!persisted) {
+                    logger.warn(`[Playlist] BPM persist returned falsy for ${track.name} — value kept in memory only, lost on restart`);
+                }
+            } catch (e) {
+                logger.warn(`[Playlist] BPM persist failed for ${track.name} — value kept in memory only, lost on restart`, e);
+            }
         }
 
         // Drop stale work: track cleared/deleted/replaced while DB persist

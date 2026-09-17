@@ -394,8 +394,11 @@ function registerIpcHandlers(): void {
     await shell.openPath(fullPath);
   });
 
+  // Dialog throttle sentinel: a rate-limited open returns '__THROTTLED__'
+  // (NOT null) so the renderer can tell "spam the button again" apart from
+  // a real user-cancel. Real cancel / missing window still return null.
   ipcMain.handle('dialog:save-kit', async () => {
-    if (rateLimited('dialog:save-kit', 500)) return null;
+    if (rateLimited('dialog:save-kit', 500)) return '__THROTTLED__';
     const win = getMainWindow();
     if (!win) return null;
     const { canceled, filePath } = await dialog.showSaveDialog(win, {
@@ -420,8 +423,9 @@ function registerIpcHandlers(): void {
   // Dedicated session dialog: default filename carries .session.json so the
   // renderer never has to mutate the dialog-returned path (which would
   // desync it from the write allowlist).
+  // Throttle sentinel '__THROTTLED__' (see dialog:save-kit) — real cancel stays null.
   ipcMain.handle('dialog:save-session', async () => {
-    if (rateLimited('dialog:save-session', 500)) return null;
+    if (rateLimited('dialog:save-session', 500)) return '__THROTTLED__';
     const win = getMainWindow();
     if (!win) return null;
     const { canceled, filePath } = await dialog.showSaveDialog(win, {
@@ -440,8 +444,9 @@ function registerIpcHandlers(): void {
     return filePath;
   });
 
+  // Throttle sentinel '__THROTTLED__' (see dialog:save-kit) — real cancel stays null.
   ipcMain.handle('dialog:load-kit', async () => {
-    if (rateLimited('dialog:load-kit', 500)) return null;
+    if (rateLimited('dialog:load-kit', 500)) return '__THROTTLED__';
     const win = getMainWindow();
     if (!win) return null;
     const { canceled, filePaths } = await dialog.showOpenDialog(win, {
@@ -456,8 +461,9 @@ function registerIpcHandlers(): void {
     return filePaths[0];
   });
 
+  // Throttle sentinel '__THROTTLED__' (see dialog:save-kit) — real cancel stays null.
   ipcMain.handle('dialog:save-audio', async () => {
-    if (rateLimited('dialog:save-audio', 500)) return null;
+    if (rateLimited('dialog:save-audio', 500)) return '__THROTTLED__';
     const win = getMainWindow();
     if (!win) return null;
     const { canceled, filePath } = await dialog.showSaveDialog(win, {
@@ -777,9 +783,12 @@ function registerIpcHandlers(): void {
 
   // Persistent Logging Handlers
   ipcMain.handle('fs:append-log', async (_event, level: string, message: string) => {
-    if (rateLimited('fs:append-log', 50)) return false;
     const allowed: ReadonlySet<string> = new Set(['INFO', 'WARN', 'ERROR', 'DEBUG']);
     const lvl = allowed.has(String(level)) ? (level as LogLevel) : 'INFO';
+    // ERROR/WARN bypass the IPC-flood gate: disk must hold high-severity
+    // lines even in storms (a rate-limited 'false' silently drops them).
+    // INFO/DEBUG stay gated.
+    if (lvl !== 'ERROR' && lvl !== 'WARN' && rateLimited('fs:append-log', 50)) return false;
     let msg = String(message ?? '');
     // Strip control chars/newlines to block log forgery + ANSI injection; cap length.
     // Covers SGR, cursor/charset, and OSC hyperlink sequences (not just colors).
@@ -811,8 +820,9 @@ function registerIpcHandlers(): void {
     return await logManager.generatePostMortem(stateSnapshot);
   });
 
+  // Throttle sentinel '__THROTTLED__' (see dialog:save-kit) — real cancel stays null.
   ipcMain.handle('dialog:open-sample', async () => {
-    if (rateLimited('dialog:open-sample', 500)) return null;
+    if (rateLimited('dialog:open-sample', 500)) return '__THROTTLED__';
     const win = getMainWindow();
     if (!win) return null;
     const { canceled, filePaths } = await dialog.showOpenDialog(win, {
@@ -1161,6 +1171,6 @@ process.on('unhandledRejection', (reason) => {
     logToDisk('ERROR', 'Rejection burst limit hit — flushing diagnostics');
     logManager.generatePostMortem({ type: 'REJECTION_BURST' })
       .then((report) => logToDisk('ERROR', `Rejection-burst report: ${report}`))
-      .catch(() => undefined);
+      .catch((e) => { try { logToDisk('ERROR', `Rejection-burst report FAILED: ${(e as Error)?.stack || e}`); } catch { /* ignore */ } });
   }
 });

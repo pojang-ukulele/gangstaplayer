@@ -6,7 +6,7 @@ import {
     initSampler, setupPadKeyboardHandlers, getPadGrid,
     startPad, stopPad, stopAllPads, loadSampleFromPath, toggleSync,
     padBuffers, activeVoices, padVolumes, padSyncState, padBPMs,
-    padLoopStart, padLoopEnd,
+    padLoopStart, padLoopEnd, padSnapToBeat, toggleSnapToBeat,
     renderWaveform
 } from './sampler';
 import {
@@ -31,7 +31,7 @@ import { initCrashRecovery, checkAndRestore } from './crash-recovery';
 import { initTrackInfo } from './track-info';
 import { NUM_PADS } from './constants';
 
-import './types';
+import { DIALOG_THROTTLED } from './types';
 
 // State for master recording (moved to module scope for setupMasterRecording closure)
 let hiFiRecorder: HighFidelityRecorder | null = null;
@@ -121,7 +121,10 @@ function setupContextMenus() {
     // stacked duplicate contextmenu/mousedown listeners per pad.
     if (_contextMenusWired) return;
     _contextMenusWired = true;
-    // Context Menu for Pads
+    // Context Menu for Pads (restored): right-click opens #padContextMenu.
+    // Coexists with waveform-first strip gestures (drag/loupe/hold-to-loop
+    // live on .pad-wave mousedown; the menu is a right-click affordance only).
+    // Playlist/play/loop/control menus below are untouched.
     const padGrid = getPadGrid();
     const padContextMenu = document.getElementById('padContextMenu');
     padContextMenuEl = padContextMenu;
@@ -165,6 +168,15 @@ function setupContextMenus() {
                     if (document.getElementById('ctxSetLoopStart')) document.getElementById('ctxSetLoopStart')!.classList.toggle('hidden', !hasBuffer);
                     if (document.getElementById('ctxSetLoopEnd')) document.getElementById('ctxSetLoopEnd')!.classList.toggle('hidden', !hasBuffer);
                     if (document.getElementById('ctxClearLoop')) document.getElementById('ctxClearLoop')!.classList.toggle('hidden', !hasBuffer);
+                    // Snap toggle: visible with a sample, greyed/disabled without BPM (free drag).
+                    const snapItem = document.getElementById('ctxSnapToBeat');
+                    if (snapItem) {
+                        snapItem.classList.toggle('hidden', !hasBuffer);
+                        const snapOn = padSnapToBeat[i] !== false;
+                        snapItem.textContent = snapOn ? 'SNAP TO BEAT ✓' : 'SNAP TO BEAT';
+                        snapItem.classList.toggle('menu-disabled', !hasBpm);
+                        snapItem.setAttribute('aria-disabled', (!hasBpm).toString());
+                    }
 
                     const ctxPadMidiLearn = document.getElementById('ctxPadMidiLearn');
                     if (ctxPadMidiLearn) ctxPadMidiLearn.classList.toggle('hidden', !state.isMidiActive);
@@ -185,21 +197,42 @@ function setupContextMenus() {
                     logger.info(`[Main] Pad ${i} mousedown. button=${e.button}, bufferExists=${!!padBuffers[i]}`);
                     if (e.button === 0 && padBuffers[i]) startPad(i);
                 });
-                // Mouse parity: a click auditions the full sample like a
-                // keyboard/MIDI one-shot. Only a held (loop-upgraded) voice
-                // is choked on release; one-shots ring out naturally.
+                // Mouse hold-to-play (momentary): mousedown starts the voice,
+                // mouseup/mouseleave always choke it while active — same as
+                // keyboard keyup and MIDI note-off. stopPad is a safe no-op
+                // when no voice exists, so no .loop guard (the old guard let
+                // one-shot clicks latch and ring out).
                 pad.addEventListener('mouseup', () => {
-                    try { if (activeVoices[i]?.source?.loop) stopPad(i); } catch { /* ignore */ }
+                    try { if (activeVoices[i]) stopPad(i); } catch { /* ignore */ }
                 });
                 pad.addEventListener('mouseleave', () => {
-                    try { if (activeVoices[i]?.source?.loop) stopPad(i); } catch { /* ignore */ }
+                    try { if (activeVoices[i]) stopPad(i); } catch { /* ignore */ }
+                });
+                // Safety: releasing outside the pad after drag-off never fires
+                // pad mouseup — choke the voice anyway (mirrors the rec-btn
+                // window mouseup fallback in sampler.ts).
+                window.addEventListener('mouseup', () => {
+                    try { if (activeVoices[i]) stopPad(i); } catch { /* ignore */ }
                 });
                 pad.addEventListener('click', async () => {
                     logger.info(`[Main] Pad ${i} click. bufferExists=${!!padBuffers[i]}`);
                     if (!padBuffers[i]) {
                         const filePath = await bridge?.openSampleDialog();
                         logger.info(`[Main] Pad ${i} dialog result: ${filePath}`);
-                        if (filePath) await loadSampleFromPath(filePath, i);
+                        // Throttle sentinel is truthy — trap it before the
+                        // path guard or it would load as a sample path.
+                        if (filePath === DIALOG_THROTTLED) {
+                            logger.debug(`[Main] Pad ${i} sample dialog throttled — TRY AGAIN`);
+                            toast.info('DIALOG BUSY — TRY AGAIN');
+                        } else if (filePath) {
+                            try {
+                                const ok = await loadSampleFromPath(filePath, i);
+                                if (!ok) toast.error("SAMPLE LOAD FAILED");
+                            } catch (e) {
+                                logger.error(`[Main] Pad ${i} load failed`, e);
+                                toast.error("SAMPLE LOAD FAILED");
+                            }
+                        }
                         logger.info(`[Main] Pad ${i} after load. bufferExists=${!!padBuffers[i]}`);
                     }
                 });
@@ -207,11 +240,24 @@ function setupContextMenus() {
         }
     }
 
+    // === PAD MENU ITEMS (restored prior behavior) ===
     if (ctxLoadSample && padContextMenu) {
         ctxLoadSample.addEventListener('click', async () => {
             const index = parseInt(padContextMenu.dataset.padIndex || "0");
             const filePath = await bridge?.openSampleDialog();
-            if (filePath) await loadSampleFromPath(filePath, index);
+            // Throttle sentinel is truthy — trap it before the path guard.
+            if (filePath === DIALOG_THROTTLED) {
+                logger.debug(`[Main] Pad ${index} sample dialog throttled — TRY AGAIN`);
+                toast.info('DIALOG BUSY — TRY AGAIN');
+            } else if (filePath) {
+                try {
+                    const ok = await loadSampleFromPath(filePath, index);
+                    if (!ok) toast.error("SAMPLE LOAD FAILED");
+                } catch (e) {
+                    logger.error(`[Main] Pad ${index} load failed`, e);
+                    toast.error("SAMPLE LOAD FAILED");
+                }
+            }
         });
     }
     if (ctxSync && padContextMenu) {
@@ -232,7 +278,10 @@ function setupContextMenus() {
             const index = parseInt(padContextMenu.dataset.padIndex || "0");
             const buf = padBuffers[index];
             const bpm = padBPMs[index];
-            if (!buf || !bpm) return;
+            if (!buf || !bpm) {
+                logger.debug(`[Main] 1-bar loop skipped (stale pad ${index}: buffer=${!!buf}, bpm=${!!bpm})`);
+                return;
+            }
             const beatSec = 60 / bpm;
             const barSec = beatSec * 4;
             const currentPos = (buf.duration / 4); // roughly 1/4 into sample
@@ -248,7 +297,10 @@ function setupContextMenus() {
             const index = parseInt(padContextMenu.dataset.padIndex || "0");
             import('./sampler').then(({ padBuffers, padLoopStart, padLoopEnd, padBeatPositions, renderWaveform }) => {
                 const buf = padBuffers[index];
-                if (!buf) return;
+                if (!buf) {
+                    logger.debug(`[Main] Loop-start preset skipped (stale pad ${index}: sample gone)`);
+                    return;
+                }
                 // Use 25% of duration as the default loop start position
                 const pos = buf.duration * 0.25;
                 padLoopStart[index] = pos;
@@ -257,6 +309,8 @@ function setupContextMenus() {
                 }
                 toast.success(`LOOP START AT ${pos.toFixed(2)}s`);
                 if (renderWaveform) renderWaveform(index);
+            }).catch((err) => {
+                logger.warn(`[Main] Loop-start preset failed (sampler import)`, err);
             });
         });
     }
@@ -265,7 +319,10 @@ function setupContextMenus() {
             const index = parseInt(padContextMenu.dataset.padIndex || "0");
             import('./sampler').then(({ padBuffers, padLoopStart, padLoopEnd, padBeatPositions, renderWaveform }) => {
                 const buf = padBuffers[index];
-                if (!buf) return;
+                if (!buf) {
+                    logger.debug(`[Main] Loop-end preset skipped (stale pad ${index}: sample gone)`);
+                    return;
+                }
                 // Use 75% of duration as the default loop end position
                 const pos = buf.duration * 0.75;
                 padLoopEnd[index] = pos;
@@ -274,6 +331,8 @@ function setupContextMenus() {
                 }
                 toast.success(`LOOP END AT ${pos.toFixed(2)}s`);
                 if (renderWaveform) renderWaveform(index);
+            }).catch((err) => {
+                logger.warn(`[Main] Loop-end preset failed (sampler import)`, err);
             });
         });
     }
@@ -285,7 +344,22 @@ function setupContextMenus() {
                 padLoopEnd[index] = -1;
                 toast.info("LOOP CLEARED");
                 if (renderWaveform) renderWaveform(index);
+            }).catch((err) => {
+                logger.warn(`[Main] Loop-clear failed (sampler import)`, err);
             });
+        });
+    }
+    const ctxSnapToBeat = document.getElementById('ctxSnapToBeat');
+    if (ctxSnapToBeat && padContextMenu) {
+        ctxSnapToBeat.addEventListener('click', () => {
+            const index = parseInt(padContextMenu.dataset.padIndex || "0");
+            if (!padBuffers[index] || !padBPMs[index]) {
+                toast.info("SNAP NEEDS BPM");
+                return;
+            }
+            const next = toggleSnapToBeat(index);
+            ctxSnapToBeat.textContent = next ? 'SNAP TO BEAT ✓' : 'SNAP TO BEAT';
+            toast.info(next ? `PAD ${index + 1} SNAP ON` : `PAD ${index + 1} SNAP OFF`);
         });
     }
 
@@ -509,7 +583,12 @@ function setupMasterRecording() {
                         }
 
                         const path = await bridge?.saveAudioDialog();
-                        if (path) {
+                        // Throttle sentinel is truthy — trap it before the
+                        // path guard or it would be written as a file path.
+                        if (path === DIALOG_THROTTLED) {
+                            logger.debug('[MasterRec] Save-audio dialog throttled — TRY AGAIN');
+                            toast.info('DIALOG BUSY — TRY AGAIN (RECORDING DISCARDED)');
+                        } else if (path) {
                              const uint8 = new Uint8Array(wavBuffer);
                              // IPC Buffer Alignment Fix
                              const safeBuffer = uint8.buffer.slice(uint8.byteOffset, uint8.byteOffset + uint8.byteLength);
@@ -852,7 +931,7 @@ async function initApp() {
                 colno,
                 stack: (error as Error | undefined)?.stack,
                 appState
-            })).catch(() => undefined).finally(() => { errorReporting = false; });
+            })).catch((e) => { try { logger.error('[Renderer Crash] Crash report write failed — ring copy is the only evidence', e); } catch { /* ignore */ } }).finally(() => { errorReporting = false; });
         } catch { errorReporting = false; /* report must never throw back into the handler */ }
     });
 
@@ -873,7 +952,7 @@ async function initApp() {
                 type: 'RENDERER_REJECTION',
                 reason: String(event.reason)?.slice(0, 2000),
                 appState
-            })).catch(() => undefined).finally(() => { rejectionReporting = false; });
+            })).catch((e) => { try { logger.error('[Renderer Rejection] Crash report write failed — ring copy is the only evidence', e); } catch { /* ignore */ } }).finally(() => { rejectionReporting = false; });
         } catch { rejectionReporting = false; }
     });
 }

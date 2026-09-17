@@ -9,6 +9,7 @@
  */
 
 import './types';
+import { DIALOG_THROTTLED } from './types';
 import { state, Track, LoopMode, PlaybackMode } from './state';
 import { settings, applySettingsToUI, updateAutoMix } from './settings';
 import { NUM_PADS, VALID_AUDIO_EXTENSIONS } from './constants';
@@ -164,9 +165,21 @@ export async function saveSession(): Promise<void> {
         let filePath: string | null | undefined;
         if (window.electronAPI?.saveSessionDialog) {
             filePath = await window.electronAPI.saveSessionDialog();
+            // Throttled dialog open returns the sentinel (truthy) — check
+            // before the cancel guard or it would be treated as a real path.
+            if (filePath === DIALOG_THROTTLED) {
+                logger.debug('[Session] Save dialog throttled — TRY AGAIN');
+                toast.info('DIALOG BUSY — TRY AGAIN');
+                return;
+            }
             if (!filePath) return;
         } else if (window.electronAPI?.saveKit) {
             filePath = await window.electronAPI.saveKit();
+            if (filePath === DIALOG_THROTTLED) {
+                logger.debug('[Session] Save dialog throttled — TRY AGAIN');
+                toast.info('DIALOG BUSY — TRY AGAIN');
+                return;
+            }
             if (!filePath) return;
         } else {
             toast.error("SESSION SAVE NOT AVAILABLE");
@@ -355,6 +368,12 @@ export async function loadSession(): Promise<void> {
 
         if (window.electronAPI?.loadKit) {
             filePath = await window.electronAPI.loadKit();
+            // Throttle sentinel (truthy) — must precede the cancel guard.
+            if (filePath === DIALOG_THROTTLED) {
+                logger.debug('[Session] Load dialog throttled — TRY AGAIN');
+                toast.info('DIALOG BUSY — TRY AGAIN');
+                return;
+            }
             if (!filePath) return;
         } else {
             toast.error("SESSION LOAD NOT AVAILABLE");

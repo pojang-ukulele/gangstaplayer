@@ -1,7 +1,22 @@
 /* Fonts: offline-first system stack (no render-blocking @import).
  * The Google Fonts @import previously blocked first render on slow networks
  * and left pixel-font fallbacks undefined offline. Pixel faces degrade to
- * monospace system fonts until the user installs them locally. */
+ * monospace system fonts until the user installs them locally.
+ * Self-hosted OFL faces live under assets/fonts/ (copied to app-build). */
+@font-face {
+    font-family: 'VT323';
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url('assets/fonts/VT323-Regular.woff2') format('woff2');
+}
+@font-face {
+    font-family: 'Press Start 2P';
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url('assets/fonts/PressStart2P-Regular.woff2') format('woff2');
+}
 
 :root {
     --bg-color: #111;
@@ -380,10 +395,13 @@ h1 {
 
 .pad-grid {
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(4, minmax(0, 1fr));
     grid-auto-rows: 1fr;
+    align-items: stretch;
     gap: 12px;
     width: 100%;
+    max-width: 100%;
+    min-width: 0;
     flex: 1;
     min-height: 200px;
     background: #0a0a0a;
@@ -398,10 +416,17 @@ h1 {
     flex-direction: column;
     gap: 10px;
     align-items: center;
+    min-width: 0;
+    min-height: 0;
+    width: 100%;
+    max-width: 100%;
 }
 
 .pad {
     width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    min-height: 0;
     aspect-ratio: 1;
     border-radius: 4px;
     cursor: pointer;
@@ -483,6 +508,19 @@ h1 {
     border-color: #fff;
 }
 
+/* Dead-press flash: brief red edge blink when a pad trigger fails shut
+   (empty pad, dead audio, no gain node). Outline-only — never touches
+   layout, transform, or the layered box-shadows. Auto-clears when sampler
+   removes .denied after DENIED_FLASH_MS (~220ms). */
+.pad.denied {
+    animation: padDeniedFlash 0.22s ease-out;
+}
+
+@keyframes padDeniedFlash {
+    0%, 100% { outline: 2px solid transparent; outline-offset: -2px; }
+    50% { outline: 2px solid rgba(255, 60, 60, 0.95); outline-offset: -2px; }
+}
+
 /* Waveform preview canvas inside each pad */
 .pad-canvas {
     position: absolute;
@@ -531,6 +569,9 @@ input[type=range]:focus {
 
 input[type=range].pad-slider {
     width: 90%;
+    max-width: 100%;
+    min-width: 0;
+    flex-shrink: 0;
     height: 4px;
     background: #050505;
     border: 1px solid #333;
@@ -1014,33 +1055,19 @@ input[type=range].progress-slider:hover::-webkit-slider-thumb {
     user-select: none;
 }
 
-/* Loading Pad State */
+/* Loading Pad State: interaction locked, but the only visual cue is the
+   LOADING strip text pulsing below — no overlay, no resize, no new colors. */
 .pad.loading {
     pointer-events: none;
-    opacity: 0.7;
 }
 
-.pad.loading::after {
-    content: '';
-    position: absolute;
-    top: 50%;
-    left: 50%;
-    width: 20px;
-    height: 20px;
-    margin: -10px 0 0 -10px;
-    border: 3px solid rgba(57, 255, 20, 0.2);
-    border-top-color: var(--neon-green);
-    border-radius: 50%;
-    animation: padSpin 0.6s linear infinite;
-    pointer-events: none;
+.pad.loading .pad-empty {
+    animation: padLoadingPulse 1.1s ease-in-out infinite;
 }
 
-.pad.loading > span {
-    visibility: hidden;
-}
-
-@keyframes padSpin {
-    to { transform: rotate(360deg); }
+@keyframes padLoadingPulse {
+    0%, 100% { opacity: 0.45; }
+    50% { opacity: 1; }
 }
 
 /* Track Loading Spinner (visible during BPM detection) */
@@ -1065,20 +1092,6 @@ input[type=range].progress-slider:hover::-webkit-slider-thumb {
 
 @keyframes trackSpin {
     to { transform: rotate(360deg); }
-}
-
-/* Loaded Pad Hover Tooltip */
-.pad.loaded:hover::after {
-    content: 'RIGHT-CLICK FOR OPTIONS';
-    position: absolute;
-    bottom: 5px;
-    left: 50%;
-    transform: translateX(-50%);
-    width: 100%;
-    font-size: 0.6rem;
-    color: rgba(255,255,255,0.7);
-    text-shadow: 1px 1px 2px black;
-    pointer-events: none;
 }
 
 
@@ -2412,13 +2425,21 @@ input[type=range]:focus-visible {
     --pad-wave-playhead: #ffcc00;
 }
 
-/* Stack number row / waveform strip / sample name inside the pad */
+/* Stack number row / waveform strip / sample name inside the pad.
+   Containment: the pad is a fixed square (aspect-ratio:1) — inner content
+   must clip, never grow the grid cell. Every flex child gets min-width:0
+   so long filenames can't force the column wider. */
 .pad {
     flex-direction: column;
     justify-content: flex-start;
     align-items: stretch;
     padding: 6px 6px 5px 6px;
     gap: 4px;
+    min-width: 0;
+    min-height: 0;
+    max-width: 100%;
+    overflow: hidden;
+    flex-shrink: 1;
 }
 
 /* Top row: pad number (always visible) + key/sync/midi badges */
@@ -2428,6 +2449,11 @@ input[type=range]:focus-visible {
     justify-content: space-between;
     padding-left: 20px; /* clear the record LED */
     min-height: 16px;
+    min-width: 0;
+    max-width: 100%;
+    width: 100%;
+    overflow: hidden;
+    flex-shrink: 0;
     position: relative;
     z-index: 3;
 }
@@ -2439,6 +2465,11 @@ input[type=range]:focus-visible {
     line-height: 1;
     color: rgba(0, 0, 0, 0.75);
     text-shadow: 0 1px 0 rgba(255, 255, 255, 0.15);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex-shrink: 1;
 }
 
 .pad:not(.loaded) .pad-num {
@@ -2454,6 +2485,8 @@ input[type=range]:focus-visible {
     display: flex;
     align-items: center;
     gap: 4px;
+    flex-shrink: 0;
+    min-width: 0;
 }
 
 .pad-key {
@@ -2484,11 +2517,18 @@ input[type=range]:focus-visible {
     text-shadow: 0 0 6px var(--neon-cyan);
 }
 
-/* Compact waveform strip: own green background, ember-red filled wave ink */
+/* Compact waveform strip: own green background, ember-red filled wave ink.
+   Fixed 34px height — never grows the pad; clips internally. */
 .pad-wave {
     position: relative;
     height: 34px;
+    min-height: 34px;
+    max-height: 34px;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
     flex-shrink: 0;
+    flex-grow: 0;
     background: var(--pad-wave-bg);
     border: 1px solid #000;
     border-radius: 3px;
@@ -2508,6 +2548,96 @@ input[type=range]:focus-visible {
 
 .pad.active .pad-wave {
     box-shadow: inset 0 0 10px rgba(0, 0, 0, 0.85), 0 0 8px rgba(57, 255, 20, 0.6);
+}
+
+/* Beat mode (Shift+Ctrl): gold edge cue that beat markers are revealed
+   (canvas redraws them brighter) and edges will snap. Glow only — no resize. */
+.pad-wave.show-beats {
+    box-shadow: inset 0 0 10px rgba(0, 0, 0, 0.85), 0 0 6px rgba(255, 204, 0, 0.45);
+}
+
+/* Waveform zoom loupe: transparent modal layer (never intercepts input —
+   all gestures stay on the window handlers), fixed cursor-anchored box.
+   Same green/orange/neon theme as the strip; position:fixed keeps it out
+   of the pad grid flow entirely. */
+.modal.wave-zoom-popup {
+    background: transparent;
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+    pointer-events: none;
+}
+
+.modal.wave-zoom-popup.active {
+    display: block;
+}
+
+.wave-zoom-box {
+    position: fixed;
+    background: var(--pad-wave-bg);
+    border: 1px solid #000;
+    border-radius: 3px;
+    box-shadow: inset 0 0 10px rgba(0, 0, 0, 0.85), 0 0 12px rgba(255, 204, 0, 0.5);
+    overflow: hidden;
+    pointer-events: auto;
+    user-select: none;
+    z-index: 3001;
+}
+
+.wave-zoom-title {
+    height: 22px;
+    line-height: 22px;
+    padding: 0 8px;
+    font-size: 0.68rem;
+    letter-spacing: 2px;
+    color: rgba(255, 255, 255, 0.55);
+    white-space: nowrap;
+    overflow: hidden;
+}
+
+.wave-zoom-body {
+    position: relative;
+    width: 100%;
+    box-sizing: border-box;
+    /* Green breathing room: the inset canvas never touches the box edges.
+       Theme green matches the strip bg; box size/border/shadow unchanged. */
+    padding: 0 14px;
+    background: var(--pad-wave-bg);
+    overflow: hidden;
+    cursor: crosshair;
+    touch-action: none;
+}
+
+.wave-zoom-canvas {
+    position: absolute;
+    top: 0;
+    left: 14px;
+    width: calc(100% - 28px);
+    height: 100%;
+    pointer-events: none;
+}
+
+.wave-zoom-selection {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    background: var(--pad-wave-sel);
+    border-left: 1px solid var(--neon-purple);
+    border-right: 1px solid var(--neon-purple);
+    pointer-events: none;
+}
+
+.wave-zoom-selection.snapped {
+    border-left-color: #ffd24d;
+    border-right-color: #ffd24d;
+    box-shadow: 0 0 8px rgba(255, 210, 77, 0.8), inset 0 0 8px rgba(255, 210, 77, 0.35);
+}
+
+/* Armed beat-span: persistent gold glow that survives release (Ctrl-armed
+   region). Stronger than the transient snapped glow — same gold family. */
+.wave-zoom-selection.armed {
+    border-left-color: #ffe08a;
+    border-right-color: #ffe08a;
+    box-shadow: 0 0 12px rgba(255, 210, 77, 0.9), inset 0 0 12px rgba(255, 210, 77, 0.45);
 }
 
 .pad-wave .pad-canvas {
@@ -2543,6 +2673,29 @@ input[type=range]:focus-visible {
     pointer-events: none;
 }
 
+/* Snap-to-beat state: gold edge glow on magnetized selections.
+   Keeps the purple fill — only the snapped edges pop. */
+.pad-selection.snapped {
+    border-left-color: #ffd24d;
+    border-right-color: #ffd24d;
+    box-shadow: 0 0 8px rgba(255, 210, 77, 0.8), inset 0 0 8px rgba(255, 210, 77, 0.35);
+}
+
+/* Armed beat-span: persistent gold glow that survives release (Ctrl-armed
+   region). Stronger than the transient snapped glow — same gold family. */
+.pad-selection.armed {
+    border-left-color: #ffe08a;
+    border-right-color: #ffe08a;
+    box-shadow: 0 0 12px rgba(255, 210, 77, 0.9), inset 0 0 12px rgba(255, 210, 77, 0.45);
+}
+
+/* Disabled context-menu item (snap with no BPM): greyed, non-interactive. */
+.context-item.menu-disabled {
+    opacity: 0.35;
+    pointer-events: none;
+    cursor: not-allowed;
+}
+
 .pad-playhead {
     position: absolute;
     top: 0;
@@ -2554,9 +2707,14 @@ input[type=range]:focus-visible {
     pointer-events: none;
 }
 
-/* Sample name below the strip, truncated with ellipsis */
+/* Sample name below the strip, truncated with ellipsis.
+   Locked to the pad width — a long filename clips instead of sizing the grid column. */
 .pad-name {
     display: block;
+    width: 100%;
+    max-width: 100%;
+    min-width: 0;
+    flex-shrink: 0;
     text-align: center;
     font-size: 0.72rem;
     line-height: 1.1;
@@ -2598,9 +2756,15 @@ input[type=range]:focus-visible {
     align-self: center;
     width: auto;
     min-width: 30px;
+    max-width: 100%;
     height: 20px;
+    min-height: 20px;
+    max-height: 20px;
     padding: 0 9px;
     flex-shrink: 0;
+    flex-grow: 0;
+    overflow: hidden;
+    white-space: nowrap;
     display: inline-flex;
     align-items: center;
     justify-content: center;
