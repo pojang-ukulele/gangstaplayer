@@ -27,7 +27,8 @@
 ### 📼 TAPE DECK PLAYER
 
 - **Drag & Drop:** Drag audio files directly into the playlist to add them.
-- **Playlist System:** Load up your MP3s/WAVs and keep the vibe going.
+- **Playlist System:** Load up your MP3s/WAVs and keep the vibe going. Dropped tracks decode + analyze immediately (BPM/duration); replay is instant via memory + on-disk PCM cache.
+- **BPM Review State:** Uncertain detections show `[?bpm]` instead of hanging on analyzing — right-click → Analyze retries with a second detection pass.
 - **Multi-Select:** Hold `SHIFT` and press `↑/↓` (or Click) to select multiple tracks. Use `CTRL`+Click to toggle.
 - **Master Chopper & Screwer:** Use the global tempo slider to slow that track down. **Real-time screw.**
 - **Magnetic Snap:** Slider snaps to 100% speed so you don't mess up the flow.
@@ -162,9 +163,9 @@
 
 - **Sandboxed File I/O**: The renderer process can only write files to paths returned by native OS save dialogs or to the app's `userData` directory. All file paths are validated for traversal attacks, null-byte injection, size limits, and media file types.
 - **Audio Validation**: Incoming audio files are checked for valid magic-number signatures (WAV, MP3, OGG, FLAC, M4A, WebM) before decoding, preventing non-audio files from crashing the pipeline.
-- **AutoMix Crash Recovery**: The AI mixer server auto-restarts on failure with backoff (max 3 attempts). Python dependencies are auto-installed via pip when the server starts (non-blocking).
+- **AutoMix Crash Recovery**: The AI mixer server auto-restarts on failure with backoff (max 3 attempts). Python dependencies are installed manually (`npm run setup:sonetra` / `setup:sonetra:win`) — the app never auto-runs pip.
 - **Memory Safety**: Blob URLs are revoked with a delayed "graveyard" mechanism to prevent race conditions during rapid track skipping, and reclaimed on app exit.
-- **Test Coverage**: 77 automated tests covering audio engine, player logic, settings persistence, state management, and utility functions, plus a Playwright smoke test. Run `npm run typecheck` before committing.
+- **Test Coverage**: 150 automated tests across 20 suites covering audio engine, player logic, settings persistence, state management, and utility functions, plus a Playwright smoke test. Run `npm run typecheck` before committing.
 
 ---
 
@@ -172,8 +173,8 @@
 
 ### Prerequisites
 
-- **Node.js**: v18+ Recommended
-- **Python**: v3.10+ (Required for Sonetra AI bridge functionality)
+- **Node.js**: v22.12+ Recommended
+- **Python**: v3.12+ (Required for Sonetra AI bridge functionality)
 
 > **Note**: Sonetra AI mixing requires a running/local Python FastAPI server (setup in `sonetra-bridge.js`). If not using AI features, you can skip the Python dependency.
 
@@ -211,7 +212,7 @@ npm run dist
 ### Testing & Typecheck
 
 ```bash
-npm test        # Jest suite (77 tests across 6 files, incl. Playwright smoke)
+npm test        # Jest suite (150 tests across 20 suites, incl. Playwright smoke)
 npm run typecheck  # tsc --noEmit — esbuild does NOT typecheck; run this before committing
 ```
 

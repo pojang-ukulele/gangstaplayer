@@ -2749,9 +2749,10 @@ input[type=range]:focus-visible {
     text-align: left;
 }
 
-/* Slim key chip, centered under the waveform strip.
-   The outer .pad div keeps all trigger/long-press/menu listeners
-   (button clicks bubble up), so this is purely the visual hit-target. */
+/* Flat key label, centered under the waveform strip — no disc.
+   Matches the upper "01".."16" numeral treatment (same family/weight/
+   color, flat text). The outer .pad div keeps all trigger/long-press/
+   menu listeners (button clicks bubble up), so this is purely visual. */
 .pad-trigger {
     align-self: center;
     width: auto;
@@ -2769,47 +2770,56 @@ input[type=range]:focus-visible {
     align-items: center;
     justify-content: center;
     cursor: pointer;
-    border-radius: 10px;
-    border: 1px solid rgba(255, 255, 255, 0.14);
-    font-family: 'VT323', 'Courier New', monospace;
-    background: rgba(0, 0, 0, 0.35);
-    color: rgba(57, 255, 20, 0.75);
-    box-shadow:
-        inset 0 1px 2px rgba(0, 0, 0, 0.6),
-        0 1px 0 rgba(255, 255, 255, 0.08);
-    transition: transform 0.05s, background-color 0.1s, box-shadow 0.1s, border-color 0.1s, color 0.1s;
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+    font-family: inherit;
+    font-weight: bold;
+    letter-spacing: 1px;
+    line-height: 1;
+    color: rgba(0, 0, 0, 0.75);
+    text-shadow: 0 1px 0 rgba(255, 255, 255, 0.15);
+    transition: transform 0.05s, color 0.1s;
 }
 
 .pad-trigger:hover {
     transform: translateY(-1px);
-    border-color: rgba(57, 255, 20, 0.45);
-    color: var(--neon-green);
-    box-shadow:
-        inset 0 1px 2px rgba(0, 0, 0, 0.6),
-        0 1px 0 rgba(255, 255, 255, 0.08),
-        0 0 8px rgba(57, 255, 20, 0.25);
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    color: #000;
 }
 
 .pad-trigger:active {
     transform: translateY(1px);
-    background: rgba(0, 0, 0, 0.5);
-    box-shadow:
-        inset 0 2px 4px rgba(0, 0, 0, 0.7);
+    background: transparent;
+    border: none;
+    box-shadow: none;
 }
 
 .pad-trigger .pad-key {
     font-size: 0.85rem;
+    font-weight: bold;
     line-height: 1;
     letter-spacing: 1px;
+    font-family: inherit;
     padding: 0;
     border: none;
     border-radius: 0;
     background: transparent;
+    box-shadow: none;
     color: inherit;
+    text-shadow: inherit;
 }
 
 .pad:not(.loaded) .pad-trigger {
-    color: rgba(57, 255, 20, 0.75);
+    color: rgba(57, 255, 20, 0.55);
+    text-shadow: none;
+}
+
+.pad:not(.loaded) .pad-trigger:hover {
+    color: var(--neon-green);
 }
 
 /* Unloaded pads show a bigger key letter/number, like the empty-state mock. */
@@ -2818,32 +2828,27 @@ input[type=range]:focus-visible {
 }
 
 .pad.loaded .pad-trigger {
-    background: rgba(0, 0, 0, 0.28);
-    border-color: rgba(0, 0, 0, 0.4);
-    color: rgba(0, 0, 0, 0.8);
-    box-shadow:
-        inset 0 1px 2px rgba(0, 0, 0, 0.4),
-        0 1px 0 rgba(255, 255, 255, 0.2);
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    color: rgba(0, 0, 0, 0.75);
+    text-shadow: 0 1px 0 rgba(255, 255, 255, 0.15);
 }
 
 .pad.loaded .pad-trigger:hover {
-    background: rgba(0, 0, 0, 0.38);
-    border-color: rgba(0, 0, 0, 0.55);
+    background: transparent;
+    border: none;
+    box-shadow: none;
     color: #000;
-    box-shadow:
-        inset 0 1px 2px rgba(0, 0, 0, 0.4),
-        0 1px 0 rgba(255, 255, 255, 0.2),
-        0 0 8px rgba(0, 0, 0, 0.3);
 }
 
 .pad.active .pad-trigger {
     transform: translateY(1px);
-    background: rgba(0, 0, 0, 0.45);
-    border-color: rgba(0, 0, 0, 0.6);
-    box-shadow:
-        inset 0 1px 3px rgba(0, 0, 0, 0.7),
-        0 0 12px rgba(57, 255, 20, 0.5);
-    color: #fff;
+    background: transparent;
+    border: none;
+    box-shadow: none;
+    color: #000;
+    text-shadow: 0 1px 0 rgba(255, 255, 255, 0.15);
 }
 
 .pad-trigger:focus {

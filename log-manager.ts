@@ -12,9 +12,36 @@ class LogManager {
     private currentBufferSize = 0;
     private logFilePath: string;
     private flushTimer: ReturnType<typeof setInterval> | null = null;
+    private redactionEntries: Array<{ pattern: RegExp; replacement: string }> = [];
 
     private readonly MAX_LOG_FILE_BYTES = 10 * 1024 * 1024;
     private readonly VALID_LEVELS: ReadonlySet<string> = new Set(['INFO', 'WARN', 'ERROR', 'DEBUG']);
+
+    private rebuildRedactionEntries(currentLogDir: string): void {
+        const platform = os.platform();
+        const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const addEntry = (dir: string, replacement: string) => {
+            if (!dir) return;
+            // Normalize to both / and \\ for Windows paths
+            const normalizedDir = path.normalize(dir);
+            const escapedDir = escapeRegExp(normalizedDir);
+            this.redactionEntries.push({
+                pattern: new RegExp(`^${escapedDir.replace(/\\\\/g, '[\\\\/]')}`, platform === 'win32' || platform === 'darwin' ? 'i' : ''),
+                replacement: replacement
+            });
+        };
+
+        this.redactionEntries = []; // Clear existing entries
+
+        // User Data Path
+        addEntry(currentLogDir, '<userData>');
+
+        // Home Directory
+        addEntry(os.homedir(), '<home>');
+
+        // Temp Directory
+        addEntry(os.tmpdir(), '<tmp>');
+    }
 
     constructor() {
         let userDataPath: string;
@@ -25,6 +52,7 @@ class LogManager {
         }
         try { fs.mkdirSync(userDataPath, { recursive: true }); } catch { /* ignore */ }
         this.logFilePath = path.join(userDataPath, 'gangsta_log.txt');
+        this.rebuildRedactionEntries(userDataPath);
         // Buffered entries must reach disk even without a crash — otherwise
         // the log file stays empty in normal operation.
         this.flushTimer = setInterval(() => this.flushBuffer(), this.FLUSH_INTERVAL_MS);
@@ -35,8 +63,14 @@ class LogManager {
     public log(level: LogLevel, source: 'MAIN' | 'RENDERER', message: string) {
         if (!this.VALID_LEVELS.has(level as string)) level = 'INFO';
         if (source !== 'MAIN' && source !== 'RENDERER') source = 'MAIN';
-        let msg = String(message ?? '')
-            .replace(/[\r\n\x00-\x1F\x7F]+/g, ' ')
+        let msg = String(message ?? '');
+
+        // Apply redaction before stripping/capping
+        for (const { pattern, replacement } of this.redactionEntries) {
+            msg = msg.replace(pattern, replacement);
+        }
+
+        msg = msg.replace(/[\r\n\x00-\x1F\x7F]+/g, ' ')
             .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
             .replace(/\x1b\([0-9A-Z]/g, '')
             .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')
@@ -121,6 +155,7 @@ class LogManager {
             if (next === this.logFilePath) return;
             this.logFilePath = next;
             this._lastRotationCheck = 0;
+            this.rebuildRedactionEntries(userDataPath);
         } catch { /* keep current path */ }
     }
 
@@ -224,10 +259,12 @@ class LogManager {
 
         try {
             fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
+            try { fs.chmodSync(reportPath, 0o600); } catch { /* Windows ignores */ }
         } catch (e) {
             const fallback = path.join(os.tmpdir(), `gangsta_crash_${Date.now()}_${process.pid}_${Math.floor(Math.random() * 1e6)}.json`);
             try {
                 fs.writeFileSync(fallback, JSON.stringify(report, null, 2));
+                try { fs.chmodSync(fallback, 0o600); } catch { /* Windows ignores */ }
                 return fallback;
             } catch {
                 throw e instanceof Error ? e : new Error(String(e));

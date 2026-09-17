@@ -34,6 +34,7 @@ export interface Track {
     path: string;
     duration: number;
     bpm?: number;
+    needsReview?: boolean;
 }
 
 export type PlaybackMode = 'continuous' | 'single';
@@ -246,3 +247,18 @@ class ReactiveStore implements AppStateData {
 }
 
 export const state = new ReactiveStore();
+
+/**
+ * Replace one playlist element with a patched clone and notify.
+ * The ONLY supported write path for Track fields — direct in-place
+ * writes (`state.playlist[i].bpm = x`) throw on the frozen copy, and
+ * mutating a spread-then-update without replacing the element ref is
+ * invisible to update()'s shallowEqual gate. Returns false on OOB.
+ */
+export function replaceTrackInPlaylist(index: number, patch: Partial<Track>): boolean {
+    const list = state.playlist;
+    if (!Number.isInteger(index) || index < 0 || index >= list.length) return false;
+    const next = [...list];
+    next[index] = { ...next[index], ...patch };
+    return state.update({ playlist: next });
+}

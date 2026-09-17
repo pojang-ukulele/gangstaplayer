@@ -34,7 +34,7 @@ async function build() {
         entryPoints: [resolveEntry('main.js')],
         bundle: true,
         platform: 'node',
-        target: 'node20',
+        target: 'node24',
         outfile: path.join(BUILD_DIR, 'main.js'),
         minify: MINIFY,
         sourcemap: SOURCEMAP,
@@ -321,9 +321,16 @@ function stageExternalDeps() {
             console.warn(`Warning: failed to stage ${dep}: ${e?.message || e}`);
         }
     }
-    // Sanity: the native binding must exist or the packaged DB is dead.
-    const binding = path.join(destRoot, 'better-sqlite3', 'build', 'Release', 'better_sqlite3.node');
-    if (!fs.existsSync(binding)) {
+    // Sanity: a native binding must exist or the packaged DB is dead.
+    // v13 ships N-API prebuilds in prebuilds/ (no build/Release tree).
+    const prebuildDir = path.join(destRoot, 'better-sqlite3', 'prebuilds');
+    let bindingFound = false;
+    try {
+        bindingFound = fs.existsSync(prebuildDir) &&
+            fs.readdirSync(prebuildDir).some(f => f.endsWith('.node'));
+    } catch { /* treat as missing */ }
+    const binding = path.join(prebuildDir, 'binding-check');
+    if (!bindingFound) {
         console.warn('Warning: better-sqlite3 native binding not staged — packaged getDbManager() will fail. Run `npm install` then rebuild.');
     } else {
         console.log(`Staged ${staged} external dep(s) including better-sqlite3 native binding.`);

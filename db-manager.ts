@@ -14,6 +14,20 @@ function finiteNum(v: unknown, fallback = 0): number {
     return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
 }
 
+export function canonicalizeTrackPath(p: string): string {
+    let resolved: string;
+    try {
+        resolved = path.resolve(p);
+    } catch {
+        resolved = p;
+    }
+    resolved = resolved.replace(/\\/g, '/');
+    if (process.platform === 'win32' || process.platform === 'darwin') {
+        resolved = resolved.toLowerCase();
+    }
+    return resolved;
+}
+
 export class DatabaseManager {
     private db: Database.Database;
 
@@ -129,7 +143,7 @@ export class DatabaseManager {
         `);
         return stmt.run({
             id: String(track.id).slice(0, 256),
-            path: track.path,
+            path: canonicalizeTrackPath(track.path),
             name: String(track.name ?? '').slice(0, 512),
             duration: finiteNum(track.duration, 0),
             bpm: finiteNum(track.bpm, 0),
@@ -139,7 +153,8 @@ export class DatabaseManager {
 
     public getTrackByPath(path: string) {
         const stmt = this.db.prepare('SELECT * FROM tracks WHERE path = ?');
-        const row: any = stmt.get(path);
+        let row: any = stmt.get(canonicalizeTrackPath(path));
+        if (!row) row = stmt.get(path);
         if (row && row.metadata) row.metadata = safeParse(row.metadata, {});
         return row;
     }
@@ -155,8 +170,10 @@ export class DatabaseManager {
 
     // SEARCH / FILTER
     public searchTracks(query: string) {
+        const raw = String(query ?? '').slice(0, 256).trim();
+        if (raw.replace(/[\\%_]/g, '').length < 2) return [];
         // Escape LIKE wildcards so user input like "50%" doesn't match everything
-        const escaped = String(query ?? '').slice(0, 256).replace(/[\\%_]/g, ch => '\\' + ch);
+        const escaped = raw.replace(/[\\%_]/g, ch => '\\' + ch);
         const wildcard = `%${escaped}%`;
         // Bulk surface excludes metadata (256KB x rows = IPC OOM) and caps
         // at 200 rows — getTrackByPath keeps metadata for single-track needs.

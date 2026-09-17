@@ -13,8 +13,9 @@ import { logger } from './logger';
 // which silently killed snapshot collection and restore entirely.
 import {
     padBuffers, padPaths, padVolumes, padBPMs, padSyncState,
+    padSnapToBeat, padBeatPositions, padBpmEstimated,
     padLoopStart, padLoopEnd, padWaveforms,
-    loadSampleFromPath
+    loadSampleFromPath, recomputePadBeatGrid
 } from './sampler';
 import { showConfirm } from './modals';
 import { AUTO_SAVE_INTERVAL_MS, MAX_SNAPSHOTS, MIN_SAVE_INTERVAL_MS, NUM_PADS } from './constants';
@@ -31,6 +32,7 @@ interface SnapshotPad {
     vol: number;
     bpm: number;
     sync: boolean;
+    snap?: boolean;
     loopStart?: number;
     loopEnd?: number;
 }
@@ -200,6 +202,7 @@ function collectSnapshot(reason?: string): CrashSnapshot {
                 vol: padVolumes[i] ?? 0.75,
                 bpm: padBPMs[i] || 0,
                 sync: padSyncState[i] || false,
+                snap: (padSnapToBeat as unknown as Record<number, boolean> | undefined)?.[i] === false ? false : undefined,
                 loopStart: (typeof ls === 'number' && Number.isFinite(ls) && ls >= 0) ? ls : undefined,
                 loopEnd: (typeof le === 'number' && Number.isFinite(le) && le > 0) ? le : undefined,
             };
@@ -398,6 +401,9 @@ export async function restoreSnapshot(): Promise<boolean> {
             vol: padVolumes[i] ?? 0.75,
             bpm: padBPMs[i] ?? 0,
             sync: !!padSyncState[i],
+            snap: ((padSnapToBeat as unknown as Record<number, boolean> | undefined)?.[i] === false ? false : undefined) as boolean | undefined,
+            beats: Array.isArray((padBeatPositions as unknown as Record<number, number[]> | undefined)?.[i]) ? [...(padBeatPositions as unknown as Record<number, number[]>)[i]] : [],
+            est: !!(padBpmEstimated as unknown as Record<number, boolean> | undefined)?.[i],
             ls: padLoopStart[i] ?? -1,
             le: padLoopEnd[i] ?? -1,
             wf: (padWaveforms as unknown as unknown[])[i],
@@ -424,6 +430,24 @@ export async function restoreSnapshot(): Promise<boolean> {
                     padVolumes[i] = p.vol;
                     padBPMs[i] = p.bpm;
                     padSyncState[i] = p.sync;
+                    try {
+                        const snapStore = padSnapToBeat as unknown as Record<number, boolean> | undefined;
+                        if (snapStore) {
+                            if (p.snap === false || p.snap === true) snapStore[i] = p.snap;
+                            else delete snapStore[i];
+                        }
+                    } catch { /* ignore */ }
+                    try {
+                        const beatStore = padBeatPositions as unknown as Record<number, number[]> | undefined;
+                        if (beatStore && Array.isArray((p as { beats?: unknown }).beats)) beatStore[i] = [...(p as { beats: number[] }).beats];
+                    } catch { /* ignore */ }
+                    try {
+                        const estStore = padBpmEstimated as unknown as Record<number, boolean> | undefined;
+                        if (estStore) {
+                            if ((p as { est?: unknown }).est) estStore[i] = true;
+                            else delete estStore[i];
+                        }
+                    } catch { /* ignore */ }
                     padLoopStart[i] = p.ls;
                     padLoopEnd[i] = p.le;
                     (padWaveforms as unknown as unknown[])[i] = p.wf;
@@ -581,7 +605,10 @@ export async function restoreSnapshot(): Promise<boolean> {
             try { padPaths[i] = ''; } catch { /* ignore */ }
             try { (padWaveforms as any)[i] = undefined; } catch { /* ignore */ }
             try { padBPMs[i] = 0; } catch { /* ignore */ }
+            try { (padBeatPositions as unknown as Record<number, number[]> | undefined)?.[i] !== undefined && ((padBeatPositions as unknown as Record<number, number[]>)[i] = []); } catch { /* ignore */ }
+            try { delete (padBpmEstimated as unknown as Record<number, boolean> | undefined)?.[i]; } catch { /* ignore */ }
             try { padSyncState[i] = false; } catch { /* ignore */ }
+            try { delete (padSnapToBeat as unknown as Record<number, boolean> | undefined)?.[i]; } catch { /* ignore */ }
             try { padLoopStart[i] = -1; } catch { /* ignore */ }
             try { padLoopEnd[i] = -1; } catch { /* ignore */ }
         }
@@ -601,7 +628,7 @@ export async function restoreSnapshot(): Promise<boolean> {
                     break;
                 }
                 const idx = parseInt(key);
-                const p = (snapshot.pads as Record<number, { path: string; vol: number; bpm: number; sync: boolean; loopStart?: number; loopEnd?: number }>)[idx];
+                const p = (snapshot.pads as Record<number, { path: string; vol: number; bpm: number; sync: boolean; snap?: boolean; loopStart?: number; loopEnd?: number }>)[idx];
                 if (!p || !Number.isInteger(idx) || idx < 0 || idx >= NUM_PADS) continue;
                 // Fail fast: empty/overlong paths can never load.
                 if (typeof p.path !== 'string' || !p.path || p.path.length > 32760) {
@@ -613,10 +640,19 @@ export async function restoreSnapshot(): Promise<boolean> {
                 // otherwise failures leave ghost paths with no buffer.
                 try {
                     const remaining = Math.max(1000, OVERALL_RESTORE_BUDGET_MS - (Date.now() - restoreStart));
-                    await withTimeout(loadSampleFromPath(p.path, idx), Math.min(PER_PAD_RESTORE_MS, remaining));
+                    await withTimeout(loadSampleFromPath(p.path, idx, typeof p.bpm === 'number' ? p.bpm : undefined), Math.min(PER_PAD_RESTORE_MS, remaining));
                     padVolumes[idx] = (typeof p.vol === 'number' && Number.isFinite(p.vol)) ? Math.min(1, Math.max(0, p.vol)) : 0.75;
-                    padBPMs[idx] = p.bpm || 0;
+                    padBPMs[idx] = (typeof p.bpm === 'number' && Number.isFinite(p.bpm)) ? Math.min(300, Math.max(0, p.bpm)) : 0;
+                    // Snapshot BPM overwrites fresh analysis — rebuild grid.
+                    try { if (typeof recomputePadBeatGrid === 'function') recomputePadBeatGrid(idx); } catch { /* ignore */ }
                     padSyncState[idx] = p.sync || false;
+                    try {
+                        const snapStore = padSnapToBeat as unknown as Record<number, boolean> | undefined;
+                        if (snapStore) {
+                            if (typeof p.snap === 'boolean') snapStore[idx] = p.snap;
+                            else delete snapStore[idx];
+                        }
+                    } catch { /* ignore */ }
                     if (typeof p.loopStart === 'number' && Number.isFinite(p.loopStart) && p.loopStart >= 0) padLoopStart[idx] = p.loopStart;
                     if (typeof p.loopEnd === 'number' && Number.isFinite(p.loopEnd) && p.loopEnd > 0) padLoopEnd[idx] = p.loopEnd;
                 } catch (err: unknown) {

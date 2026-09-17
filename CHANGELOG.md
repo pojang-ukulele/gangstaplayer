@@ -1,5 +1,27 @@
 # Changelog
 
+## [Unreleased] — "Audit sweep + Electron 43 + BPM/cache (2026-09-17)"
+
+### 🛡️ Audit sweep fixes (verified: `tsc --noEmit` clean, Jest 150/150 across 20 suites)
+
+- **Main/IPC (`main.ts`, `db-manager.ts`)**: `db:get-track` now mirrors the upsert gate (audio-ext + ADS/UNC reject + `validatePath` + consent, fail-closed); new `canonicalizeTrackPath()` (resolve, slash-normalize, case-fold on win/mac) applied on upsert store and lookup with raw fallback for legacy rows.
+- **Deserialization (`js/utils.ts`, `js/session.ts`, `js/sampler.ts`)**: new cycle-safe `sanitizeParsedJson()` strips `__proto__`/`constructor`/`prototype` after every kit/session parse; kit loads get the same 25 MB pre-decode cap sessions already had.
+- **State (`js/state.ts`, `js/player.ts`, `js/playlist.ts`, `js/track-info.ts`)**: `finishCrossfade` guards `swapChannels()` (throw resets blend flags + toast, no stuck UI); new `replaceTrackInPlaylist()` clone-then-update helper; all 8 in-place playlist writes converted (in-place writes were invisible to subscribers).
+- **Logging (`log-manager.ts`)**: userData/home/tmpdir prefixes redacted to `<userData>`/`<home>`/`<tmp>` before strip/cap; crash reports `chmod 0600` (primary + tmpdir fallback).
+- **XSS/DB edges (`js/sampler.ts`, `js/playlist.ts`, `db-manager.ts`)**: `escapeAttr` also escapes `/`; playlist tooltip strips `"<>`; `searchTracks` returns `[]` under 2 non-wildcard chars (no leading-wildcard full scans).
+
+### ⬆️ Electron 43 upgrade (verified: `tsc --noEmit` clean, Jest 150/150, dev build green)
+
+- **Pins**: `electron ^43.7.1`, `better-sqlite3 ^13.0.3` (N-API, no per-Electron rebuild), `@types/node ^24.x`; `npm audit fix` cut 23 vulns → 1 low (rest need breaking `--force`, deferred).
+- **Build (`scripts/build.js`, `package.json`)**: main bundle `target: 'node24'`; v13 staging fixed (sanity check + `asarUnpack` now look at `prebuilds/*.node`, not the removed `build/Release` tree); staged closure still verifies (17 deps).
+- **Python (`sonetra-requirements.txt`)**: refreshed to `fastapi 0.141.1`, `uvicorn 0.53.0`, `pydantic>=2.9,<3`, `numpy 2.5.2`, `librosa 0.11.0`, `soundfile 0.14.0` (resolver-verified on 3.13; never numpy-2.x with librosa 0.10). Server e2e still needs a Sonetra source checkout (not in repo).
+
+### 🎵 BPM + instant replay (verified: `tsc --noEmit` clean, Jest 150/150)
+
+- **Resilient detection (`js/worker-client.ts`)**: one confident attempt + single retry at 0.7× threshold; low-confidence rows persist duration and show ` [?bpm]` instead of hanging at ` [...]` forever; right-click Analyze clears the in-flight entry so retries really run.
+- **Decode caches**: in-memory LRU (3 entries / 100 MB) shared by analysis + playback — dropped tracks never re-read + re-decode on play; persistent PCM disk cache (`userData/cache-pcm`, sha + mtime key, 100 MB/entry, 500 MB LRU) makes reloads instant across sessions. New narrow IPC only (`pcmcache:get/put`, `fs:stat-file`, hex-keyed + capped + rate-limited).
+- **Pads**: key letter/number loses the dark disc, now flat type matching the `01`–`16` numerals at the same size.
+
 ## [Unreleased] — "Waveform-first pads + error-signaling audit fixes (2026-09-17)"
 
 ### 🎛️ Sampler pads go waveform-first (verified: `tsc --noEmit` clean)

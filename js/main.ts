@@ -159,7 +159,7 @@ function setupContextMenus() {
                     if (padCtxDivider) padCtxDivider.classList.toggle('hidden', !hasBuffer);
 
                     // Show loop items when sample is loaded
-                    const hasBpm = hasBuffer && !!padBPMs[i];
+                    const hasBpm = hasBuffer && Number.isFinite(padBPMs[i]) && (padBPMs[i] as number) > 0;
                     // NOTE: element id is 'padCtxLoopDivider' in index.html —
                     // the old 'ctxLoopDivider' lookup never resolved.
                     const padCtxLoopDivider = document.getElementById('padCtxLoopDivider');

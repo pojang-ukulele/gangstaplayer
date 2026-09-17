@@ -737,6 +737,127 @@ function registerIpcHandlers(): void {
   // call sites (master recording uses saveAudioDialog + fs:save-file).
   // Orphaned handlers are pure attack surface; re-add with callers if needed.
 
+  // Persistent decoded-audio (PCM) disk cache. fs:save-file's allowlist
+  // rejects non-dialog/non-recordings writes, so the cache gets its own
+  // narrow channel: fixed dir under userData, hex-only filenames, byte caps.
+  const PCM_CACHE_KEY_RE = /^[0-9a-f]{64}$/;
+  const PCM_CACHE_ENTRY_MAX_BYTES = 100 * 1024 * 1024;
+  const PCM_CACHE_DIR_MAX_BYTES = 500 * 1024 * 1024;
+  function getPcmCacheDir(): string {
+    return path.join(app.getPath('userData'), 'cache-pcm');
+  }
+  ipcMain.handle('pcmcache:get', async (_event, key: unknown) => {
+    if (rateLimited('pcmcache:get', 50)) return null;
+    if (typeof key !== 'string' || !PCM_CACHE_KEY_RE.test(key)) {
+      logToDisk('ERROR', 'Security: Blocked pcmcache:get with invalid key');
+      return null;
+    }
+    try {
+      const dir = getPcmCacheDir();
+      const fp = path.join(dir, `${key}.pcm`);
+      let stat: fs.Stats;
+      try {
+        stat = fs.statSync(fp);
+      } catch {
+        return null;
+      }
+      if (!stat.isFile() || stat.size === 0 || stat.size > PCM_CACHE_ENTRY_MAX_BYTES) return null;
+      return fs.readFileSync(fp);
+    } catch (err) {
+      logToDisk('ERROR', `pcmcache:get failed: ${err}`);
+      return null;
+    }
+  });
+
+  ipcMain.handle('pcmcache:put', async (_event, key: unknown, data: unknown) => {
+    if (rateLimited('pcmcache:put', 50)) return false;
+    if (typeof key !== 'string' || !PCM_CACHE_KEY_RE.test(key)) {
+      logToDisk('ERROR', 'Security: Blocked pcmcache:put with invalid key');
+      return false;
+    }
+    if (!data || !(data instanceof Uint8Array) || data.byteLength === 0 || data.byteLength > PCM_CACHE_ENTRY_MAX_BYTES) {
+      logToDisk('ERROR', `Security: Blocked pcmcache:put with invalid payload (${(data as { byteLength?: unknown })?.byteLength ?? 'n/a'} bytes)`);
+      return false;
+    }
+    try {
+      const dir = getPcmCacheDir();
+      fs.mkdirSync(dir, { recursive: true });
+      const fp = path.join(dir, `${key}.pcm`);
+      fs.writeFileSync(fp, Buffer.from((data as Uint8Array).buffer, (data as Uint8Array).byteOffset, (data as Uint8Array).byteLength));
+      // Dir total cap 500MB: evict oldest files first (mtime order).
+      try {
+        const entries: { p: string; mtime: number; size: number }[] = [];
+        for (const name of fs.readdirSync(dir)) {
+          // Only our own hex-named entries count — stray files never protect
+          // cache entries from eviction, nor get evicted by it.
+          if (!/^[0-9a-f]{64}\.pcm$/.test(name)) continue;
+          try {
+            const st = fs.statSync(path.join(dir, name));
+            if (st.isFile()) entries.push({ p: path.join(dir, name), mtime: st.mtimeMs, size: st.size });
+          } catch { /* ignore */ }
+        }
+        let total = entries.reduce((a, e) => a + e.size, 0);
+        entries.sort((a, b) => a.mtime - b.mtime);
+        for (const e of entries) {
+          if (total <= PCM_CACHE_DIR_MAX_BYTES) break;
+          try { fs.unlinkSync(e.p); total -= e.size; } catch { /* ignore */ }
+        }
+      } catch { /* eviction best effort */ }
+      return true;
+    } catch (err) {
+      logToDisk('ERROR', `pcmcache:put failed: ${err}`);
+      return false;
+    }
+  });
+
+  // Metadata-only read: SAME gates as fs:read-file (ext allowlist via
+  // isReadPathAllowed + validatePath + realpath + isFile). statSync only,
+  // no content crosses IPC.
+  ipcMain.handle('fs:stat-file', async (_event, pathStr: unknown) => {
+    if (rateLimited('fs:stat-file', 50)) return null;
+    if (typeof pathStr !== 'string') {
+      logToDisk('ERROR', 'Security: Blocked illegal stat attempt');
+      return null;
+    }
+    const validated = validatePath(pathStr);
+    if (!validated) {
+      logToDisk('ERROR', `Security: Blocked illegal stat attempt from ${pathStr}`);
+      return null;
+    }
+    if (!isReadPathAllowed(validated)) {
+      logToDisk('ERROR', `Security: Blocked stat of non-media file ${validated}`);
+      return null;
+    }
+    try {
+      let realPath: string;
+      try {
+        realPath = fs.realpathSync.native(validated);
+      } catch {
+        realPath = fs.realpathSync(validated);
+      }
+      if (realPath !== validated && !isReadPathAllowed(realPath)) {
+        logToDisk('ERROR', `Security: Blocked symlink stat ${validated} -> ${realPath}`);
+        return null;
+      }
+      const checkPath = realPath || validated;
+      let stat: fs.Stats;
+      try {
+        stat = fs.statSync(checkPath);
+      } catch {
+        logToDisk('ERROR', `Security: Blocked stat of non-existent path ${validated}`);
+        return null;
+      }
+      if (!stat.isFile()) {
+        logToDisk('ERROR', `Security: Blocked stat of non-file path ${validated}`);
+        return null;
+      }
+      return { size: stat.size, mtimeMs: stat.mtimeMs };
+    } catch (err) {
+      logToDisk('ERROR', `Security: Stat failed for ${validated}: ${err}`);
+      return null;
+    }
+  });
+
   ipcMain.handle('fs:show-item-in-folder', async (_event, pathStr: string) => {
     if (rateLimited('fs:show-item-in-folder', 500)) return false;
     const validated = validatePath(pathStr);
@@ -951,6 +1072,20 @@ function registerIpcHandlers(): void {
     if (rateLimited('db:get-track', 50)) return null;
     try {
       if (typeof trackPath !== 'string' || !trackPath || trackPath.length > 32760) return null;
+      const ext = path.extname(trackPath).replace('.', '').toLowerCase();
+      if (!VALID_AUDIO_EXTENSIONS.includes(ext as never)) {
+        logToDisk('ERROR', `Security: Blocked db:get-track with non-audio ext ${trackPath}`);
+        return null;
+      }
+      if (isAdsOrUncPath(trackPath)) {
+        logToDisk('ERROR', `Security: Blocked db:get-track with ADS/UNC ${trackPath}`);
+        return null;
+      }
+      const v = validatePath(trackPath);
+      if (!v || !isReadPathAllowed(v)) {
+        logToDisk('ERROR', `Security: Blocked db:get-track without consent ${trackPath}`);
+        return null;
+      }
       const db = getDbManager();
       if (!db) return null;
       return db.getTrackByPath(trackPath);

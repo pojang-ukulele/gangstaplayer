@@ -78,7 +78,7 @@ function spawnWorker(): Worker {
     w!.onmessage = (e: MessageEvent) => {
         // A healthy response resets the crash counter.
         spawnFailCount = 0;
-        const { type, bpm, confidence, blob, id } = e.data || {};
+        const { type, bpm, confidence, blob, altBpm, id } = e.data || {};
         // Id-less replies are dropped without leaking: no pending entry is
         // touched, nothing is resolved or rejected.
         if (id === undefined || id === null) return;
@@ -86,7 +86,10 @@ function spawnWorker(): Worker {
         if (!request) return;
         pendingRequests.delete(id);
         if (type === 'BPM_RESULT' && request.kind === 'BPM') {
-            request.resolve(typeof bpm === 'number' ? { bpm, confidence: typeof confidence === 'string' ? confidence : 'none' } : { bpm: 0, confidence: 'none' });
+            const safeAlt = typeof altBpm === 'number' && Number.isFinite(altBpm) && altBpm > 0 ? altBpm : undefined;
+            request.resolve(typeof bpm === 'number'
+                ? { bpm, confidence: typeof confidence === 'string' ? confidence : 'none', ...(safeAlt !== undefined ? { altBpm: safeAlt } : {}) }
+                : { bpm: 0, confidence: 'none' });
         } else if (type === 'WAVE_RESULT' && request.kind === 'WAVE') {
             request.resolve(blob);
         } else {
@@ -194,14 +197,17 @@ export interface BpmAnalysis {
     confidence: BpmConfidence;
     /** True when callers must retry/other-means and must NOT cache as analyzed 0. */
     needsReview: boolean;
+    /** Octave rival of the winner (no silent fold) — present on confident results only. */
+    altBpm?: number;
 }
 
 /**
  * Detect BPM with a confidence flag (mono fast path: channel-0, 90s cap).
  * Low-confidence and -1 results resolve to { bpm: null, needsReview: true }
- * so callers retry instead of caching a bogus analyzed 0. Octave-fold limits:
- * the worker corrects one 2x octave error into 60-180 (usable 30-210);
- * triplets and <30/>210 extremes are needs-review by design.
+ * so callers retry instead of caching a bogus analyzed 0. Octave handling:
+ * the worker returns the TPS winner as bpm with the best octave rival as
+ * altBpm (no silent fold); triplets and <30/>210 extremes are needs-review
+ * by design.
  */
 export function detectBPMWithConfidence(audioBuffer: AudioBuffer, options?: { threshold?: number; minStepSeconds?: number }): Promise<BpmAnalysis> {
     if (!isAudioBufferLike(audioBuffer)) return Promise.reject(new Error('Invalid AudioBuffer'));
@@ -230,16 +236,39 @@ export function detectBPMWithConfidence(audioBuffer: AudioBuffer, options?: { th
             minStepSeconds: typeof minStep === 'number' && minStep > 0 && minStep <= 5 ? minStep : BPM_MIN_STEP_SECONDS
         },
         id
-    }), [data.buffer]).then((res: { bpm?: number; confidence?: BpmConfidence }) => {
+    }), [data.buffer]).then((res: { bpm?: number; confidence?: BpmConfidence; altBpm?: number }) => {
         const bpm = typeof res?.bpm === 'number' ? res.bpm : 0;
         const confidence: BpmConfidence = res?.confidence === 'high' || res?.confidence === 'medium' || res?.confidence === 'low' ? res.confidence : 'none';
         if (bpm <= 0 || confidence === 'low' || confidence === 'none') {
             return { bpm: null, confidence, needsReview: true };
         }
-        return { bpm, confidence, needsReview: false };
+        const out: BpmAnalysis = { bpm, confidence, needsReview: false };
+        if (typeof res?.altBpm === 'number' && Number.isFinite(res.altBpm) && res.altBpm > 0 && res.altBpm !== bpm) {
+            out.altBpm = res.altBpm;
+        }
+        return out;
     });
 }
 
+/**
+ * Resilient BPM entry: one confident attempt, then a single retry with a
+ * relaxed threshold (threshold*0.7, same other opts). Returns the best
+ * result — a success from either attempt, else the original attempt.
+ * Callers still gate persistence through resolveBpmPersist.
+ */
+export function detectBPMResilient(audioBuffer: AudioBuffer, options?: { threshold?: number; minStepSeconds?: number }): Promise<BpmAnalysis> {
+    return detectBPMWithConfidence(audioBuffer, options).then((first) => {
+        if (!first.needsReview && first.bpm !== null) return first;
+        const base = typeof options?.threshold === 'number' && options.threshold > 0 && options.threshold <= 1
+            ? options.threshold
+            : BPM_DETECTION_THRESHOLD;
+        const relaxed = { ...options, threshold: base * 0.7 };
+        return detectBPMWithConfidence(audioBuffer, relaxed).then((second) => {
+            if (!second.needsReview && second.bpm !== null) return second;
+            return first;
+        });
+    });
+}
 /**
  * Legacy BPM entry (kept for existing deck/playlist callers): resolves a
  * number, 0 when analysis needs review. New code should prefer

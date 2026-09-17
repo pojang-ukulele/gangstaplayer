@@ -5,7 +5,7 @@
  * and the global ESC handler in main.ts.
  */
 
-import { state, Track } from './state';
+import { state, Track, replaceTrackInPlaylist } from './state';
 import { openModal, closeModal } from './modals';
 import { toast } from './toast';
 import { logger } from './logger';
@@ -144,29 +144,25 @@ async function saveTags(): Promise<void> {
     const genre = read('tagGenre');
     const metadata = { title, artist, album, genre };
 
-    const next = [...state.playlist];
-    next[idx] = {
-        ...next[idx],
-        ...(title ? { name: title.slice(0, 512) } : {}),
-    };
-    state.update({ playlist: next });
+    if (title) replaceTrackInPlaylist(idx, { name: title.slice(0, 512) });
+    const updated = state.playlist[idx];
 
     try {
         const saved = await window.database?.upsertTrack({
-            id: next[idx].id,
-            path: next[idx].path,
-            name: next[idx].name,
-            duration: next[idx].duration,
-            bpm: next[idx].bpm ?? 0,
+            id: updated.id,
+            path: updated.path,
+            name: updated.name,
+            duration: updated.duration,
+            bpm: updated.bpm ?? 0,
             metadata,
         });
         if (!saved) {
-            logger.warn(`[TrackInfo] Tag persist returned falsy for ${next[idx].name} — tags kept in memory only`);
+            logger.warn(`[TrackInfo] Tag persist returned falsy for ${updated.name} — tags kept in memory only`);
             toast.error('TAGS SAVE FAILED');
             return;
         }
         toast.success('TAGS SAVED');
-        logger.info(`[TrackInfo] Tags saved for ${next[idx].name}`);
+        logger.info(`[TrackInfo] Tags saved for ${updated.name}`);
     } catch (e) {
         logger.warn('[TrackInfo] Tag persist failed', e);
         toast.error('TAG SAVE FAILED');

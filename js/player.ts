@@ -1,8 +1,10 @@
 // === PLAYER MODULE ===
 import { audioCtx, resumeAudioContext, masterGain, ensureAudio } from './audio';
 import { settings, isAiEnabled } from './settings';
-import { state, Track, PlaybackMode, LoopMode } from './state';
-import { detectBPMWithConfidence, resolveBpmPersist } from './worker-client';
+import { state, Track, PlaybackMode, LoopMode, replaceTrackInPlaylist } from './state';
+import { detectBPMResilient, resolveBpmPersist } from './worker-client';
+import { getDecoded } from './decoded-cache';
+import { getDiskAudio, putDiskAudio } from './pcm-disk-cache';
 import { toast } from './toast';
 import { engine } from './audio-engine';
 import { logger } from './logger';
@@ -151,6 +153,18 @@ export function getDroppedAudioFile(filePath: string, trackId?: string): File | 
  * Returns a detached ArrayBuffer or null when unreadable.
  */
 export async function readAudioBytesForPath(filePath: string, trackId?: string): Promise<ArrayBuffer | null> {
+    // Shared decoded cache first: a prior analysis decode serves playback
+    // too — skip the dropped-file/IPC re-read. Returns a copy so caller
+    // decodes never neuter the cached bytes. Signature still validated.
+    if (trackId) {
+        try {
+            const hit = getDecoded(trackId);
+            if (hit && hit.bytes.byteLength > 0 && hit.bytes.byteLength <= MAX_FILE_SIZE_BYTES) {
+                const sigErr = validateAudioSignature(hit.bytes, filePath.split(/[\\/]/).pop());
+                if (!sigErr) return hit.bytes.slice(0);
+            }
+        } catch { /* fall through */ }
+    }
     const dropped = getDroppedAudioFile(filePath, trackId);
     if (dropped) {
         try {
@@ -236,10 +250,15 @@ async function getSafeUrl(filePath: string, isMain: boolean, verifyDecode = fals
             return "";
         }
         if (verifyDecode && ensureAudio() && audioCtx) {
+            // Cache hit already proved decodable during analysis — skip the
+            // second decode, signature above still ran on the cached bytes.
+            const isCacheHit = !!trackId && !!getDecoded(trackId);
+            if (!isCacheHit) {
             try { await audioCtx.decodeAudioData(arrayBuffer.slice(0)); }
             catch {
                 logger.warn(`[SafeURL] Rejected undecodable file: ${filePath}`);
                 return "";
+            }
             }
         }
         // Blob wraps the ORIGINAL buffer — the old extra slice(0) tripled
@@ -391,8 +410,32 @@ export async function loadTrack(index: number): Promise<void> {
     logger.info(`[Player] Loading track: ${track.name} [ID: ${track.id}]`);
     // Single IPC read shared by playback blob + decode/BPM. Previously this
     // read the file twice (2x I/O, 2x RAM, TOCTOU). decodeAudioData detaches
-    // its input, so the blob gets a copy.
+    // its input, so the blob gets a copy. A prior analysis decode serves
+    // here too — cache hit skips the re-read + decode-verify below.
+    const _cacheHit = track.id ? getDecoded(track.id) : undefined;
+    let _useCache = !!_cacheHit && _cacheHit.bytes.byteLength > 0
+        && _cacheHit.bytes.byteLength <= MAX_FILE_SIZE_BYTES && !!_cacheHit.buffer;
     let sharedBuffer: ArrayBuffer | null = null;
+    // Persistent disk cache (memory → disk → source): a prior session's PCM
+    // feeds memory with WAV-backed bytes, so reuse the memory path below.
+    if (!_useCache) {
+        try {
+            const _diskBuf = await getDiskAudio(track.path, track.id);
+            if (_diskBuf) {
+                const _fed = track.id ? getDecoded(track.id) : undefined;
+                if (_fed && _fed.bytes.byteLength > 0 && _fed.bytes.byteLength <= MAX_FILE_SIZE_BYTES && !!_fed.buffer) {
+                    sharedBuffer = _fed.bytes.slice(0);
+                    logger.debug(`[Player] loadId=${loadId} disk cache hit: ${track.path}`);
+                    if (loadId !== _loadTrackId) { logger.debug(`[Player] loadId=${loadId} superseded after disk hit`); return; }
+                    _useCache = true;
+                }
+            }
+        } catch { /* fall through to source read */ }
+    }
+    if (_useCache && !sharedBuffer) {
+        sharedBuffer = _cacheHit!.bytes.slice(0);
+        logger.debug(`[Player] loadId=${loadId} cache hit: ${track.path}`);
+    } else if (!sharedBuffer) {
     logger.debug(`[Player] loadId=${loadId} read start: ${track.path}`);
     try {
         sharedBuffer = await withLoadStepTimeout(readAudioBytesForPath(track.path, track.id), LOAD_READ_TIMEOUT_MS, 'read');
@@ -407,6 +450,7 @@ export async function loadTrack(index: number): Promise<void> {
     }
     logger.debug(`[Player] loadId=${loadId} read done bytes=${sharedBuffer?.byteLength ?? 'null'}`);
     if (loadId !== _loadTrackId) { logger.debug(`[Player] loadId=${loadId} superseded after read`); return; }
+    }
     if (!sharedBuffer) {
         toast.error("TRACK UNREADABLE — KEPT PREVIOUS TRACK");
         hideSpinnerIfCurrent(loadId);
@@ -429,8 +473,16 @@ export async function loadTrack(index: number): Promise<void> {
     if (trackSpinner) trackSpinner.classList.add('active');
 
     // Verify decodability BEFORE touching the live deck. Uses a detached copy
-    // so sharedBuffer stays intact for the playback blob.
+    // so sharedBuffer stays intact for the playback blob. Cache hit reuses
+    // the analysis decode — signature above still ran on the cached bytes.
     let verifiedBuffer: AudioBuffer | null = null;
+    if (_useCache) {
+        // Re-resolve: the buffer may come from memory or the disk-fed entry.
+        // A mid-load eviction falls back to decoding the bytes above.
+        verifiedBuffer = (track.id ? getDecoded(track.id)?.buffer : undefined) ?? null;
+        if (verifiedBuffer) logger.debug(`[Player] loadId=${loadId} decode skipped (cache hit): ${track.path}`);
+    }
+    if (!verifiedBuffer) {
     logger.debug(`[Player] loadId=${loadId} decode start: ${track.path}`);
     try {
         if (ensureAudio() && audioCtx && sharedBuffer) {
@@ -450,6 +502,11 @@ export async function loadTrack(index: number): Promise<void> {
         return;
     }
     logger.debug(`[Player] loadId=${loadId} decode done`);
+    // Persist fresh decodes to the cross-session disk cache (fire-and-forget).
+    if (verifiedBuffer && !_useCache) {
+        try { void putDiskAudio(track.path, verifiedBuffer); } catch { /* ignore */ }
+    }
+    }
     if (loadId !== _loadTrackId) { logger.debug(`[Player] loadId=${loadId} superseded after decode`); hideSpinnerIfCurrent(loadId); return; }
     const live = state.playlist;
     if (index < 0 || index >= live.length || live[index]?.id !== track.id) { logger.debug(`[Player] loadId=${loadId} cancelled: playlist changed`); hideSpinnerIfCurrent(loadId); return; }
@@ -500,7 +557,7 @@ export async function loadTrack(index: number): Promise<void> {
             // 1. Detect BPM if missing (confidence-gated: a needs-review
             // result keeps the prior value instead of caching a bogus 0).
             if (!hasBpm) {
-                const analysis = await detectBPMWithConfidence(audioBuffer);
+                const analysis = await detectBPMResilient(audioBuffer);
                 if (_loadTrackId !== loadId) {
                     hideSpinnerIfCurrent(loadId);
                     return; // cancelled
@@ -513,9 +570,8 @@ export async function loadTrack(index: number): Promise<void> {
                 } else {
                     const bpm = decision.bpm;
                     if (pIdx >= 0) {
-                        const next = [...state.playlist];
-                        next[pIdx] = { ...next[pIdx], bpm };
-                        state.update({ masterBPM: bpm, playlist: next });
+                        replaceTrackInPlaylist(pIdx, { bpm });
+                        state.update({ masterBPM: bpm });
                     } else {
                         state.update({ masterBPM: bpm });
                     }
@@ -847,8 +903,17 @@ function finishCrossfade(nextIndex: number, expectedId?: string): void {
         return;
     }
 
-    // PROMOTE channel
-    engine.swapChannels();
+    // PROMOTE channel — ref-swap is synchronous with no guard flag by
+    // design, so a mid-promote throw must reset blend state explicitly or
+    // the UI sticks in blending against engine truth.
+    try {
+        engine.swapChannels();
+    } catch (e) {
+        logger.error('[Player] Channel promote failed', e);
+        state.update({ isCrossfadeInProgress: false, blendingIndex: -1 });
+        try { toast.error('CROSSFADE FAILED — KEPT CURRENT TRACK'); } catch { /* ignore */ }
+        return;
+    }
 
     // Swap tracked blob URLs safely
     const oldMainUrl = mainBlobUrl;
@@ -864,6 +929,7 @@ function finishCrossfade(nextIndex: number, expectedId?: string): void {
     state.update({
         currentTrackIndex: nextIndex,
         isCrossfadeInProgress: false,
+        blendingIndex: -1,
         masterBPM: promotedBpm > 0 ? promotedBpm : 0,
     });
     crossfadeRateRatio = 1;

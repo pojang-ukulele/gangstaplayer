@@ -109,6 +109,42 @@ export function normalizeToArrayBuffer(data: any): ArrayBuffer {
     );
 }
 
+// ==================== JSON SANITIZER ====================
+
+/**
+ * Recursively strips prototype-pollution keys (__proto__/constructor/
+ * prototype) from parsed JSON. Cycle-safe via Seen set. Clean inputs
+ * pass through unchanged (same structure returned).
+ */
+export function sanitizeParsedJson<T>(value: T, seen: Set<object> = new Set()): T {
+    if (Array.isArray(value)) {
+        if (seen.has(value as unknown as object)) return value;
+        seen.add(value as unknown as object);
+        for (let i = 0; i < value.length; i++) {
+            try { value[i] = sanitizeParsedJson(value[i], seen); } catch { /* ignore */ }
+        }
+        return value;
+    }
+    if (value !== null && typeof value === 'object') {
+        const proto = Object.getPrototypeOf(value);
+        if (proto !== Object.prototype && proto !== null) return value;
+        if (seen.has(value as unknown as object)) return value;
+        seen.add(value as unknown as object);
+        for (const key of Object.keys(value as unknown as object)) {
+            if (key === '__proto__' || key === 'constructor' || key === 'prototype') {
+                try { delete (value as unknown as Record<string, unknown>)[key]; } catch { /* ignore */ }
+                continue;
+            }
+            try {
+                (value as unknown as Record<string, unknown>)[key] =
+                    sanitizeParsedJson((value as unknown as Record<string, unknown>)[key] as unknown, seen) as unknown;
+            } catch { /* ignore */ }
+        }
+        return value;
+    }
+    return value;
+}
+
 // ==================== AUDIO FILE VALIDATION ====================
 // Magic number signatures for common audio formats
 

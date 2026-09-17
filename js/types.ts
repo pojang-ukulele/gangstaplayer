@@ -31,6 +31,8 @@ export interface ElectronAPI {
 export interface FileSystemAPI {
     // main returns Buffer|null (Node); renderer sees Uint8Array|null.
     readFile(filePath: string): Promise<Uint8Array | null>;
+    // Metadata-only (SAME gates as readFile); null on reject/rate-limit.
+    statFile(filePath: string): Promise<{ size: number; mtimeMs: number } | null>;
     consentFile(filePath: string): Promise<boolean>;
     // main returns boolean success (false on reject/rate-limit).
     saveFile(filePath: string, data: Uint8Array): Promise<boolean>;
@@ -59,6 +61,12 @@ export interface DatabaseAPI {
     getAllTracks(): Promise<any[]>;
 }
 
+export interface PcmCacheAPI {
+    // main returns Buffer|null (Node); renderer sees Uint8Array|null.
+    get(key: string): Promise<Uint8Array | null>;
+    put(key: string, data: Uint8Array): Promise<boolean>;
+}
+
 // === Global Window Augmentation ===
 // Bridges are guaranteed in Electron; renderer guards with `?.`/try-catch at
 // call sites that also run in browser/test boots (see js/main.ts initApp).
@@ -68,6 +76,7 @@ declare global {
         fileSystem: FileSystemAPI;
         sonetra: SonetraAPI;
         database: DatabaseAPI;
+        pcmCache: PcmCacheAPI;
     }
 }
 

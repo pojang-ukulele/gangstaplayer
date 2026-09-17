@@ -15,12 +15,17 @@ import { settings, applySettingsToUI, updateAutoMix } from './settings';
 import { NUM_PADS, VALID_AUDIO_EXTENSIONS } from './constants';
 import { toast } from './toast';
 import { logger } from './logger';
+import { sanitizeParsedJson } from './utils';
 import {
     padPaths,
     padVolumes,
     padBPMs,
     padSyncState,
+    padSnapToBeat,
+    padBeatPositions,
+    padBpmEstimated,
     loadSampleFromPath,
+    recomputePadBeatGrid,
     padBuffers,
     padWaveforms,
     padLoopStart,
@@ -119,6 +124,7 @@ interface SessionPad {
     vol: number;
     bpm?: number;
     sync?: boolean;
+    snap?: boolean;
     loopStart?: number;
     loopEnd?: number;
 }
@@ -198,6 +204,7 @@ export async function saveSession(): Promise<void> {
                     vol: padVolumes[i] ?? 0.75,
                     bpm: padBPMs[i] || undefined,
                     sync: padSyncState[i] || undefined,
+                    snap: padSnapToBeat[i] === false ? false : undefined,
                     loopStart: (typeof ls === 'number' && Number.isFinite(ls) && ls >= 0) ? ls : undefined,
                     loopEnd: (typeof le === 'number' && Number.isFinite(le) && le > 0) ? le : undefined,
                 });
@@ -285,7 +292,7 @@ export async function loadSession(): Promise<void> {
         autoMix: { eqCrossfade: boolean; filterSweep: boolean; hpfSweep: boolean; bpmSync: boolean; trackDuration: number; btnDuration: number; enableAI: boolean };
         masterVolume: number | null;
         tempoValue: number | null;
-        pads: Array<{ buf: AudioBuffer | undefined; path: string; vol: number; bpm: number; sync: boolean; ls: number; le: number; wf: unknown }>;
+        pads: Array<{ buf: AudioBuffer | undefined; path: string; vol: number; bpm: number; sync: boolean; snap: boolean | undefined; beats: number[]; est: boolean; ls: number; le: number; wf: unknown }>;
     } | null = null;
     // Generation guard: per-pad loads that time out keep running in the
     // background (no abort). Without this their late resolve overwrites the
@@ -315,6 +322,11 @@ export async function loadSession(): Promise<void> {
                 padVolumes[i] = p.vol;
                 padBPMs[i] = p.bpm;
                 padSyncState[i] = p.sync;
+                if (p.snap === false || p.snap === true) padSnapToBeat[i] = p.snap;
+                else delete padSnapToBeat[i];
+                if (Array.isArray(p.beats)) padBeatPositions[i] = [...p.beats];
+                if (p.est) padBpmEstimated[i] = true;
+                else try { delete padBpmEstimated[i]; } catch { /* ignore */ }
                 padLoopStart[i] = p.ls;
                 padLoopEnd[i] = p.le;
                 try { (padWaveforms as unknown as unknown[])[i] = p.wf; } catch { /* ignore */ }
@@ -394,7 +406,7 @@ export async function loadSession(): Promise<void> {
             return;
         }
         const jsonStr = new TextDecoder().decode(rawData as Uint8Array);
-        const session: SessionData = JSON.parse(jsonStr);
+        const session: SessionData = sanitizeParsedJson(JSON.parse(jsonStr));
 
         // Verify checksum (corruption evidence only — not attacker-proof)
         if (session.signature) {
@@ -425,6 +437,9 @@ export async function loadSession(): Promise<void> {
             vol: padVolumes[i] ?? 0.75,
             bpm: padBPMs[i] ?? 0,
             sync: !!padSyncState[i],
+            snap: (padSnapToBeat[i] === false ? false : undefined) as boolean | undefined,
+            beats: Array.isArray(padBeatPositions[i]) ? [...padBeatPositions[i]] : [],
+            est: !!padBpmEstimated[i],
             ls: padLoopStart[i] ?? -1,
             le: padLoopEnd[i] ?? -1,
             wf: (padWaveforms as unknown as unknown[])[i],
@@ -508,7 +523,10 @@ export async function loadSession(): Promise<void> {
                 padPaths[i] = '';
                 padWaveforms[i] = undefined!;
                 padBPMs[i] = 0;
+                padBeatPositions[i] = [];
                 padSyncState[i] = false;
+                delete padSnapToBeat[i];
+                try { delete padBpmEstimated[i]; } catch { /* ignore */ }
                 padLoopStart[i] = -1;
                 padLoopEnd[i] = -1;
             }
@@ -528,7 +546,8 @@ export async function loadSession(): Promise<void> {
                     continue;
                 }
                 if (loadGen !== sessionLoadGen) break; // rolled back mid-loop — stop writing
-                const orig = loadSampleFromPath(ppath, idx);
+                const sessBpm = typeof (p as SessionPad)?.bpm === 'number' ? (p as SessionPad).bpm : undefined;
+                const orig = loadSampleFromPath(ppath, idx, sessBpm);
                 // Late-resolve guard: the timed-out load keeps decoding in the
                 // background; if it lands after a rollback/newer load, undo the
                 // ghost commit for this pad.
@@ -543,6 +562,11 @@ export async function loadSession(): Promise<void> {
                                 padVolumes[idx] = snap.vol;
                                 padBPMs[idx] = snap.bpm;
                                 padSyncState[idx] = snap.sync;
+                                if (snap.snap === false || snap.snap === true) padSnapToBeat[idx] = snap.snap;
+                                else delete padSnapToBeat[idx];
+                                if (Array.isArray(snap.beats)) padBeatPositions[idx] = [...snap.beats];
+                                if (snap.est) padBpmEstimated[idx] = true;
+                                else try { delete padBpmEstimated[idx]; } catch { /* ignore */ }
                                 padLoopStart[idx] = snap.ls;
                                 padLoopEnd[idx] = snap.le;
                                 try { (padWaveforms as unknown as unknown[])[idx] = snap.wf; } catch { /* ignore */ }
@@ -556,8 +580,14 @@ export async function loadSession(): Promise<void> {
                     const vol = (p as SessionPad).vol;
                     if (typeof vol === 'number' && Number.isFinite(vol)) padVolumes[idx] = Math.min(1, Math.max(0, vol));
                     const bpm = (p as SessionPad).bpm;
-                    if (typeof bpm === 'number' && Number.isFinite(bpm)) padBPMs[idx] = Math.min(300, Math.max(0, bpm));
+                    if (typeof bpm === 'number' && Number.isFinite(bpm)) {
+                        padBPMs[idx] = Math.min(300, Math.max(0, bpm));
+                        // Session BPM overwrites fresh analysis — rebuild grid.
+                        recomputePadBeatGrid(idx);
+                    }
                     if (typeof (p as SessionPad).sync === 'boolean') padSyncState[idx] = (p as SessionPad).sync as boolean;
+                    if (typeof (p as SessionPad).snap === 'boolean') padSnapToBeat[idx] = (p as SessionPad).snap as boolean;
+                    else delete padSnapToBeat[idx];
                     const ls = (p as SessionPad).loopStart;
                     const le = (p as SessionPad).loopEnd;
                     if (typeof ls === 'number' && Number.isFinite(ls) && ls >= 0) padLoopStart[idx] = ls;

@@ -17,6 +17,11 @@ function cleanData(d: unknown): Uint8Array | null {
   return d;
 }
 
+function cleanPcmKey(k: unknown): string | null {
+  if (typeof k !== 'string' || !/^[0-9a-f]{64}$/.test(k)) return null;
+  return k;
+}
+
 contextBridge.exposeInMainWorld('electronAPI', {
   minimize: () => ipcRenderer.send('app:minimize'),
   maximize: () => ipcRenderer.send('app:maximize'),
@@ -72,6 +77,11 @@ contextBridge.exposeInMainWorld('fileSystem', {
     if (!p) return Promise.resolve(null);
     return ipcRenderer.invoke('fs:read-file', p);
   },
+  statFile: (path: string) => {
+    const p = cleanPath(path);
+    if (!p) return Promise.resolve(null);
+    return ipcRenderer.invoke('fs:stat-file', p);
+  },
   consentFile: (path: string) => {
     const p = cleanPath(path);
     if (!p) return Promise.resolve(false);
@@ -115,6 +125,20 @@ contextBridge.exposeInMainWorld('sonetra', {
     return () => {
       ipcRenderer.removeListener('sonetra:restart-status', handler);
     };
+  }
+});
+// Persistent decoded-audio (PCM) disk cache (narrow IPC: hex key + ≤100MB data)
+contextBridge.exposeInMainWorld('pcmCache', {
+  get: (key: string) => {
+    const k = cleanPcmKey(key);
+    if (!k) return Promise.resolve(null);
+    return ipcRenderer.invoke('pcmcache:get', k);
+  },
+  put: (key: string, data: Uint8Array) => {
+    const k = cleanPcmKey(key);
+    const d = cleanData(data);
+    if (!k || !d) return Promise.resolve(false);
+    return ipcRenderer.invoke('pcmcache:put', k, d);
   }
 });
 // Database Bridge

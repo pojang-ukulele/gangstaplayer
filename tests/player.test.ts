@@ -128,6 +128,7 @@ jest.mock('../js/worker-client', () => {
         ...actual,
         detectBPMWorker: jest.fn().mockResolvedValue(120),
         detectBPMWithConfidence: jest.fn().mockResolvedValue({ bpm: 120, confidence: 'high', needsReview: false }),
+        detectBPMResilient: jest.fn().mockResolvedValue({ bpm: 120, confidence: 'high', needsReview: false }),
         resolveBpmPersist: actual.resolveBpmPersist,
         bufferToWaveWorker: jest.fn(),
     };
@@ -394,11 +395,11 @@ describe('Player — guarded functions (no DOM, no crash)', () => {
 
     test('loadTrack with missing BPM + needs-review keeps prior (no 0 write)', async () => {
         // Deck skip-persist path: fixture bpm 0 → confidence gate reachable
-        // only because the mock now provides detectBPMWithConfidence.
+        // only because the mock now provides detectBPMResilient.
         const wc = jest.requireMock('../js/worker-client') as {
-            detectBPMWithConfidence: jest.Mock;
+            detectBPMResilient: jest.Mock;
         };
-        wc.detectBPMWithConfidence.mockResolvedValueOnce({ bpm: null, confidence: 'low', needsReview: true });
+        wc.detectBPMResilient.mockResolvedValueOnce({ bpm: null, confidence: 'low', needsReview: true });
         mockFileSystem.readFile.mockResolvedValueOnce(new ArrayBuffer(1024));
         const mockDecodedBuffer = {
             numberOfChannels: 2,
@@ -414,7 +415,7 @@ describe('Player — guarded functions (no DOM, no crash)', () => {
         await new Promise((r) => setTimeout(r, 0));
         await new Promise((r) => setTimeout(r, 0));
 
-        expect(wc.detectBPMWithConfidence).toHaveBeenCalled();
+        expect(wc.detectBPMResilient).toHaveBeenCalled();
         expect(state.playlist[1].bpm).toBe(0);
         expect(state.masterBPM).toBe(0);
     });

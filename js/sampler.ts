@@ -5,7 +5,7 @@ import { audioCtx, masterGain, resumeAudioContext, ensureAudio } from './audio';
 import { engine } from './audio-engine';
 import { toast } from './toast';
 import { logger } from './logger';
-import { normalizeToArrayBuffer, validateAudioSignature } from './utils';
+import { normalizeToArrayBuffer, sanitizeParsedJson, validateAudioSignature } from './utils';
 import type { FileSystemAPI, ElectronAPI } from './types';
 import { DIALOG_THROTTLED } from './types';
 import { resolveBpmPersist } from './worker-client';
@@ -203,6 +203,58 @@ function computeBeatPositions(bpm: number, duration: number): number[] {
     return positions;
 }
 
+/** Recompute a pad's beat grid from its current BPM + buffer duration.
+ *  Guard: duration must be > 0, otherwise the grid is left untouched.
+ *  Clears stale armed indices (grid moved). */
+export function recomputePadBeatGrid(index: number): void {
+    const bpm = padBPMs[index] ?? 0;
+    const dur = padBuffers[index]?.duration ?? 0;
+    if (!(dur > 0)) return;
+    padBeatPositions[index] = computeBeatPositions(bpm, dur);
+    padArmedBeats[index] = null;
+    try { delete padBpmEstimated[index]; } catch { /* ignore */ }
+}
+
+/** Clear BPM + beat grid so no stale grid survives a failed analysis. */
+export function clearPadBeatGrid(index: number): void {
+    padBPMs[index] = 0;
+    padBeatPositions[index] = [];
+    padArmedBeats[index] = null;
+    padSnappedEdges[index] = null;
+    try { delete padBpmEstimated[index]; } catch { /* ignore */ }
+}
+
+/** Fallback tempo when detection needs review — guarantees a visible grid
+ *  + working Ctrl-snap instead of an empty strip. Priority: prior pad BPM,
+ *  then caller-provided (kit/session/snapshot) BPM, then 120. */
+export const FALLBACK_BPM = 120;
+/** True when a pad's BPM is an estimate (fallback), shown as ~bpm in the strip. */
+export const padBpmEstimated: Record<number, boolean> = {};
+
+function applyBpmFallback(index: number, duration: number, callerBpm?: number): number {
+    if (!(duration > 0)) { clearPadBeatGrid(index); return 0; }
+    const prior = padBPMs[index];
+    let bpm = 0;
+    if (Number.isFinite(prior) && (prior as number) > 0) bpm = prior as number;
+    else if (Number.isFinite(callerBpm as number) && (callerBpm as number) > 0) bpm = callerBpm as number;
+    else bpm = FALLBACK_BPM;
+    bpm = Math.min(300, Math.max(1, bpm));
+    padBPMs[index] = bpm;
+    padBeatPositions[index] = computeBeatPositions(bpm, duration);
+    padArmedBeats[index] = null;
+    padSnappedEdges[index] = null;
+    padBpmEstimated[index] = true;
+    return bpm;
+}
+
+/** Repaint strip (+ loupe when open) after async BPM settles — ug:dataChanged
+ *  has no paint listener, so without this successful detections stay invisible. */
+function refreshPadAfterBpm(index: number): void {
+    try { renderWaveform(index); } catch { /* ignore */ }
+    try { updatePadVisuals(index); } catch { /* ignore */ }
+    try { syncZoomToCommitted(index); } catch { /* ignore */ }
+}
+
 // === SELECTION (active area) HELPERS ===
 
 function clampToBuffer(index: number, t: number): number {
@@ -347,6 +399,7 @@ export function clearPad(index: number): void {
     delete padBPMs[index];
     delete padSyncState[index];
     delete padSnapToBeat[index];
+    try { delete padBpmEstimated[index]; } catch { /* ignore */ }
     padSnappedEdges[index] = null;
     padArmedBeats[index] = null;
     padSelections[index] = null;
@@ -596,12 +649,13 @@ export function renderWaveform(index: number, opts?: { beatBoost?: boolean }): v
         w, h, ink, inkEdge, beatBoost: opts?.beatBoost === true,
     });
 
-    // === 4. BPM tag (tiny, top-left of the strip) ===
+    // === 4. BPM tag (tiny, top-left of the strip; ~ marks estimated grids) ===
     if (padBPMs[index] > 0) {
         ctx.fillStyle = 'rgba(255, 255, 255, 0.65)';
         ctx.font = '8px VT323, monospace';
         ctx.textBaseline = 'top';
-        ctx.fillText(`${padBPMs[index]}bpm`, 3, 2);
+        const tag = padBpmEstimated[index] ? `~${padBPMs[index]}bpm` : `${padBPMs[index]}bpm`;
+        ctx.fillText(tag, 3, 2);
     }
 }
 
@@ -621,35 +675,67 @@ interface WavePaintInput {
     ink: string;
     inkEdge: string;
     beatBoost?: boolean;
+    // Visible window in global seconds for loupe zoom. Envelope data is
+    // pre-resampled to the window; region/beats stay global and are mapped
+    // through xOf so beat math (snap intervals, armed indices) is untouched.
+    view?: { start: number; end: number };
 }
 
 function paintWaveCanvas(ctx: CanvasRenderingContext2D, o: WavePaintInput): void {
     const { data, beats, bpm, duration, region, snapFlags, w, h, ink, inkEdge } = o;
     const midY = h / 2;
     const stepX = w / WAVEFORM_POINTS;
+    // Window mapping: global seconds -> canvas x. Defaults to full duration
+    // so strip callers (no view) render exactly as before.
+    const v0 = (o.view && Number.isFinite(o.view.start)) ? o.view.start : 0;
+    const v1 = (o.view && Number.isFinite(o.view.end) && o.view.end > v0) ? o.view.end : duration;
+    const vSpan = Math.max(1e-9, v1 - v0);
+    const xOf = (t: number): number => ((t - v0) / vSpan) * w;
+    const xVisible = (x: number): boolean => x >= -1 && x <= w + 1;
 
     // === 1. Selection tint (canvas backstop behind the DOM overlay) ===
     if (region && region.end > region.start) {
-        const lsX = (region.start / duration) * w;
-        const leX = (region.end / duration) * w;
-        ctx.fillStyle = 'rgba(188, 19, 254, 0.25)';
-        ctx.fillRect(lsX, 0, leX - lsX, h);
-        ctx.strokeStyle = 'rgba(188, 19, 254, 0.8)';
-        ctx.lineWidth = 1.5;
-        ctx.beginPath();
-        ctx.moveTo(lsX, 0); ctx.lineTo(lsX, h);
-        ctx.moveTo(leX, 0); ctx.lineTo(leX, h);
-        ctx.stroke();
+        const cs = Math.max(region.start, v0);
+        const ce = Math.min(region.end, v1);
+        if (ce > cs) {
+            const lsX = xOf(cs);
+            const leX = xOf(ce);
+            ctx.fillStyle = 'rgba(188, 19, 254, 0.25)';
+            ctx.fillRect(lsX, 0, leX - lsX, h);
+            ctx.strokeStyle = 'rgba(188, 19, 254, 0.8)';
+            ctx.lineWidth = 1.5;
+            ctx.beginPath();
+            ctx.moveTo(lsX, 0); ctx.lineTo(lsX, h);
+            ctx.moveTo(leX, 0); ctx.lineTo(leX, h);
+            ctx.stroke();
+        }
     }
 
-    // === 2. Beat ticks (revealed brighter/taller while Shift is held) ===
+    // === 2. Always-on beat grid (visible whenever beats exist, no modifier
+    // needed) + mid ticks (revealed brighter/taller while Ctrl is held) ===
     if (beats && beats.length > 1) {
         const boost = o.beatBoost === true;
+        // Full-height faint grid lines for every beat + stronger downbeat
+        // every 4th beat. Drawn first so mid ticks + highlights sit on top.
+        for (let i = 0; i < beats.length; i++) {
+            const x = xOf(beats[i]);
+            if (!xVisible(x)) continue;
+            const isDown = (i % 4 === 0);
+            ctx.strokeStyle = boost
+                ? (isDown ? 'rgba(255, 204, 0, 0.85)' : 'rgba(255, 204, 0, 0.6)')
+                : (isDown ? 'rgba(255, 204, 0, 0.45)' : 'rgba(255, 204, 0, 0.28)');
+            ctx.lineWidth = isDown ? (boost ? 1.5 : 1) : 1;
+            ctx.beginPath();
+            ctx.moveTo(x, 0);
+            ctx.lineTo(x, h);
+            ctx.stroke();
+        }
         ctx.strokeStyle = boost ? 'rgba(255, 204, 0, 0.9)' : 'rgba(255, 204, 0, 0.35)';
         ctx.lineWidth = boost ? 1.5 : 1;
         const tickHalf = boost ? 6 : 4;
         for (let i = 0; i < beats.length; i++) {
-            const x = (beats[i] / duration) * w;
+            const x = xOf(beats[i]);
+            if (!xVisible(x)) continue;
             ctx.beginPath();
             ctx.moveTo(x, midY - tickHalf);
             ctx.lineTo(x, midY + tickHalf);
@@ -668,15 +754,16 @@ function paintWaveCanvas(ctx: CanvasRenderingContext2D, o: WavePaintInput): void
                 let x = -1;
                 if (ivHi > 0) {
                     const bi = Math.min(beats.length - 1, Math.max(0, Math.round(t / ivHi)));
-                    x = (beats[bi] / duration) * w;
+                    x = xOf(beats[bi]);
                 } else {
                     let best = 0, bd = Infinity;
                     for (let i = 0; i < beats.length; i++) {
                         const d = Math.abs(beats[i] - t);
                         if (d < bd) { bd = d; best = i; }
                     }
-                    x = (beats[best] / duration) * w;
+                    x = xOf(beats[best]);
                 }
+                if (!xVisible(x)) continue;
                 ctx.beginPath();
                 ctx.moveTo(x, midY - 6);
                 ctx.lineTo(x, midY + 6);
@@ -692,7 +779,8 @@ function paintWaveCanvas(ctx: CanvasRenderingContext2D, o: WavePaintInput): void
                 ctx.strokeStyle = 'rgba(255, 224, 130, 0.9)';
                 ctx.lineWidth = 2;
                 for (let i = a0; i <= a1; i++) {
-                    const x = (beats[i] / duration) * w;
+                    const x = xOf(beats[i]);
+                    if (!xVisible(x)) continue;
                     ctx.beginPath();
                     ctx.moveTo(x, midY - 6);
                     ctx.lineTo(x, midY + 6);
@@ -803,6 +891,14 @@ let _zoomPadL = 0;
 let _zoomPadR = 0;
 // True while a strip/loupe gesture owns the window mouse handlers.
 let _gestureActive = false;
+// Loupe zoom view: visible window as fractions of total duration.
+// Reset to full on openZoom()/closeZoom(); narrowed by onZoomWheel.
+let _zoomView = { start: 0, end: 1 };
+// Last live drag preview (global seconds) so a wheel-zoom mid-drag can
+// repaint the preview instead of falling back to committed state.
+let _zoomLive: { index: number; start: number; end: number; startSnapped: boolean; endSnapped: boolean; armed: boolean } | null = null;
+// Base loupe title (without the zoom factor suffix) set at openZoom().
+let _zoomBaseTitle = '';
 
 function ensureZoomDom(): ZoomDom | null {
     if (_zoomDom) return _zoomDom;
@@ -819,6 +915,11 @@ function ensureZoomDom(): ZoomDom | null {
         if (box.dataset.ugZoomDown !== '1') {
             box.dataset.ugZoomDown = '1';
             box.addEventListener('mousedown', onZoomBoxDown);
+        }
+        if (box.dataset.ugZoomWheel !== '1') {
+            box.dataset.ugZoomWheel = '1';
+            // Non-passive so preventDefault() stops page scroll while zooming.
+            box.addEventListener('wheel', onZoomWheel, { passive: false });
         }
         return _zoomDom;
     } catch { return null; }
@@ -840,7 +941,12 @@ function onZoomBoxDown(e: MouseEvent): void {
         if (!wave) return;
         const lr = z.canvas.getBoundingClientRect();
         if (lr.width <= 0) return;
-        const frac = Math.min(1, Math.max(0, (e.clientX - lr.left) / lr.width));
+        const winFrac = Math.min(1, Math.max(0, (e.clientX - lr.left) / lr.width));
+        // Loupe canvas shows the zoom window, not full duration — convert to
+        // global frac so the synth strip press lands in the same space as
+        // frac0/drag cur (both global once onMove converts back).
+        const span = Math.max(1e-6, _zoomView.end - _zoomView.start);
+        const frac = Math.min(1, Math.max(0, _zoomView.start + winFrac * span));
         const sr = wave.getBoundingClientRect();
         if (sr.width <= 0) return;
         e.stopPropagation();
@@ -897,10 +1003,14 @@ function openZoom(index: number, cx: number, cy: number, stripW: number): void {
     z.box.style.top = top + 'px';
     z.body.style.height = zh + 'px';
     const bpm = padBPMs[index] ?? 0;
-    z.title.textContent = `PAD ${String(index + 1).padStart(2, '0')}${bpm > 0 ? ` • ${bpm}BPM` : ''} • SHIFT ZOOM • CTRL SNAP`;
+    _zoomBaseTitle = `PAD ${String(index + 1).padStart(2, '0')}${bpm > 0 ? ` • ${bpm}BPM` : ''} • SHIFT ZOOM • CTRL SNAP`;
+    z.title.textContent = _zoomBaseTitle;
     z.root.classList.add('active');
     z.root.setAttribute('aria-hidden', 'false');
     _zoomIndex = index;
+    // Fresh loupe always starts at full duration; wheel narrows from here.
+    _zoomView = { start: 0, end: 1 };
+    _zoomLive = null;
     try {
         const cs = getComputedStyle(z.body);
         _zoomPadL = Math.max(0, parseFloat(cs.paddingLeft) || 0);
@@ -912,7 +1022,9 @@ function openZoom(index: number, cx: number, cy: number, stripW: number): void {
     mirrorZoomOverlay();
 }
 
-/** Repaint the loupe canvas from committed state (theme vars read off the strip). */
+/** Repaint the loupe canvas from committed state (theme vars read off the strip).
+ *  Window-aware: the envelope is resampled to the zoom view so zoom visibly
+ *  magnifies; region/beats stay global and map through the view window. */
 function paintZoomCanvas(index: number): void {
     if (_zoomIndex !== index) return;
     const z = _zoomDom;
@@ -943,16 +1055,20 @@ function paintZoomCanvas(index: number): void {
             if (e2) inkEdge = e2;
         }
     } catch { /* fallback ink */ }
+    const view = zoomViewSeconds(duration);
     paintWaveCanvas(ctx, {
-        data, beats: padBeatPositions[index], bpm: padBPMs[index] ?? 0, duration,
+        data: resampleWindowedPeaks(data, _zoomView.start, _zoomView.end),
+        beats: padBeatPositions[index], bpm: padBPMs[index] ?? 0, duration,
         region: getActiveRegion(index), snapFlags: padSnappedEdges[index],
         armed: padArmedBeats[index] ?? null,
-        w, h, ink, inkEdge, beatBoost: true,
+        w, h, ink, inkEdge, beatBoost: true, view,
     });
 }
 
-/** Mirror a seconds-range onto the loupe overlay (same % math as the strip,
- *  offset for the green side padding so it tracks the inset canvas). */
+/** Mirror a global seconds-range onto the loupe overlay, mapped into the
+ *  zoom window (same % math as the strip, offset for the green side padding
+ *  so it tracks the inset canvas). Clipped to the window; hidden when the
+ *  range lies fully outside it. */
 function mirrorZoomSelection(startSec: number, endSec: number, snapped: boolean, armed = false): void {
     const z = _zoomDom;
     if (!z || _zoomIndex < 0) return;
@@ -960,10 +1076,18 @@ function mirrorZoomSelection(startSec: number, endSec: number, snapped: boolean,
     if (!(duration > 0)) return;
     const W = z.body.clientWidth;
     if (W <= 0) return;
+    const span = Math.max(1e-6, _zoomView.end - _zoomView.start);
+    const sFrac = (startSec / duration - _zoomView.start) / span;
+    const eFrac = (endSec / duration - _zoomView.start) / span;
+    // Fully outside the window — nothing to mirror.
+    if (eFrac <= 0 || sFrac >= 1) { z.sel.classList.add('hidden'); return; }
+    const cs = Math.max(0, sFrac);
+    const ce = Math.min(1, eFrac);
+    if (!(ce > cs)) { z.sel.classList.add('hidden'); return; }
     const inner = Math.max(1, W - _zoomPadL - _zoomPadR);
     z.sel.classList.remove('hidden');
-    z.sel.style.left = ((_zoomPadL + (startSec / duration) * inner) / W * 100).toFixed(2) + '%';
-    z.sel.style.width = (((endSec - startSec) / duration) * inner / W * 100).toFixed(2) + '%';
+    z.sel.style.left = ((_zoomPadL + cs * inner) / W * 100).toFixed(2) + '%';
+    z.sel.style.width = (((ce - cs)) * inner / W * 100).toFixed(2) + '%';
     z.sel.classList.toggle('snapped', snapped);
     z.sel.classList.toggle('armed', armed);
 }
@@ -978,8 +1102,113 @@ function mirrorZoomOverlay(): void {
     mirrorZoomSelection(region.start, region.end, !!(flags && (flags.start || flags.end)), !!padArmedBeats[_zoomIndex]);
 }
 
+/** Repaint strip + loupe canvases with the live drag preview so the old
+ *  committed tint never shows alongside the new preview (single selection). */
+function paintPreviewCanvases(index: number, startSec: number, endSec: number, startSnapped: boolean, endSnapped: boolean, armedLive: boolean): void {
+    try {
+        const s = Math.min(startSec, endSec);
+        const e = Math.max(startSec, endSec);
+        const region = { start: s, end: e };
+        const snapFlags = (startSnapped || endSnapped) ? { start: startSnapped, end: endSnapped } : null;
+        let armedPreview: { from: number; to: number } | null = null;
+        if (armedLive) {
+            try {
+                const bi1 = beatIndexForTime(index, s);
+                const bi2 = beatIndexForTime(index, e);
+                if (bi1 !== null && bi2 !== null) armedPreview = { from: Math.min(bi1, bi2), to: Math.max(bi1, bi2) };
+            } catch { armedPreview = null; }
+        }
+        const buf = padBuffers[index];
+        const data = padWaveforms[index];
+        const duration = buf ? buf.duration : 0;
+        if (!buf || !(duration > 0) || !data || data.length < 2) return;
+        const beats = padBeatPositions[index];
+        const bpm = padBPMs[index] ?? 0;
+        const wrapper = padGrid?.children[index] as HTMLElement | undefined;
+        const strip = wrapper?.querySelector('.pad-wave') as HTMLElement | null;
+        const canvas = wrapper?.querySelector('.pad-canvas') as HTMLCanvasElement | null;
+        if (strip && canvas) {
+            const ctx = canvas.getContext('2d');
+            if (ctx) {
+                const dpr = window.devicePixelRatio || 1;
+                const w = strip.clientWidth;
+                const h = strip.clientHeight;
+                if (w > 0 && h > 0) {
+                    let ink = '#ff5c39';
+                    let inkEdge = '#c93a1e';
+                    try {
+                        const v = getComputedStyle(strip).getPropertyValue('--pad-wave-ink').trim();
+                        if (v) ink = v;
+                        const e2 = getComputedStyle(strip).getPropertyValue('--pad-wave-ink-edge').trim();
+                        if (e2) inkEdge = e2;
+                    } catch { /* fallback ink */ }
+                    canvas.width = w * dpr;
+                    canvas.height = h * dpr;
+                    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+                    ctx.clearRect(0, 0, w, h);
+                    paintWaveCanvas(ctx, {
+                        data, beats, bpm, duration,
+                        region, snapFlags, armed: armedPreview ?? (padArmedBeats[index] && !armedLive ? padArmedBeats[index] : null),
+                        w, h, ink, inkEdge, beatBoost: strip.classList.contains('show-beats'),
+                    });
+                    if (bpm > 0) {
+                        ctx.fillStyle = 'rgba(255, 255, 255, 0.65)';
+                        ctx.font = '8px VT323, monospace';
+                        ctx.textBaseline = 'top';
+                        ctx.fillText(`${padBpmEstimated[index] ? '~' : ''}${bpm}bpm`, 3, 2);
+                    }
+                }
+            }
+        }
+        if (isZoomOpenFor(index) && _zoomDom) {
+            const z = _zoomDom;
+            const zctx = z.canvas.getContext('2d');
+            if (zctx) {
+                const dpr = window.devicePixelRatio || 1;
+                const w = z.canvas.clientWidth;
+                const h = z.canvas.clientHeight;
+                if (w > 0 && h > 0) {
+                    let ink = '#ff5c39';
+                    let inkEdge = '#c93a1e';
+                    try {
+                        if (strip) {
+                            const v = getComputedStyle(strip).getPropertyValue('--pad-wave-ink').trim();
+                            if (v) ink = v;
+                            const e2 = getComputedStyle(strip).getPropertyValue('--pad-wave-ink-edge').trim();
+                            if (e2) inkEdge = e2;
+                        }
+                    } catch { /* fallback ink */ }
+                    z.canvas.width = w * dpr;
+                    z.canvas.height = h * dpr;
+                    zctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+                    zctx.clearRect(0, 0, w, h);
+                    paintWaveCanvas(zctx, {
+                        data: resampleWindowedPeaks(data, _zoomView.start, _zoomView.end),
+                        beats, bpm, duration,
+                        region, snapFlags, armed: armedPreview,
+                        w, h, ink, inkEdge, beatBoost: true,
+                        view: zoomViewSeconds(duration),
+                    });
+                }
+            }
+        }
+    } catch { /* preview repaint is best-effort */ }
+}
+
+/** Re-sync the loupe canvas + overlay from committed state (call after
+ *  renderWaveform on commit / discard so strip and zoom never diverge). */
+function syncZoomToCommitted(index: number): void {
+    try {
+        if (!isZoomOpenFor(index)) return;
+        paintZoomCanvas(index);
+        mirrorZoomOverlay();
+    } catch { /* best-effort */ }
+}
+
 function closeZoom(): void {
     disarmZoomSentinel();
+    _zoomView = { start: 0, end: 1 };
+    _zoomLive = null;
     if (!_zoomDom) { _zoomIndex = -1; return; }
     _zoomDom.root.classList.remove('active');
     _zoomDom.root.setAttribute('aria-hidden', 'true');
@@ -988,6 +1217,98 @@ function closeZoom(): void {
 
 function isZoomOpenFor(index: number): boolean {
     return _zoomIndex === index && !!_zoomDom?.root.classList.contains('active');
+}
+
+/** Zoom view window in global seconds for a buffer duration. */
+function zoomViewSeconds(duration: number): { start: number; end: number } {
+    return { start: _zoomView.start * duration, end: _zoomView.end * duration };
+}
+
+/** Resample full-duration peak data into WAVEFORM_POINTS bins covering the
+ *  [startF, endF) fraction window. Wide windows take per-bin maxima (peak
+ *  preserving); magnified windows lerp between source bins (smooth). */
+function resampleWindowedPeaks(data: Uint8Array, startF: number, endF: number): Uint8Array {
+    const N = WAVEFORM_POINTS;
+    const span = Math.max(1e-6, endF - startF);
+    // Fast path: full view renders the cached peaks untouched.
+    if (startF <= 0 && endF >= 1) return data;
+    const isDual = data.length >= N * 2;
+    const srcLen = isDual ? N : Math.min(N, data.length);
+    const topSrc = (j: number): number => data[Math.min(srcLen - 1, Math.max(0, j))] ?? 0;
+    const botSrc = (j: number): number => (isDual ? data[N + Math.min(N - 1, Math.max(0, j))] : topSrc(j)) ?? 0;
+    const out = new Uint8Array(N * 2);
+    for (let i = 0; i < N; i++) {
+        const srcStart = (startF + (i / N) * span) * N;
+        const srcEnd = (startF + ((i + 1) / N) * span) * N;
+        if (srcEnd - srcStart >= 1) {
+            let mt = 0, mb = 0;
+            const j0 = Math.max(0, Math.floor(srcStart));
+            const j1 = Math.min(srcLen - 1, Math.ceil(srcEnd) - 1);
+            for (let j = j0; j <= j1; j++) {
+                const t = topSrc(j), b = botSrc(j);
+                if (t > mt) mt = t;
+                if (b > mb) mb = b;
+            }
+            out[i] = mt;
+            out[N + i] = mb;
+        } else {
+            const mid = Math.min(srcLen - 1, Math.max(0, (srcStart + srcEnd) / 2));
+            const j0 = Math.floor(mid);
+            const f = mid - j0;
+            const j1 = Math.min(srcLen - 1, j0 + 1);
+            out[i] = Math.round(topSrc(j0) + (topSrc(j1) - topSrc(j0)) * f);
+            out[N + i] = Math.round(botSrc(j0) + (botSrc(j1) - botSrc(j0)) * f);
+        }
+    }
+    return out;
+}
+
+/** Mouse-wheel zoom inside the open loupe, anchored at the pointer: the
+ *  global time under the cursor stays under the cursor across the zoom. */
+function onZoomWheel(e: WheelEvent): void {
+    try {
+        const idx = _zoomIndex;
+        if (idx < 0 || !isZoomOpenFor(idx) || !_zoomDom) return;
+        const buf = padBuffers[idx];
+        const duration = buf ? buf.duration : 0;
+        if (!(duration > 0)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        const rect = _zoomDom.canvas.getBoundingClientRect();
+        if (rect.width <= 0) return;
+        const cursorFrac = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+        const span = Math.max(1e-6, _zoomView.end - _zoomView.start);
+        // Global time (fraction) under the cursor before the zoom.
+        const t = _zoomView.start + cursorFrac * span;
+        // ~1.25x per 100 deltaY (one wheel notch); continuous so trackpads
+        // and ctrl+wheel pinch deltas scale smoothly. deltaY > 0 zooms out.
+        const norm = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
+        if (!Number.isFinite(norm) || norm === 0) return;
+        const factor = Math.pow(1.25, norm / 100);
+        if (!Number.isFinite(factor) || factor <= 0) return;
+        const newSpan = Math.min(1.0, Math.max(0.02, span * factor));
+        let newStart = t - cursorFrac * newSpan;
+        newStart = Math.min(Math.max(0, newStart), 1 - newSpan);
+        _zoomView = { start: newStart, end: newStart + newSpan };
+        // Zoom factor badge (1.0x hidden at full view).
+        try {
+            const zx = 1 / newSpan;
+            _zoomDom.title.textContent = _zoomBaseTitle + (zx > 1.01 ? ` • ${zx.toFixed(1)}X` : '');
+        } catch { /* title is best-effort */ }
+        // Repaint from the live drag preview when a gesture owns one (keeps
+        // the single-selection invariant — preview only, no committed tint);
+        // otherwise re-sync from committed state.
+        const live = (_zoomLive && _zoomLive.index === idx && _gestureActive) ? _zoomLive : null;
+        if (live) {
+            paintPreviewCanvases(idx, live.start, live.end, live.startSnapped, live.endSnapped, live.armed);
+            mirrorZoomSelection(live.start, live.end, live.startSnapped || live.endSnapped, live.armed);
+        } else {
+            paintZoomCanvas(idx);
+            mirrorZoomOverlay();
+        }
+    } catch (err) {
+        logger.debug(`[Sampler] Loupe wheel zoom skipped`, err);
+    }
 }
 
 function setPadLoading(index: number, loading: boolean, gen?: number): void {
@@ -1085,22 +1406,35 @@ export async function loadSampleFile(file: File, index: number): Promise<void> {
         updatePadVisuals(index);
 
         // BPM failure must not masquerade as sample-load failure (buffer is playable).
+        // needsReview falls back to an estimated grid (prior > 120) so lines
+        // + Ctrl-snap always work; strip is repainted on every branch.
         if (detectBPMFn) {
             try {
                 const raw = await detectBPMFn(audioBuffer);
                 if (gen !== _padLoadGen[index]) return;
                 const decision = resolveBpmPersist(raw, padBPMs[index]);
                 if (!decision.persisted || decision.bpm === undefined) {
-                    logger.warn(`[Sampler] Pad ${index} BPM needs review — kept prior value`);
+                    const fb = applyBpmFallback(index, audioBuffer.duration);
+                    logger.warn(`[Sampler] Pad ${index} BPM needs review — estimated grid @${fb}bpm`);
+                    toast.info(`PAD ${index + 1} BPM UNCERTAIN — ESTIMATED GRID, SNAP ON`);
                         } else {
                             padBPMs[index] = decision.bpm;
                             padBeatPositions[index] = computeBeatPositions(decision.bpm, audioBuffer.duration);
                             padArmedBeats[index] = null; // grid moved — stale indices
+                            try { delete padBpmEstimated[index]; } catch { /* ignore */ }
                             logger.info(`[Sampler] Pad ${index} BPM: ${decision.bpm}, beats: ${padBeatPositions[index].length}`);
                         }
+                refreshPadAfterBpm(index);
             } catch (bpmErr) {
-                logger.warn(`[Sampler] Pad ${index} BPM detection skipped`, bpmErr);
+                const fb = applyBpmFallback(index, audioBuffer.duration);
+                logger.warn(`[Sampler] Pad ${index} BPM detection skipped — estimated grid @${fb}bpm`, bpmErr);
+                toast.info(`PAD ${index + 1} BPM UNCERTAIN — ESTIMATED GRID, SNAP ON`);
+                refreshPadAfterBpm(index);
             }
+        } else {
+            const fb = applyBpmFallback(index, audioBuffer.duration);
+            logger.warn(`[Sampler] Pad ${index} no BPM detector — estimated grid @${fb}bpm`);
+            refreshPadAfterBpm(index);
         }
         document.dispatchEvent(new CustomEvent('ug:dataChanged'));
     } catch (e: any) {
@@ -1112,7 +1446,7 @@ export async function loadSampleFile(file: File, index: number): Promise<void> {
     }
 }
 
-export async function loadSampleFromPath(path: string, index: number): Promise<boolean> {
+export async function loadSampleFromPath(path: string, index: number, callerBpm?: number): Promise<boolean> {
     const gen = ++_padLoadGen[index];
     setPadLoading(index, true, gen);
     let slot = false;
@@ -1177,21 +1511,34 @@ export async function loadSampleFromPath(path: string, index: number): Promise<b
         padLoopEnd[index] = -1;
         logger.info(`[Sampler] Pad ${index}: Buffer set (${audioBuffer.duration.toFixed(2)}s, ${audioBuffer.sampleRate}Hz)`);
         updatePadVisuals(index);
+        // needsReview falls back to an estimated grid (prior > caller > 120)
+        // so lines + Ctrl-snap always work; strip repainted on every branch.
         if (detectBPMFn) {
             try {
                 const raw = await detectBPMFn(audioBuffer);
                 if (gen !== _padLoadGen[index]) return true;
                 const decision = resolveBpmPersist(raw, padBPMs[index]);
                 if (!decision.persisted || decision.bpm === undefined) {
-                    logger.warn(`[Sampler] Pad ${index} BPM needs review — kept prior value`);
+                    const fb = applyBpmFallback(index, audioBuffer.duration, callerBpm);
+                    logger.warn(`[Sampler] Pad ${index} BPM needs review — estimated grid @${fb}bpm`);
+                    toast.info(`PAD ${index + 1} BPM UNCERTAIN — ESTIMATED GRID, SNAP ON`);
                 } else {
                     padBPMs[index] = decision.bpm;
                     padBeatPositions[index] = computeBeatPositions(decision.bpm, audioBuffer.duration);
                     padArmedBeats[index] = null; // grid moved — stale indices
+                    try { delete padBpmEstimated[index]; } catch { /* ignore */ }
                 }
+                refreshPadAfterBpm(index);
             } catch (bpmErr) {
-                logger.warn(`[Sampler] Pad ${index} BPM detection skipped`, bpmErr);
+                const fb = applyBpmFallback(index, audioBuffer.duration, callerBpm);
+                logger.warn(`[Sampler] Pad ${index} BPM detection skipped — estimated grid @${fb}bpm`, bpmErr);
+                toast.info(`PAD ${index + 1} BPM UNCERTAIN — ESTIMATED GRID, SNAP ON`);
+                refreshPadAfterBpm(index);
             }
+        } else {
+            const fb = applyBpmFallback(index, audioBuffer.duration, callerBpm);
+            logger.warn(`[Sampler] Pad ${index} no BPM detector — estimated grid @${fb}bpm`);
+            refreshPadAfterBpm(index);
         }
         document.dispatchEvent(new CustomEvent('ug:dataChanged'));
         return true;
@@ -1422,7 +1769,7 @@ export function createPadGrid(): void {
 }
 
 function escapeAttr(s: string): string {
-    return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/`/g, '&#96;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/`/g, '&#96;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\//g, '&#x2F;');
 }
 
 function renderPad(index: number, existing?: HTMLElement): HTMLElement {
@@ -1582,10 +1929,10 @@ function renderPad(index: number, existing?: HTMLElement): HTMLElement {
                 // Ctrl keydown/keyup). Shift owns the loupe lifetime: open
                 // while held; mouseup commits but never closes (re-drags
                 // welcome); closes only on Shift release / blur / Escape.
-                // Ctrl owns beat mode: markers + snap appear only while it
-                // is ALSO held; release returns to free selection, loupe stays.
+                // Ctrl owns beat mode: markers + snap on Ctrl alone (loupe
+                // stays Shift-gated); release returns to free selection.
                 const syncModifiers = (): void => {
-                    setShiftReveal(shiftHeld && ctrlHeld && isSnapEnabled(index));
+                    setShiftReveal(ctrlHeld && isSnapEnabled(index));
                     if (shiftHeld && (mode === 'pending' || mode === 'drag')) openZoomHere();
                     else if (!shiftHeld) closeZoomIfOurs();
                 };
@@ -1604,20 +1951,31 @@ function renderPad(index: number, existing?: HTMLElement): HTMLElement {
                     const aSec = aFrac * buf.duration;
                     const bSec = bFrac * buf.duration;
                     selEl.classList.remove('hidden');
-                    // Beat mode needs BOTH modifiers; Shift alone stays free.
-                    if (shift && ctrl && isSnapEnabled(index)) {
-                        const q = quantizeSelectionToBeat(index, aSec, bSec, rectW, buf.duration);
+                    // Ctrl-alone beat mode; Shift only owns the loupe.
+                    if (ctrl && isSnapEnabled(index)) {
+                        // Loupe pixels cover only the zoom window, so scale the
+                        // snap radius back to full-duration terms (12px in
+                        // loupe space = 12*span seconds, not 12*duration).
+                        let qW = rectW;
+                        if (isZoomOpenFor(index)) {
+                            const sp = Math.max(1e-6, _zoomView.end - _zoomView.start);
+                            if (sp < 1) qW = rectW / sp;
+                        }
+                        const q = quantizeSelectionToBeat(index, aSec, bSec, qW, buf.duration);
                         // Ctrl makes the snapped span stick: live armed look
                         // while held; commit persists it (both edges on beats).
                         const armedLive = ctrl && q.startSnapped && q.endSnapped;
                         lastPreview = { ...q, armed: armedLive };
+                        _zoomLive = { index, ...lastPreview };
                         selEl.style.left = ((q.start / buf.duration) * 100).toFixed(2) + '%';
                         selEl.style.width = (((q.end - q.start) / buf.duration) * 100).toFixed(2) + '%';
                         selEl.classList.toggle('snapped', q.startSnapped || q.endSnapped);
                         selEl.classList.toggle('armed', armedLive);
                         if (isZoomOpenFor(index)) mirrorZoomSelection(q.start, q.end, q.startSnapped || q.endSnapped, armedLive);
+                        paintPreviewCanvases(index, q.start, q.end, q.startSnapped, q.endSnapped, armedLive);
                     } else {
                         lastPreview = { start: Math.min(aSec, bSec), end: Math.max(aSec, bSec), startSnapped: false, endSnapped: false, armed: false };
+                        _zoomLive = { index, ...lastPreview };
                         const a = Math.min(aFrac, bFrac);
                         const b = Math.max(aFrac, bFrac);
                         selEl.style.left = (a * 100).toFixed(2) + '%';
@@ -1625,6 +1983,7 @@ function renderPad(index: number, existing?: HTMLElement): HTMLElement {
                         selEl.classList.remove('snapped');
                         selEl.classList.remove('armed');
                         if (isZoomOpenFor(index)) mirrorZoomSelection(lastPreview.start, lastPreview.end, false, false);
+                        paintPreviewCanvases(index, lastPreview.start, lastPreview.end, false, false, false);
                     }
                 };
 
@@ -1667,12 +2026,18 @@ function renderPad(index: number, existing?: HTMLElement): HTMLElement {
                     }
                     // While the loupe is open it owns the coordinate space
                     // (inset canvas = finer control); otherwise the strip does.
+                    // Loupe x is window-relative — convert to the global frac
+                    // (viewStart + win*span) so frac0 (global, from the strip
+                    // press or the converted synth path) and cur share a space
+                    // through applyPreview/commit.
                     const zoomOpen = isZoomOpenFor(index);
                     let r: DOMRect;
                     if (zoomOpen && _zoomDom) {
                         r = _zoomDom.canvas.getBoundingClientRect() as DOMRect;
                         if (r.width <= 0) return;
-                        cur = Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width));
+                        const win = Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width));
+                        const span = Math.max(1e-6, _zoomView.end - _zoomView.start);
+                        cur = Math.min(1, Math.max(0, _zoomView.start + win * span));
                     } else {
                         r = wave.getBoundingClientRect();
                         if (r.width <= 0) return;
@@ -1701,6 +2066,7 @@ function renderPad(index: number, existing?: HTMLElement): HTMLElement {
                         // (and any armed mark).
                         logger.debug(`[Sampler] Pad ${index} drag discarded (${mode === 'pending' ? 'no-move-click' : `span-${((b - a) * buf.duration).toFixed(3)}s-under-0.02s`}) — selection kept`);
                         renderWaveform(index);
+                        syncZoomToCommitted(index);
                         return;
                     }
                     try {
@@ -1718,10 +2084,13 @@ function renderPad(index: number, existing?: HTMLElement): HTMLElement {
                         if (!(eSec > sSec) || (eSec - sSec) < 0.02) {
                             logger.debug(`[Sampler] Pad ${index} drag discarded (${!(eSec > sSec) ? 'collapsed-span' : `span-${(eSec - sSec).toFixed(3)}s-under-0.02s`}) — selection kept`);
                             renderWaveform(index);
+                            syncZoomToCommitted(index);
                             return;
                         }
                         const sS = !!pv?.startSnapped, sE = !!pv?.endSnapped;
-                        padSnappedEdges[index] = (sS || sE) ? { start: sS, end: sE } : null;
+                        // Ctrl-alone edge glow (no Shift requirement); release
+                        // before commit clears it.
+                        padSnappedEdges[index] = (ctrlAtCommit && (sS || sE)) ? { start: sS, end: sE } : null;
                         if (shiftAtCommit && ctrlAtCommit && sS && sE && isSnapEnabled(index)) {
                             // Shift+Ctrl commit: arm the snapped beat-span as the
                             // persistent active region (hold-to-loop target).
@@ -1747,10 +2116,13 @@ function renderPad(index: number, existing?: HTMLElement): HTMLElement {
                             } else if (shiftAtCommit && ctrlAtCommit) {
                                 const why = (!sS || !sE) ? 'edges-off-grid' : 'no-beat-grid';
                                 logger.debug(`[Sampler] Pad ${index} arm skipped (${why}) — plain selection kept`);
+                            } else if (ctrlAtCommit && sS && sE) {
+                                logger.debug(`[Sampler] Pad ${index} arm skipped (shift-released) — snapped edges kept`);
                             }
                             padArmedBeats[index] = null;
                         }
                         setPadSelection(index, sSec, eSec);
+                        syncZoomToCommitted(index);
                     } catch (err) {
                         logger.error(`[Sampler] Waveform select failed for pad ${index}:`, err);
                     }
@@ -1770,6 +2142,9 @@ function renderPad(index: number, existing?: HTMLElement): HTMLElement {
                 const cleanupDrag = (): void => {
                     if (holdTimer) { clearTimeout(holdTimer); holdTimer = null; }
                     _gestureActive = false;
+                    // Live preview dies with the gesture — a later wheel zoom
+                    // repaints from committed state (wheel handler checks this).
+                    if (_zoomLive && _zoomLive.index === index) _zoomLive = null;
                     wave.classList.remove('show-beats');
                     shiftReveal = false;
                     wave.removeEventListener('mouseleave', onStripLeave);
@@ -2052,18 +2427,33 @@ async function startRecording(index: number): Promise<void> {
                 renderWaveform(index);
                 updatePadVisuals(index);
                 // Recorded pads previously kept stale waveform/BPM — SYNC stayed dead.
+                // needsReview falls back to an estimated grid; repaint every branch.
                 if (detectBPMFn) {
                     try {
                         const raw = await detectBPMFn(decodedBuffer);
                         const decision = resolveBpmPersist(raw, padBPMs[index]);
                         if (!decision.persisted || decision.bpm === undefined) {
-                            logger.warn(`[Sampler] Pad ${index} BPM needs review — kept prior value`);
+                            const fb = applyBpmFallback(index, decodedBuffer.duration);
+                            logger.warn(`[Sampler] Pad ${index} BPM needs review — estimated grid @${fb}bpm`);
+                            toast.info(`PAD ${index + 1} BPM UNCERTAIN — ESTIMATED GRID, SNAP ON`);
                         } else {
                             padBPMs[index] = decision.bpm;
                             padBeatPositions[index] = computeBeatPositions(decision.bpm, decodedBuffer.duration);
                             padArmedBeats[index] = null; // grid moved — stale indices
+                            try { delete padBpmEstimated[index]; } catch { /* ignore */ }
                         }
-                    } catch { /* BPM is best-effort */ }
+                        refreshPadAfterBpm(index);
+                    } catch {
+                        const fb = applyBpmFallback(index, decodedBuffer.duration);
+                        logger.warn(`[Sampler] Pad ${index} BPM detection skipped — estimated grid @${fb}bpm`);
+                        toast.info(`PAD ${index + 1} BPM UNCERTAIN — ESTIMATED GRID, SNAP ON`);
+                        refreshPadAfterBpm(index);
+                        /* BPM is best-effort */
+                    }
+                } else {
+                    const fb = applyBpmFallback(index, decodedBuffer.duration);
+                    logger.warn(`[Sampler] Pad ${index} no BPM detector — estimated grid @${fb}bpm`);
+                    refreshPadAfterBpm(index);
                 }
                 document.dispatchEvent(new CustomEvent('ug:dataChanged'));
                 logger.debug(`[Sampler] Recording on pad ${index} successful`);
@@ -2231,8 +2621,11 @@ async function loadKitDialog(): Promise<void> {
         
         const data = await fsBridgeRef.readFile(path);
         if (!data) { toast.error("FAILED TO LOAD KIT"); return; }
+        const rawLen = (data as unknown as { byteLength?: number; length?: number })?.byteLength
+            ?? (data as unknown as { length?: number })?.length ?? 0;
+        if (rawLen > 25 * 1024 * 1024) { toast.error("KIT FILE TOO LARGE"); return; }
         const jsonStr = new TextDecoder().decode(data);
-        const kit = JSON.parse(jsonStr);
+        const kit = sanitizeParsedJson(JSON.parse(jsonStr));
         
         if (kit.pads && Array.isArray(kit.pads)) {
             // Sequential loads with a shared budget — the old parallel
@@ -2254,7 +2647,8 @@ async function loadKitDialog(): Promise<void> {
                 const ppath = typeof (p as KitPad)?.path === 'string' ? (p as KitPad).path.slice(0, 32760) : '';
                 if (!ppath || !Number.isInteger(idx) || idx < 0 || idx >= NUM_PADS) continue;
                 try {
-                    const ok = await withTimeout(loadSampleFromPath(ppath, idx), 20000);
+                    const kitBpm = typeof (p as KitPad)?.bpm === 'number' ? (p as KitPad).bpm : undefined;
+                    const ok = await withTimeout(loadSampleFromPath(ppath, idx, kitBpm), 20000);
                     if (!ok) {
                         logger.warn(`[Sampler] Kit pad ${idx} load failed (${ppath})`);
                         failed.push(idx);
@@ -2275,6 +2669,9 @@ async function loadKitDialog(): Promise<void> {
                 }
                 if (typeof p.bpm === 'number' && Number.isFinite(p.bpm)) {
                     padBPMs[idx] = Math.min(300, Math.max(0, p.bpm));
+                    // Kit BPM overwrites fresh analysis — rebuild the grid from
+                    // the restored value (guard duration>0 inside helper).
+                    recomputePadBeatGrid(idx);
                 }
                 if (typeof p.sync === 'boolean') padSyncState[idx] = p.sync;
                 if (typeof p.snap === 'boolean') padSnapToBeat[idx] = p.snap;
@@ -2306,6 +2703,7 @@ async function loadKitDialog(): Promise<void> {
                 delete padBPMs[i];
                 delete padSyncState[i];
                 delete padSnapToBeat[i];
+                try { delete padBpmEstimated[i]; } catch { /* ignore */ }
                 padSnappedEdges[i] = null;
                 padArmedBeats[i] = null;
                 padSelections[i] = null;

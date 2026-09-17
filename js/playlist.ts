@@ -1,6 +1,8 @@
 import { audioCtx, ensureAudio } from './audio';
-import { detectBPMWithConfidence, resolveBpmPersist } from './worker-client';
-import { state, Track } from './state';
+import { detectBPMResilient, resolveBpmPersist } from './worker-client';
+import { storeDecoded, evictDecoded, clearDecoded } from './decoded-cache';
+import { getDiskAudio, putDiskAudio } from './pcm-disk-cache';
+import { state, Track, replaceTrackInPlaylist } from './state';
 import { VirtualScroller } from './reactive/ui';
 import { validateAudioSignature } from './utils';
 import { engine } from './audio-engine';
@@ -218,7 +220,8 @@ export function initPlaylist(deps: PlaylistDeps): void {
                 if (!fresh) continue;
                 const cur = _filteredView[i];
                 if (fresh.bpm !== cur.bpm || fresh.duration !== cur.duration ||
-                    fresh.name !== cur.name || fresh.path !== cur.path) {
+                    fresh.name !== cur.name || fresh.path !== cur.path ||
+                    fresh.needsReview !== cur.needsReview) {
                     _filteredView[i] = { ...fresh };
                     dirty = true;
                 }
@@ -351,13 +354,20 @@ async function analyzeTrackInBackground(track: Track): Promise<void> {
             }
             if (cached && cached.bpm > 0) {
                 const idx = state.playlist.findIndex(t => t.id === track.id);
-                const next = [...state.playlist];
-                if (idx >= 0) next[idx] = { ...next[idx], bpm: cached.bpm, duration: cached.duration };
-                state.update({ playlist: next });
+                if (idx >= 0) replaceTrackInPlaylist(idx, { bpm: cached.bpm, duration: cached.duration });
                 return;
             }
         }
 
+        // Persistent disk cache (memory → disk → source): a prior session's
+        // PCM skips the source re-read + decode below. Keyed by path+size+
+        // mtime, so edited files never hit stale entries.
+        let audioBuffer: AudioBuffer | null = null;
+        try {
+            const diskHit = await getDiskAudio(track.path, track.id);
+            if (diskHit && state.playlist.some(t => t.id === track.id)) audioBuffer = diskHit;
+        } catch { audioBuffer = null; }
+        if (!audioBuffer) {
         const rawData = await readAudioBytesForPath(track.path, track.id);
         if (!rawData) {
             console.warn(`[Playlist] Analysis skipped for ${track.name} (File unreadable)`);
@@ -376,11 +386,7 @@ async function analyzeTrackInBackground(track: Track): Promise<void> {
         if (arrayBuffer.byteLength > 64 * 1024 * 1024) {
             console.warn(`[Playlist] Analysis skipped for ${track.name} (too large to decode safely)`);
             const bigIdx = state.playlist.findIndex(t => t.id === track.id);
-            if (bigIdx >= 0) {
-                const bigNext = [...state.playlist];
-                bigNext[bigIdx] = { ...bigNext[bigIdx], bpm: 0 };
-                state.update({ playlist: bigNext });
-            }
+            if (bigIdx >= 0) replaceTrackInPlaylist(bigIdx, { bpm: 0 });
             return;
         }
         // Drop doomed work: track deleted/cleared while queued.
@@ -395,11 +401,7 @@ async function analyzeTrackInBackground(track: Track): Promise<void> {
             // yet routed through resolveBpmPersist — keep-prior would leave
             // reanalyzed rows stuck at "analyzing"; uniform-catch is future work.
             const failIdx = state.playlist.findIndex(t => t.id === track.id);
-            if (failIdx >= 0) {
-                const failNext = [...state.playlist];
-                failNext[failIdx] = { ...failNext[failIdx], bpm: 0 };
-                state.update({ playlist: failNext });
-            }
+            if (failIdx >= 0) replaceTrackInPlaylist(failIdx, { bpm: 0 });
             return;
         }
 
@@ -409,15 +411,22 @@ async function analyzeTrackInBackground(track: Track): Promise<void> {
         // Slice before decode: decodeAudioData neuters its input, and a
         // retry/double-post over the same buffer would see it detached.
         if (!ensureAudio() || !audioCtx) return;
-        const audioBuffer = await Promise.race([
+        // Slice before decode: decodeAudioData neuters its input — the copy
+        // feeds the shared decoded cache (analysis + playback, one decode).
+        const cacheBytes = arrayBuffer.slice(0);
+        const freshBuffer = await Promise.race([
             audioCtx.decodeAudioData(arrayBuffer.slice(0)),
             new Promise<never>((_, reject) => {
                 const t = setTimeout(() => reject(new Error('decode timeout')), 30000);
                 (t as any)?.unref?.();
             }),
         ]);
+        try { storeDecoded(track.id, cacheBytes, freshBuffer, freshBuffer.duration); } catch { /* ignore */ }
+        try { void putDiskAudio(track.path, freshBuffer); } catch { /* ignore */ }
+        audioBuffer = freshBuffer;
+        }
 
-        const analysis = await detectBPMWithConfidence(audioBuffer);
+        const analysis = await detectBPMResilient(audioBuffer);
 
         // Drop stale work: track cleared/deleted/replaced while decoding.
         // Verify against the live list (id + path) before any write.
@@ -433,9 +442,7 @@ async function analyzeTrackInBackground(track: Track): Promise<void> {
             console.warn(`[Playlist] BPM needs review for ${track.name} — kept prior value`);
             const durIdx = state.playlist.findIndex(t => t.id === track.id);
             if (durIdx >= 0 && state.playlist[durIdx].path === track.path) {
-                const durNext = [...state.playlist];
-                durNext[durIdx] = { ...durNext[durIdx], duration: audioBuffer.duration };
-                state.update({ playlist: durNext });
+                replaceTrackInPlaylist(durIdx, { duration: audioBuffer.duration, needsReview: true });
             }
             return;
         }
@@ -465,19 +472,13 @@ async function analyzeTrackInBackground(track: Track): Promise<void> {
         const liveIdx = state.playlist.findIndex(t => t.id === track.id);
         if (liveIdx < 0) return;
         if (state.playlist[liveIdx].path !== track.path) return;
-        const live = [...state.playlist];
-        live[liveIdx] = { ...live[liveIdx], bpm, duration: audioBuffer.duration };
-        state.update({ playlist: live });
+        replaceTrackInPlaylist(liveIdx, { bpm, duration: audioBuffer.duration });
     } catch (e) {
         console.warn(`[Playlist] BPM analysis skipped for ${track.name}`);
         // P4 deferral (oracle non-blocking): see validation-failure path above —
         // catch-path bpm:0 not routed through resolveBpmPersist (future work).
         const idx = state.playlist.findIndex(t => t.id === track.id);
-        if (idx >= 0) {
-            const next = [...state.playlist];
-            next[idx] = { ...next[idx], bpm: 0 };
-            state.update({ playlist: next });
-        }
+        if (idx >= 0) replaceTrackInPlaylist(idx, { bpm: 0 });
     }
 }
 
@@ -662,7 +663,9 @@ function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HT
     const li = (existing || document.createElement('li')) as HTMLElement;
     
     let bpmSuffix = " [...]";  // Still analyzing
-    if (track.bpm !== null && track.bpm !== undefined) {
+    if (track.needsReview) {
+        bpmSuffix = " [?bpm]";
+    } else if (track.bpm !== null && track.bpm !== undefined) {
         bpmSuffix = track.bpm > 0 ? ` [${track.bpm}bpm]` : "";  // Detected or silent fail
     }
     
@@ -682,7 +685,7 @@ function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HT
     }
 
     const fullText = track.name + bpmSuffix + blendSuffix;
-    li.title = fullText;
+    li.title = fullText.replace(/["<>]/g, '');
     let titleSpan = li.querySelector('.track-title') as HTMLElement | null;
     if (!titleSpan) {
         titleSpan = document.createElement('span');
@@ -988,10 +991,13 @@ export function reanalyzeTracks(indices: number[]): void {
         (i) => Number.isInteger(i) && i >= 0 && i < state.playlist.length
     );
     if (!valid.length) return;
-    const next = [...state.playlist];
-    for (const i of valid) next[i] = { ...next[i], bpm: undefined };
-    state.update({ playlist: next });
-    for (const i of valid) enqueueAnalysis(next[i]);
+    for (const i of valid) replaceTrackInPlaylist(i, { bpm: undefined, needsReview: false });
+    for (const i of valid) {
+        const t = state.playlist[i];
+        if (!t) continue;
+        _analysisIds.delete(t.id);
+        enqueueAnalysis(t);
+    }
     try { toast.info(`ANALYZING ${valid.length} TRACK(S)...`); } catch { /* ignore */ }
 }
 
@@ -1005,6 +1011,7 @@ export function clearPlaylist(): void {
     const doClear = (): void => {
         try { abortCrossfade(); } catch { /* ignore */ }
         clearAnalysisQueue();
+        clearDecoded();
         try { engine.main.audio.pause(); } catch { /* ignore */ }
         try { engine.main.audio.removeAttribute('src'); engine.main.audio.load(); } catch { try { engine.main.audio.src = ''; } catch { /* ignore */ } }
         try { engine.crossfade.audio.pause(); } catch { /* ignore */ }
@@ -1296,6 +1303,7 @@ export function removeSelectedTracks(): void {
     currentSelected.sort((a, b) => b - a);
 
     let playingTrackRemoved = false;
+    const removedIds = currentSelected.map(idx => currentPlaylist[idx]?.id).filter((id): id is string => !!id);
     currentSelected.forEach(idx => {
         if (idx === currentIndex) playingTrackRemoved = true;
         // Indices after a removed row shift down by one
@@ -1349,6 +1357,7 @@ export function removeSelectedTracks(): void {
         ...(newIndex !== state.currentTrackIndex ? { currentTrackIndex: newIndex } : {}),
         ...(newBlend !== state.blendingIndex ? { blendingIndex: newBlend } : {})
     });
+    for (const id of removedIds) { try { evictDecoded(id); } catch { /* ignore */ } }
     invalidateCtxIndex();
 }
 
