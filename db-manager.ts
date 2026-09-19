@@ -49,7 +49,7 @@ const ALLOWED_AUDIO_DIRS: string[] = [
 // Per-file user consent store (drag-and-drop / dialog picks).
 // DnD files live in arbitrary folders (Downloads/Desktop) that can never be
 // allowlisted by directory without opening drive roots — so the renderer
-// registers the EXACT dropped file path via fs:consent-file and the bridge
+// registers the EXACT dropped file path via fs:consent-file and the gate
 // honors only that file, never its parent directory.
 const ALLOWED_AUDIO_FILES = new Map<string, number>();
 const CONSENT_TTL_MS = 24 * 60 * 60 * 1000;

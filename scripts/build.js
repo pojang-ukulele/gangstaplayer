@@ -228,20 +228,7 @@ async function build() {
         }
     }
 
-    // 8. Bundle portable Python if present (optional local tooling)
-    const embedDir = 'python-embed';
-    const embedDest = path.join(BUILD_DIR, embedDir);
-    if (fs.existsSync(embedDir) && !fs.existsSync(embedDest)) {
-        console.log('Copying portable Python environment...');
-        fs.cpSync(embedDir, embedDest, { recursive: true });
-        console.log('Portable Python bundled.');
-    } else if (fs.existsSync(embedDest)) {
-        console.log('Portable Python already present in build.');
-    } else {
-        console.log('Portable Python not found — skipping.');
-    }
-
-    // 9. Stage external native/runtime deps into the bundle.
+    // 8. Stage external native/runtime deps into the bundle.
     // Main keeps better-sqlite3 + form-data external (native binding
     // can't be bundled), and electron-builder only packs what's inside
     // app-build — so copy them here or getDbManager() dies packaged.

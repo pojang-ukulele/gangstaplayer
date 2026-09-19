@@ -115,13 +115,6 @@
       {
         "from": "README.md",
         "to": "README.md"
-      },
-      {
-        "from": "python-embed",
-        "to": "python-embed",
-        "filter": [
-          "**/*"
-        ]
       }
     ]
   }
