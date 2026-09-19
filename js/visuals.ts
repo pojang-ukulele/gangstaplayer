@@ -238,60 +238,111 @@ export function playStartupSound(): void {
     if (_startupSoundOk) return;
 
     resumeAudioContext().then(() => {
-        const soundPath = 'assets/gun-load.wav';
-        logger.info(`[Visuals] Fetching startup sound from: ${soundPath}`);
-        
-        // Use standard fetch + decodeAudioData for highest reliability on startup
-        fetch(soundPath)
-            .then(response => {
-                if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-                return response.arrayBuffer();
-            })
-            .then(arrayBuffer => {
-                logger.debug("[Visuals] Startup sound binary loaded, decoding...");
-                // Note: We use the context's native decoder here to avoid any worker-pool race conditions on boot
-                if (!ensureAudio() || !audioCtx) throw new Error('Audio not ready');
-                return audioCtx.decodeAudioData(arrayBuffer);
-            })
-            .then(audioBuffer => {
-                logger.info("[Visuals] Startup sound decoded, initiating playback.");
-                if (!audioCtx || !masterGain) throw new Error('Audio chain not ready');
-                const source = audioCtx.createBufferSource();
-                const gain = audioCtx.createGain();
-                source.buffer = audioBuffer;
-                const masterVolEl = document.getElementById('masterVol') as HTMLInputElement | null;
-                const masterVol = masterVolEl ? Math.min(1, Math.max(0, parseFloat(masterVolEl.value) || 1)) : 1;
-                gain.gain.value = STARTUP_SOUND_VOLUME * masterVol;
-                source.connect(gain);
-                gain.connect(masterGain);
-                // One-shot nodes previously stayed connected forever (leak per
-                // boot). Release on end.
+        // Startup sequence: shotgun accent first, then the intro bed.
+        // Both fetch+decode in parallel; playback is strictly sequential --
+        // intro starts when the shotgun buffer ends. Either may fail alone
+        // without killing the other.
+        const SHOTGUN_PATH = 'assets/gun-load.wav';
+        const INTRO_PATH = 'assets/intro2.mp3';
+
+        const masterVolume = (): number => {
+            const masterVolEl = document.getElementById('masterVol') as HTMLInputElement | null;
+            return masterVolEl ? Math.min(1, Math.max(0, parseFloat(masterVolEl.value) || 1)) : 1;
+        };
+
+        const loadBuffer = (soundPath: string): Promise<AudioBuffer> => {
+            logger.info(`[Visuals] Fetching startup sound from: ${soundPath}`);
+            // Use standard fetch + decodeAudioData for highest reliability on startup
+            return fetch(soundPath)
+                .then(response => {
+                    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+                    return response.arrayBuffer();
+                })
+                .then(arrayBuffer => {
+                    logger.debug("[Visuals] Startup sound binary loaded, decoding...");
+                    // Note: We use the context's native decoder here to avoid any worker-pool race conditions on boot
+                    if (!ensureAudio() || !audioCtx) throw new Error('Audio not ready');
+                    return audioCtx.decodeAudioData(arrayBuffer);
+                });
+        };
+
+        const playBuffer = (audioBuffer: AudioBuffer): Promise<void> => {
+            return new Promise<void>((resolve, reject) => {
                 try {
+                    if (!audioCtx || !masterGain) throw new Error('Audio chain not ready');
+                    const source = audioCtx.createBufferSource();
+                    const gain = audioCtx.createGain();
+                    source.buffer = audioBuffer;
+                    gain.gain.value = STARTUP_SOUND_VOLUME * masterVolume();
+                    source.connect(gain);
+                    gain.connect(masterGain);
+                    // One-shot nodes previously stayed connected forever (leak per
+                    // boot). Release on end, then signal the sequencer.
                     source.onended = () => {
                         try { source.disconnect(); } catch { /* ignore */ }
                         try { gain.disconnect(); } catch { /* ignore */ }
+                        resolve();
                     };
-                } catch { /* ignore */ }
-                source.start(0);
-                _startupSoundOk = true;
-                logger.info("[Visuals] Startup sound playback started.");
-            })
-            .catch((e: any) => {
-                logger.error(`[Visuals] Startup Sound Error: ${e.message || String(e)}`);
-                // Fallback for extreme cases: try playing via native Audio element (bypasses Web Audio chain)
-                try {
-                    const audio = new Audio(soundPath);
-                    const masterVolEl = document.getElementById('masterVol') as HTMLInputElement | null;
-                    audio.volume = STARTUP_SOUND_VOLUME * (masterVolEl ? Math.min(1, Math.max(0, parseFloat(masterVolEl.value) || 1)) : 1);
-                    audio.play().then(() => { _startupSoundOk = true; }).catch((pErr: any) => {
-                        logger.error(`[Visuals] Native Audio Fallback failed: ${pErr.message || String(pErr)}`);
-                        armStartupSoundRetry();
-                    });
-                } catch (fallbackErr: any) {
-                    logger.error(`[Visuals] All startup sound attempts failed: ${fallbackErr.message || String(fallbackErr)}`);
-                    armStartupSoundRetry();
+                    logger.info("[Visuals] Startup sound decoded, initiating playback.");
+                    source.start(0);
+                } catch (e) {
+                    reject(e);
                 }
             });
+        };
+
+        const playNative = (soundPath: string): Promise<void> => {
+            // Fallback for extreme cases: try playing via native Audio element (bypasses Web Audio chain)
+            return new Promise<void>((resolve, reject) => {
+                try {
+                    const audio = new Audio(soundPath);
+                    audio.volume = STARTUP_SOUND_VOLUME * masterVolume();
+                    audio.onended = () => resolve();
+                    audio.onerror = () => reject(new Error('native audio error'));
+                    audio.play().catch((pErr: any) => reject(pErr instanceof Error ? pErr : new Error(String(pErr))));
+                } catch (e) {
+                    reject(e);
+                }
+            });
+        };
+
+        const finishOk = (): void => {
+            if (!_startupSoundOk) {
+                _startupSoundOk = true;
+                logger.info("[Visuals] Startup sound playback started.");
+            }
+        };
+
+        // Kick off both loads up front so the intro buffer is ready
+        // the moment the shotgun ends (no fetch gap between them).
+        const shotgunReady: Promise<AudioBuffer | null> = loadBuffer(SHOTGUN_PATH).catch((e: any) => {
+            logger.error(`[Visuals] Startup Sound Error (${SHOTGUN_PATH}): ${e.message || String(e)}`);
+            return null;
+        });
+        const introReady: Promise<AudioBuffer | null> = loadBuffer(INTRO_PATH).catch((e: any) => {
+            logger.error(`[Visuals] Startup Sound Error (${INTRO_PATH}): ${e.message || String(e)}`);
+            return null;
+        });
+        // Sequencer: shotgun, then intro. A dead shotgun skips ahead;
+        // a dead intro falls back to the native element; total failure
+        // re-arms the user-gesture retry.
+        shotgunReady
+            .then(shotgunBuffer => shotgunBuffer
+                ? playBuffer(shotgunBuffer).catch((e: any) => {
+                    logger.error(`[Visuals] Startup Sound Error (${SHOTGUN_PATH}): ${e.message || String(e)}`);
+                })
+                : Promise.resolve())
+            .then(() => introReady)
+            .then(introBuffer => introBuffer ? playBuffer(introBuffer) : playNative(INTRO_PATH))
+            .then(
+                () => finishOk(),
+                (e: any) => {
+                    logger.error(`[Visuals] All startup sound attempts failed (${INTRO_PATH}): ${e.message || String(e)}`);
+                    armStartupSoundRetry();
+                }
+            );
+        // NOTE: old parallel playOne/onOneFailed removed; the sequencer above
+        // plays shotgun first, then intro.
     }).catch(e => {
         logger.error(`[Visuals] Audio Context Resume failed: ${e.message}`);
         armStartupSoundRetry();

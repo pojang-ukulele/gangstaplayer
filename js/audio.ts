@@ -38,6 +38,11 @@ function _fireRebuilt(): void {
     }
 }
 
+/** Reset the failed flag — call when device state changes or user gestures again. */
+export function resetAudioFailure(): void {
+    _failed = false;
+}
+
 /** Create (or recreate) context + master chain. Returns true when usable. */
 export function ensureAudio(): boolean {
     try {
@@ -52,7 +57,13 @@ export function ensureAudio(): boolean {
         }
         if (!audioCtx) {
             const Cls = getAudioContextClass();
-            if (!Cls) { _failed = true; return false; }
+            if (!Cls) {
+                if (_failed) return false;
+                // First-time failure: mark failed and return false so caller
+                // can retry later (e.g. after user gesture unlock).
+                _failed = true;
+                return false;
+            }
             audioCtx = new Cls();
             _owningCtx = audioCtx;
         }
@@ -69,7 +80,7 @@ export function ensureAudio(): boolean {
             // previously got null and never retried.
             _fireRebuilt();
         }
-        _failed = false;
+        if (_failed) { _failed = false; }
         return true;
     } catch (e) {
         console.error("AudioContext creation failed:", e);

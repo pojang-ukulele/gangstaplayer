@@ -445,7 +445,14 @@ function armLongPress(index: number): void {
     _longPressTimers[index] = setTimeout(() => {
         if (!_pressHeld[index]) return;
         const voice = activeVoices[index];
-        if (!voice) return;
+        if (!voice) {
+            // Short selection already ended while still held: (re)start it
+            // looping. The stopPad inside startPad disarms this fired timer
+            // (harmless); keyup still stops the voice via stopPad.
+            try { startPad(index, { loop: true }); } catch { /* ignore */ }
+            _pressHeld[index] = true;
+            return;
+        }
         try {
             const region = getActiveRegion(index);
             const dur = padBuffers[index]?.duration ?? 0;
@@ -2323,6 +2330,9 @@ export function setupPadKeyboardHandlers(): void {
                 startRecording(index);
             } else if (!e.altKey && padBuffers[index]) {
                 startPad(index);
+                // Hold-to-loop (parity with mouse hold): past LONG_PRESS_MS
+                // the live voice loops the selection; keyup -> stopPad disarms.
+                armLongPress(index);
             }
         }
     });

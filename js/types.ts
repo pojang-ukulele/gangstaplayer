@@ -41,19 +41,6 @@ export interface FileSystemAPI {
     getLogPath(): Promise<string>;
 }
 
-export interface SonetraAPI {
-    getCachedTransition(track1Path: string, track2Path: string): Promise<{ success: boolean; audioBuffer?: Uint8Array | null; error?: string }>;
-    precomputeTransition(track1Path: string, track2Path: string): Promise<{ success: boolean; cached?: boolean; error?: string }>;
-    onRestartStatus(callback: (status: unknown) => void): () => void;
-    // Main-owned lifecycle (no renderer IPC — main process only).
-    // Declared for main-process typing, not exposed via preload (H4).
-    startServer?(): Promise<{ success: boolean; port?: number; error?: string }>;
-    stopServer?(): Promise<{ success: boolean }>;
-    restartServer?(): Promise<{ success: boolean; error?: string }>;
-    analyzeTrack?(trackPath: string): Promise<{ success: boolean; analysis?: unknown; error?: string }>;
-    createTransition?(a: string, b: string, style?: string): Promise<{ success: boolean; audioBuffer?: Uint8Array | null; error?: string }>;
-}
-
 export interface DatabaseAPI {
     upsertTrack(track: any): Promise<any>;
     getTrack(path: string): Promise<any>;
@@ -74,7 +61,6 @@ declare global {
     interface Window {
         electronAPI: ElectronAPI;
         fileSystem: FileSystemAPI;
-        sonetra: SonetraAPI;
         database: DatabaseAPI;
         pcmCache: PcmCacheAPI;
     }

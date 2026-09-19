@@ -6,8 +6,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>GANGSTA PLAYER PRO 3</title>
     <!-- Content Security Policy for Safety.
-         connect-src allows any loopback port (http/ws, 127.0.0.1 + localhost)
-         so a user-configured Sonetra port works, not just the 8765 default. -->
+         connect-src allows loopback (http/ws, 127.0.0.1 + localhost)
+         for local tooling on user-configured ports. -->
     <meta http-equiv="Content-Security-Policy"
         content="default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self' data: blob:; media-src 'self' blob: data:; connect-src 'self' http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:*; worker-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none';">
     <link rel="stylesheet" href="styles.css">
@@ -245,9 +245,9 @@
                         <label for="mixOptBPMSync" class="automix-checkbox-label">BPM Sync (Tempo Match)</label>
                     </div>
                     <div class="automix-option-row">
-                        <!-- Sonetra AI OFF by default -->
+                        <!-- Local-engine Auto-Mix OFF by default -->
                         <input type="checkbox" id="mixOptEnableAI" class="gangsta-check">
-<label for="mixOptEnableAI" class="automix-checkbox-label">AI Auto-Mix (Sonetra)</label>
+<label for="mixOptEnableAI" class="automix-checkbox-label">AI Auto-Mix (Local Engine)</label>
                     </div>
 
                     <!-- FADE SLIDERS -->

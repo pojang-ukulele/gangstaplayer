@@ -41,20 +41,6 @@ function workerUrl(): string {
 let worker: Worker | null = null;
 const pendingRequests = new Map<number, PendingRequest>();
 let requestId = 0;
-let consecutiveTimeouts = 0;
-const MAX_CONSECUTIVE_TIMEOUTS = 2;
-// Spawn backoff: a missing/broken worker script previously caused an infinite
-// spawn/fail loop, each queued request waiting out its full 30s timeout.
-let spawnFailCount = 0;
-let spawnCoolUntil = 0;
-const SPAWN_COOLDOWN_MS = 60000;
-function noteSpawnFailure(): void {
-    spawnFailCount++;
-    if (spawnFailCount >= 3) {
-        spawnCoolUntil = Date.now() + SPAWN_COOLDOWN_MS;
-        spawnFailCount = 0;
-    }
-}
 
 function spawnWorker(): Worker {
     // Resolve lazily (not at import time) so packaged file:// baseURIs and
@@ -71,13 +57,12 @@ function spawnWorker(): Worker {
         }
     }
     if (!w) {
-        noteSpawnFailure();
         throw new Error(`WORKER_UNAVAILABLE: audio worker failed to spawn (${candidates.join(', ')}): ${lastErr instanceof Error ? lastErr.message : String(lastErr)}`);
     }
 
     w!.onmessage = (e: MessageEvent) => {
-        // A healthy response resets the crash counter.
-        spawnFailCount = 0;
+        // A healthy response: no per-worker crash counter needed — next
+        // request will spawn a fresh worker if this one is dead.
         const { type, bpm, confidence, blob, altBpm, id } = e.data || {};
         // Id-less replies are dropped without leaking: no pending entry is
         // touched, nothing is resolved or rejected.
@@ -99,24 +84,21 @@ function spawnWorker(): Worker {
 
     w!.onerror = (err) => {
         console.error('[WorkerClient] Audio worker error:', err.message, err.filename, err.lineno);
-        noteSpawnFailure();
         failAllPending(new Error(`Audio worker crashed: ${err.message || 'unknown error'}`));
-        // Mark dead so the next request spawns a fresh worker instead of
-        // posting into a corpse and waiting forever.
-        if (worker === w) worker = null;
+        // Worker died — ensure next spawn creates a fresh one.
+        worker = null;
     };
 
     w!.onmessageerror = (err) => {
         console.error('[WorkerClient] Audio worker message error:', err);
         // Structured-clone failure (e.g. neutered buffer) is known instantly —
-        // previously pending ids hung until the 30s timeout despite that.
-        // Null the worker: a deserializing worker is untrustworthy for queued
-        // jobs — the next call spawns fresh instead of timing out one by one.
+        // fail all pending instead of letting them hang until timeout.
+        failAllPending(new Error('Audio worker message error: response could not be deserialized'));
+        // Worker died — ensure next spawn creates a fresh one.
         if (worker === w) {
             try { w!.terminate(); } catch { /* ignore */ }
             worker = null;
         }
-        failAllPending(new Error('Audio worker message error: response could not be deserialized'));
     };
 
     return w!;
@@ -131,12 +113,11 @@ function failAllPending(err: Error): void {
     }
 }
 
+/**
+ * Get the current worker, spawning a fresh one if needed.
+ * If the worker has died, this will replace it silently.
+ */
 function getWorker(): Worker {
-    if (Date.now() < spawnCoolUntil) {
-        // Fail loud (not a silent cooldown): callers surface this to toast/log
-        // instead of hanging until a timeout.
-        throw new Error('WORKER_UNAVAILABLE: audio worker cooling down after repeated crashes');
-    }
     if (!worker) {
         console.warn('[WorkerClient] Spawning audio worker');
         worker = spawnWorker();
@@ -144,6 +125,10 @@ function getWorker(): Worker {
     return worker;
 }
 
+/**
+ * Post a request to the audio worker with optional transferables.
+ * Timeout defaults to 30s but can be overridden per-call.
+ */
 function post(kind: RequestKind, buildMessage: (id: number) => { type: string; payload: any }, transfer: Transferable[], timeoutMs = 30000): Promise<any> {
     do {
         requestId = (requestId + 1) % 1000000000;
@@ -153,20 +138,10 @@ function post(kind: RequestKind, buildMessage: (id: number) => { type: string; p
         const timer = setTimeout(() => {
             if (pendingRequests.has(id)) {
                 pendingRequests.delete(id);
-                consecutiveTimeouts++;
-                // Hung worker: terminate AND fail every other queued request —
-                // previously only the timed-out call rejected while the rest
-                // waited on a dead worker until their own 30s timeout.
-                if (consecutiveTimeouts >= MAX_CONSECUTIVE_TIMEOUTS && worker) {
-                    try { worker.terminate(); } catch { /* ignore */ }
-                    worker = null;
-                    consecutiveTimeouts = 0;
-                    failAllPending(new Error('Audio worker terminated after repeated timeouts'));
-                }
                 reject(new Error(`Audio worker timed out (${kind})`));
             }
         }, timeoutMs);
-        const wrappedResolve = (v: any) => { clearTimeout(timer); consecutiveTimeouts = 0; resolve(v); };
+        const wrappedResolve = (v: any) => { clearTimeout(timer); resolve(v); };
         const wrappedReject = (e: Error) => { clearTimeout(timer); reject(e); };
         pendingRequests.set(id, { kind, resolve: wrappedResolve, reject: wrappedReject });
         try {

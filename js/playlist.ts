@@ -277,35 +277,40 @@ export function setBlendingIndex(index: number): void {
 const _analysisQueue: Track[] = [];
 let _analysisActive = 0;
 const MAX_CONCURRENT_ANALYSIS = 2;
-// In-flight ids (M16): reanalyze-all / bulk re-adds previously queued the
-// same track N times and burned N full decodes for one last-writer-wins.
 const _analysisIds = new Set<string>();
+// Maximum queue size before tracks are held for retry (increased from 256).
+const MAX_ANALYSIS_QUEUE = 512;
+// Retry queue: tracks that couldn't be enqueued will be retried with backoff.
+const _retryQueue: Track[] = [];
+let _retryToastAt = 0;
+const RETRY_INITIAL_MS = 1000;
+const RETRY_MAX_MS = 30000;
+const RETRY_MULTIPLIER = 2;
 
-let _analysisDropToastAt = 0;
 function enqueueAnalysis(track: Track): void {
-    // Bounded queue — bulk imports previously queued N unbounded decodes.
-    if (_analysisQueue.length >= 256) {
-        // Requeue instead of a silent bpm:0: the track keeps its analyzing
-        // state and retries once the queue drains (stale/dequeued tracks are
-        // dropped by the guards). Throttled toast, not a silent mark.
+    // Bounded queue — tracks beyond MAX_ANALYSIS_QUEUE wait in retry queue with backoff.
+    if (_analysisQueue.length >= MAX_ANALYSIS_QUEUE) {
+        // Add to retry queue with exponential backoff instead of dropping.
+        const alreadyQueued = _retryQueue.some(t => t.id === track.id);
+        if (!alreadyQueued) {
+            _retryQueue.push(track);
+        }
+        // Schedule next retry
+        const currentDelay = Math.min(RETRY_MAX_MS, RETRY_INITIAL_MS * Math.pow(RETRY_MULTIPLIER, _retryQueue.length));
+        setTimeout(() => {
+            try {
+                const t = _retryQueue.shift();
+                if (t && state.playlist.some(x => x.id === t.id) && !_analysisIds.has(t.id)) {
+                    enqueueAnalysis(t);
+                }
+            } catch { /* ignore */ }
+        }, currentDelay);
         try {
             const now = Date.now();
-            if (now - _analysisDropToastAt > 10000) {
-                _analysisDropToastAt = now;
-                toast.info('ANALYSIS QUEUE FULL — RETRYING...');
+            if (now - _retryToastAt > 10000) {
+                _retryToastAt = now;
+                toast.info('ANALYSIS QUEUE FULL — TRACKS WILL BE RETRIED SHORTLY');
             }
-        } catch { /* ignore */ }
-        try {
-            const retryId = track?.id;
-            const t = setTimeout(() => {
-                try {
-                    if (!retryId) return;
-                    if (!state.playlist.some(x => x.id === retryId)) return;
-                    if (_analysisIds.has(retryId)) return;
-                    enqueueAnalysis(track);
-                } catch { /* ignore */ }
-            }, 2000);
-            (t as unknown as { unref?: () => void })?.unref?.();
         } catch { /* ignore */ }
         return;
     }
@@ -318,6 +323,7 @@ function enqueueAnalysis(track: Track): void {
 export function clearAnalysisQueue(): void {
     _analysisQueue.length = 0;
     _analysisIds.clear();
+    _retryQueue.length = 0;
 }
 
 function pumpAnalysisQueue(): void {
@@ -518,7 +524,7 @@ export function addTracksToPlaylist(files: File[]): void {
         existingPaths.add(normPath(fullPath));
         // Keep the user-gesture File bytes so decode/playback/BPM never need
         // an IPC re-read that fail-closed allowlists would deny. Also register
-        // per-file consent so later disk reads (Sonetra, post-restart) pass.
+        // per-file consent so later disk reads (post-restart) pass.
         const track: Track = {
             id: uuid(),
             name: String(file.name).slice(0, 512),
@@ -707,6 +713,7 @@ function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HT
         // that was ALREADY selected is a reorder gesture, not a selection one.
         li.addEventListener('mousedown', (e) => {
             if (e.button !== 0) return;
+            hidePlaylistContextMenu();
             const idx = parseInt(li.dataset.index || "-1");
             if (idx < 0) return;
             playlistFocused = true;
@@ -739,6 +746,7 @@ function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HT
 
         li.addEventListener('click', (e) => {
             e.stopPropagation();
+            hidePlaylistContextMenu();
             // Click after a press-drag would collapse the just-built range.
             if (suppressClick) { suppressClick = false; return; }
             const idx = parseInt(li.dataset.index || "0");
@@ -782,6 +790,7 @@ function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HT
 
         li.addEventListener('dblclick', (e) => {
             e.stopPropagation();
+            hidePlaylistContextMenu();
             const viewIdx = parseInt(li.dataset.index || "0");
             // H26: filtered rows are positions in the view — resolve to the
             // full-list index by id so the correct track loads.
@@ -805,6 +814,7 @@ function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HT
         li.draggable = true;
 
         li.addEventListener('dragstart', (e) => {
+            hidePlaylistContextMenu();
             const idx = parseInt(li.dataset.index || "-1");
             if (idx < 0) { e.preventDefault(); return; }
             // Select-drag in progress (press started on an unselected row):
@@ -901,7 +911,13 @@ function renderTrackRow(track: Track, index: number, existing?: HTMLElement): HT
             const menu = document.getElementById('contextMenu');
             if (menu) {
                 menu.classList.remove('hidden');
+                menu.setAttribute('aria-hidden', 'false');
                 menu.style.display = 'block';
+                // Dismiss other menus so only one is ever visible.
+                for (const id of ['padContextMenu', 'playContextMenu', 'loopContextMenu', 'controlContextMenu']) {
+                    const m = document.getElementById(id);
+                    if (m) { m.classList.add('hidden'); m.setAttribute('aria-hidden', 'true'); }
+                }
                 // M32: menus stay BELOW modals (modal z-index 3000).
                 menu.style.zIndex = '1500';
                 hideSamplerSubmenu();
@@ -1055,6 +1071,27 @@ export function hideSamplerSubmenu(): void {
     if (parent) parent.setAttribute('aria-expanded', 'false');
 }
 
+/**
+ * Dismiss the playlist context menu (plus any other open context menu).
+ * Explicit calls are required because row click/dblclick handlers use
+ * stopPropagation, which blocks the global document-click dismisser in
+ * main.ts — without this the menu stays stuck open after left-clicking
+ * another track. Hides by id locally (no import from main.ts → cycle).
+ */
+export function hidePlaylistContextMenu(): void {
+    try {
+        const ids = ['contextMenu', 'samplerSubmenu', 'padContextMenu', 'playContextMenu', 'loopContextMenu', 'controlContextMenu'];
+        for (const id of ids) {
+            const m = document.getElementById(id);
+            if (m) { m.classList.add('hidden'); m.setAttribute('aria-hidden', 'true'); }
+        }
+        const menu = document.getElementById('contextMenu');
+        if (menu) { try { delete menu.dataset.ctxIndex; } catch { /* ignore */ } }
+        const parent = document.getElementById('ctxLoadToSampler');
+        if (parent) parent.setAttribute('aria-expanded', 'false');
+    } catch { /* ignore */ }
+}
+
 function showSamplerSubmenu(): void {
     if (_submenuHideTimer) { clearTimeout(_submenuHideTimer); _submenuHideTimer = null; }
     const sub = document.getElementById('samplerSubmenu');
@@ -1107,6 +1144,7 @@ async function buildSamplerSubmenu(trackIdx: number): Promise<void> {
         item.dataset.padIndex = i.toString();
         item.addEventListener('click', (e) => {
             e.stopPropagation();
+            hidePlaylistContextMenu();
             void loadTrackToPad(trackIdx, i);
         });
         sub.appendChild(item);
@@ -1489,6 +1527,7 @@ export function setupPlaylistHandlers(): void {
 
     if (ctxFocusPlaying) ctxFocusPlaying.addEventListener('click', () => {
         focusPlayingTrack();
+        hidePlaylistContextMenu();
     });
 
     if (ctxAnalyzeBPM) ctxAnalyzeBPM.addEventListener('click', () => {
@@ -1504,13 +1543,16 @@ export function setupPlaylistHandlers(): void {
         }
         if (!indices.length) {
             try { toast.info('NOTHING TO ANALYZE'); } catch { /* ignore */ }
+            hidePlaylistContextMenu();
             return;
         }
         reanalyzeTracks(indices);
+        hidePlaylistContextMenu();
     });
 
     if (ctxTrackInfo) ctxTrackInfo.addEventListener('click', () => {
         const track = resolveCtxTrack();
+        hidePlaylistContextMenu();
         if (!track) {
             try { toast.info('NO TRACK SELECTED'); } catch { /* ignore */ }
             return;
@@ -1520,6 +1562,7 @@ export function setupPlaylistHandlers(): void {
 
     if (ctxShowInFolder) ctxShowInFolder.addEventListener('click', () => {
         const track = resolveCtxTrack();
+        hidePlaylistContextMenu();
         if (!track) return;
         const show = window.fileSystem?.showItemInFolder;
         if (typeof show !== 'function') {
@@ -1535,6 +1578,7 @@ export function setupPlaylistHandlers(): void {
 
     if (ctxCopyPath) ctxCopyPath.addEventListener('click', () => {
         const track = resolveCtxTrack();
+        hidePlaylistContextMenu();
         if (!track) return;
         const done = () => { try { toast.success('FILE PATH COPIED'); } catch { /* ignore */ } };
         const fail = () => { try { toast.error('COPY FAILED'); } catch { /* ignore */ } };
@@ -1554,15 +1598,20 @@ export function setupPlaylistHandlers(): void {
     });
 
     if (ctxClearPlaylist) ctxClearPlaylist.addEventListener('click', () => {
+        // clearPlaylist may open a confirm modal — dismiss first so the
+        // menu never sits above/below the dialog (M32).
+        hidePlaylistContextMenu();
         clearPlaylist();
     });
 
     if (ctxRemove) ctxRemove.addEventListener('click', () => {
         removeSelectedTracks();
+        hidePlaylistContextMenu();
     });
 
     if (ctxSelectAll) ctxSelectAll.addEventListener('click', () => {
         selectAllTracks();
+        hidePlaylistContextMenu();
     });
 
     if (ctxMoveUp) ctxMoveUp.addEventListener('click', () => {
@@ -1603,6 +1652,7 @@ export function setupPlaylistHandlers(): void {
         anchorIndex = remapUp(anchorIndex);
         pivotIndex = remapUp(pivotIndex);
         invalidateCtxIndex();
+        hidePlaylistContextMenu();
     });
 
     if (ctxMoveDown) ctxMoveDown.addEventListener('click', () => {
@@ -1640,5 +1690,6 @@ export function setupPlaylistHandlers(): void {
         anchorIndex = remapDown(anchorIndex);
         pivotIndex = remapDown(pivotIndex);
         invalidateCtxIndex();
+        hidePlaylistContextMenu();
     });
 }

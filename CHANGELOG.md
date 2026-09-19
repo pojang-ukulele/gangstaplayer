@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased] — "Remove Sonetra AI backend (2026-09-17)"
+
+### 🗑️ Remove Sonetra AI backend (verified: `tsc --noEmit` clean, Jest green, dev build green)
+
+- **Removed (`sonetra-bridge.ts`, `sonetra-requirements.txt`, `scripts/setup-sonetra.js`)**: Python FastAPI backend dropped; mixing is handled entirely by the local DSP engine (EQ crossfade, filter sweeps, BPM sync), fully offline. `sonetra:*` IPC handlers, preload `sonetra` bridge, `SonetraAPI` types, renderer pre-warm/status callers, `setup:sonetra*` scripts, and build/package entries deleted.
+- **Gates preserved (`db-manager.ts`, `main.ts`)**: audio consent allowlist (`isAllowedAudioFile`/`isAllowedAudioDirForPath`/`addAllowedAudioFile` + dir constants) relocated verbatim from the bridge into `db-manager.ts` and re-exported — DB upsert consent gate and `isReadPathAllowed` behavior unchanged.
+
 ## [Unreleased] — "Audit sweep + Electron 43 + BPM/cache (2026-09-17)"
 
 ### 🛡️ Audit sweep fixes (verified: `tsc --noEmit` clean, Jest 150/150 across 20 suites)

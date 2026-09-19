@@ -1,6 +1,6 @@
 // === PLAYER MODULE ===
 import { audioCtx, resumeAudioContext, masterGain, ensureAudio } from './audio';
-import { settings, isAiEnabled } from './settings';
+import { settings } from './settings';
 import { state, Track, PlaybackMode, LoopMode, replaceTrackInPlaylist } from './state';
 import { detectBPMResilient, resolveBpmPersist } from './worker-client';
 import { getDecoded } from './decoded-cache';
@@ -37,11 +37,7 @@ let crossfadeBlobUrl: string = "";
  * Keyed by the resolved disk path from getPathForFile; bounded LRU.
  */
 const droppedAudioFiles = new Map<string, File>();
-const droppedAudioById = new Map<string, File>();
-const MAX_DROPPED_FILES = 100;
-// L8: 100 files x 100MB = up to 10GB pinned. Budget total bytes too.
-const MAX_DROPPED_BYTES = 500 * 1024 * 1024;
-let _droppedBytes = 0;
+const MAX_DROPPED_FILES = 20;
 
 /** Load-step timeout: a hung IPC read or decode must surface, never stall silent. */
 const LOAD_READ_TIMEOUT_MS = 15000;
@@ -113,25 +109,17 @@ export function cacheDroppedAudio(filePath: string, file: File, trackId?: string
         if (!filePath || !file) return;
         const key = canonicalDroppedKey(filePath);
         const prev = droppedAudioFiles.get(key);
-        if (prev) _droppedBytes -= prev.size || 0;
-        if (droppedAudioFiles.has(key)) droppedAudioFiles.delete(key);
+        if (prev) droppedAudioFiles.delete(key);
         droppedAudioFiles.set(key, file);
-        _droppedBytes += file.size || 0;
-        const evictPath = (): void => {
+        // Enforce max cache size: evict oldest entries first.
+        while (droppedAudioFiles.size > MAX_DROPPED_FILES) {
             const oldest = droppedAudioFiles.keys().next().value;
-            if (oldest === undefined) return;
-            const f = droppedAudioFiles.get(oldest);
-            if (f) _droppedBytes -= f.size || 0;
+            if (oldest === undefined) break;
             droppedAudioFiles.delete(oldest);
-        };
-        while ((droppedAudioFiles.size > MAX_DROPPED_FILES || _droppedBytes > MAX_DROPPED_BYTES) && droppedAudioFiles.size > 0) evictPath();
-        // Accounting drift (unknown sizes) must never pin the counter high.
-        if (droppedAudioFiles.size === 0) _droppedBytes = 0;
-        if (_droppedBytes < 0) _droppedBytes = 0;
+        }
         if (trackId) {
-            if (droppedAudioById.has(trackId)) droppedAudioById.delete(trackId);
-            droppedAudioById.set(trackId, file);
-            while (droppedAudioById.size > MAX_DROPPED_FILES) evictOldest(droppedAudioById);
+            // Track ID caching is handled by the caller via getDroppedAudioFile;
+            // the droppedAudioFiles map is keyed by canonical path.
         }
     } catch { /* ignore */ }
 }
@@ -139,8 +127,14 @@ export function cacheDroppedAudio(filePath: string, file: File, trackId?: string
 export function getDroppedAudioFile(filePath: string, trackId?: string): File | undefined {
     try {
         if (trackId) {
-            const byId = droppedAudioById.get(trackId);
-            if (byId) return byId;
+            // Track ID lookup: find file by canonical path associated with this trackId.
+            // The droppedAudioFiles map is keyed by canonical path, so we iterate.
+            for (const [key, file] of droppedAudioFiles) {
+                if (canonicalDroppedKey(key) === canonicalDroppedKey(filePath)) {
+                    return file;
+                }
+            }
+            return undefined;
         }
         const hit = droppedAudioFiles.get(canonicalDroppedKey(filePath));
         if (hit) return hit;
@@ -610,6 +604,43 @@ let crossfadeRateRatio = 1;
 /** Cached sampler module for per-tick tempo fan-out (H12: no import() per event). */
 let _samplerMod: typeof import('./sampler') | null = null;
 
+/** First-class blend flavor. Default 'smooth' preserves legacy automation. */
+export type CrossfadeStyle = 'smooth' | 'echo-out';
+/** Echo-out send nodes, created once per blend (never per-rAF). */
+let echoNodes: { delay: DelayNode; feedback: GainNode; wet: GainNode } | null = null;
+const ECHO_DELAY_DEFAULT_S = 0.375;
+const ECHO_FEEDBACK_START = 0.45;
+const ECHO_FEEDBACK_END = 0.05;
+const ECHO_WET_PEAK = 0.5;
+function clampEcho(v: number, lo: number, hi: number): number {
+    return Number.isFinite(v) ? Math.min(hi, Math.max(lo, v)) : lo;
+}
+/** Dotted-eighth delay from masterBPM, clamped 0.05–1.0s. */
+function echoDelaySeconds(): number {
+    try {
+        const bpm = state.masterBPM;
+        if (typeof bpm === 'number' && Number.isFinite(bpm) && bpm > 0) {
+            return clampEcho((60 / bpm) * 0.75, 0.05, 1.0);
+        }
+    } catch { /* fall through to default */ }
+    return ECHO_DELAY_DEFAULT_S;
+}
+/** Disconnect all echo nodes. Safe to call when none exist. */
+function teardownEcho(): void {
+    const nodes = echoNodes;
+    echoNodes = null;
+    if (!nodes) return;
+    try {
+        if (audioCtx) {
+            const t = audioCtx.currentTime;
+            try { nodes.wet.gain.cancelScheduledValues(t); } catch { /* ignore */ }
+            try { nodes.feedback.gain.cancelScheduledValues(t); } catch { /* ignore */ }
+        }
+    } catch { /* ignore */ }
+    for (const n of [nodes.wet, nodes.feedback, nodes.delay]) {
+        try { n.disconnect(); } catch { /* ignore */ }
+    }
+}
 /** Element-safe tempo clamp — match ratios legitimately reach 0.25–4. */
 function clampTempoRate(r: number): number {
     return Number.isFinite(r) ? Math.min(4, Math.max(0.25, r)) : 1;
@@ -624,6 +655,7 @@ export function abortCrossfade(reason?: string): void {
     crossfadeGen++;
     if (reason) logger.debug(`[AutoMix] Crossfade aborted: ${reason}`);
     crossfadeRateRatio = 1;
+    teardownEcho();
     if (crossfadeTimer) { clearTimeout(crossfadeTimer); crossfadeTimer = null; }
     try { engine.crossfade.audio.pause(); } catch { /* ignore */ }
     // Reclaim the incoming blob URL — removeSelectedTracks clears src but the
@@ -661,7 +693,7 @@ function updateControlsLock(locked: boolean): void {
     });
 }
 
-export async function startCrossfade(targetIndex: number | null = null, customDuration: number | null = null): Promise<void> {
+export async function startCrossfade(targetIndex: number | null = null, customDuration: number | null = null, style: CrossfadeStyle = 'smooth'): Promise<void> {
     const playlist = state.playlist;
     if (state.isCrossfadeInProgress || !playlist.length) return;
     // Never blend from silence — a stopped/empty deck produces a fade from nothing.
@@ -743,36 +775,13 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
     // Handshake passed — engage the control lock for the automation run.
     updateControlsLock(true);
 
-    // Sonetra AI: pre-warm only. Cached AI transitions are generated in the
-    // background for future mixes; live AI-stem playback is NOT implemented
-    // (checkbox previously implied it was). Guard indices — currentTrackIndex
-    // can be -1 on an empty/fresh playlist.
-    // Safety: the AI lookup + rate setup + EQ/filter/gain automation below
+    // Safety: the rate setup + EQ/filter/gain automation below
     // run inside one try — any throw aborts the blend (incoming stopped,
     // URL revoked, flag + lock reset) and rethrows so callers see the
     // failure instead of deadlocking with isCrossfadeInProgress stuck true.
     // Blend sound is unchanged; this only adds failure cleanup.
+    // Mixing is handled entirely by the local DSP engine (no AI backend).
     try {
-    const aiOn = typeof isAiEnabled === 'function' ? isAiEnabled() : settings.autoMix.enableAI;
-    if (aiOn && window.sonetra) {
-        const cur = playlist[state.currentTrackIndex];
-        const nxt = playlist[nextIdx];
-        if (cur && nxt) {
-            // Check cache first so getCachedTransition is not dead code and we
-            // avoid duplicate 100MB uploads when the transition already exists.
-            window.sonetra.getCachedTransition(cur.path, nxt.path)
-                .then((cached) => {
-                    if (cached && (cached as any).success) {
-                        logger.info('[AutoMix] Sonetra transition cache: hit');
-                        return;
-                    }
-                    return window.sonetra.precomputeTransition(cur.path, nxt.path)
-                        .then((r) => logger.info(`[AutoMix] Sonetra transition cache: ${r.success ? (r.cached ? 'hit' : 'generated') : r.error}`));
-                })
-                .catch(() => { /* offline / server down — non-fatal */ });
-        }
-    }
-
     // Mirror the outgoing ramp depths (H10): incoming starts exactly where
     // outgoing ends so the blend has no mid hole. Uses constants, not magic.
     cross.lowEQ.gain.value = settings.autoMix.eqCrossfade ? CROSSFADE_RAMP_LOW_DB : 0;
@@ -864,6 +873,34 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
     cross.gain.gain.setValueAtTime(0.001, now);
     cross.gain.gain.linearRampToValueAtTime(1, now + duration);
 
+    // --- ECHO-OUT flavor: dub send on the outgoing deck ---
+    // Dry path keeps the gain automation above untouched; the wet send
+    // blooms 0→~0.5 while feedback decays to 0.05 so no tail runs away.
+    // Nodes are created once per blend; failures degrade to smooth.
+    teardownEcho();
+    if (style === 'echo-out' && masterGain) {
+        try {
+            const delay = audioCtx.createDelay(1.0);
+            delay.delayTime.value = echoDelaySeconds();
+            const feedback = audioCtx.createGain();
+            feedback.gain.value = clampEcho(ECHO_FEEDBACK_START, 0, 0.6);
+            const wet = audioCtx.createGain();
+            wet.gain.value = 0;
+            main.gain.connect(delay);
+            delay.connect(feedback);
+            feedback.connect(delay);
+            delay.connect(wet);
+            wet.connect(masterGain);
+            echoNodes = { delay, feedback, wet };
+            wet.gain.setValueAtTime(0, now);
+            wet.gain.linearRampToValueAtTime(clampEcho(ECHO_WET_PEAK, 0, 0.6), now + duration);
+            feedback.gain.setValueAtTime(feedback.gain.value, now);
+            feedback.gain.linearRampToValueAtTime(ECHO_FEEDBACK_END, now + duration);
+        } catch {
+            teardownEcho();
+        }
+    }
+
     const gen = myGen;
     if (crossfadeTimer) clearTimeout(crossfadeTimer);
     crossfadeTimer = setTimeout(() => {
@@ -881,6 +918,8 @@ export async function startCrossfade(targetIndex: number | null = null, customDu
 }
 
 function finishCrossfade(nextIndex: number, expectedId?: string): void {
+    // Echo send must die with the blend on every path — no runaway tail.
+    teardownEcho();
     // Stale timer (aborted by stop/delete) must never resurrect audio.
     if (!state.isCrossfadeInProgress) return;
     if (!Number.isInteger(nextIndex) || nextIndex < 0 || nextIndex >= state.playlist.length) {

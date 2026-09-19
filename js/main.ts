@@ -71,8 +71,6 @@ function getMissingBridges(): string[] {
     if (!window.electronAPI) missing.push('electronAPI');
     if (!window.fileSystem) missing.push('fileSystem');
     if (!window.database) missing.push('database');
-    // L9: sonetra was skipped — AI features silently no-op without it.
-    if (!window.sonetra) missing.push('sonetra');
     return missing;
 }
 
@@ -664,17 +662,15 @@ async function initApp() {
         tempoSliderRef: getTempoSlider() as HTMLInputElement
     });
 
-    // Playlist UI wires up immediately (C15): gating init + handlers behind
-    // the crash-restore prompt left file-input/DnD/context-menu dead whenever
-    // the user never answered it. The DB load still waits for the prompt so a
-    // late async read can't clobber a restore; declined/absent prompts trigger
-    // the DB load afterwards, restored snapshots skip it as before.
+    // Playlist UI wires up immediately (C15). The DB load still waits for the
+    // auto-restore so a late async read can't clobber it; a missing/failed
+    // restore triggers the DB load afterwards, restored snapshots skip it.
     initPlaylist({ loadTrack, playTrack, skipDbLoad: true });
     setupPlaylistHandlers();
-    // Bounded prompt wait: an unanswered modal previously pended forever and
-    // the library DB load behind it never ran (empty-looking app). 60s of
-    // silence counts as decline; a later YES still overwrites (DB-load guards
-    // yield to non-empty/restored playlists).
+    // Bounded restore wait: a hung restore previously pended forever and
+    // the library DB load behind it never ran (empty-looking app). 60s
+    // without settling counts as no-restore; a late restore still
+    // overwrites (DB-load guards yield to non-empty/restored playlists).
     const restoreWait = checkAndRestore();
     const restoreTimeout = new Promise<boolean>((resolve) => {
         const t = setTimeout(() => resolve(false), 60000);
@@ -687,21 +683,6 @@ async function initApp() {
     });
 
     initMIDI({ startPad, stopPad, activeVoices, padVolumes });
-
-    // Sonetra status was previously forwarded by main but never subscribed —
-    // surface crashes/restarts instead of dropping the signal.
-    try {
-        try { (window as unknown as { __ugSonetraUnsub?: () => void }).__ugSonetraUnsub?.(); } catch { /* ignore */ }
-        const unsub = window.sonetra?.onRestartStatus?.((status: unknown) => {
-            try {
-                const s = status as { event?: string; message?: string };
-                logger.info(`[Sonetra] status: ${s?.event ?? 'unknown'} ${s?.message ?? ''}`);
-                if (s?.event === 'crashed' || s?.event === 'failed') toast.error(`AI MIXER ${String(s.event).toUpperCase()}`);
-                else if (s?.event === 'restarted' || s?.event === 'started') toast.success('AI MIXER ONLINE');
-            } catch { /* ignore */ }
-        });
-        try { if (typeof unsub === 'function') (window as unknown as { __ugSonetraUnsub?: () => void }).__ugSonetraUnsub = unsub; } catch { /* ignore */ }
-    } catch { /* Sonetra bridge unavailable — non-fatal */ }
 
     initSettings({ setAutoMixEnabled });
 
@@ -859,6 +840,16 @@ async function initApp() {
         });
     }
 
+    // Right-click on empty space (not a row/pad/slider/button opener —
+    // those stopPropagation and never reach here) dismisses stale menus.
+    // Skipped when the click is inside a menu so submenu hovers survive.
+    document.addEventListener('contextmenu', (e) => {
+        const t = e.target as HTMLElement | null;
+        try {
+            if (t?.closest?.('.context-menu, .context-submenu')) return;
+        } catch { /* ignore */ }
+        hideAllContextMenus();
+    });
     // Global Click Handler to hide menus
     document.addEventListener('click', () => {
         const playlistCtxMenu = document.getElementById('contextMenu');
@@ -894,15 +885,33 @@ async function initApp() {
         }
     });
     
-    // Startup sequence completion
-    playStartupSound();
+    // Startup sequence completion: show the GUI first, then play the
+    // shotgun-then-intro stack once the last session is actually on screen.
+    // Double-rAF waits for a painted frame; the beat after that lets the
+    // restored/DB content finish compositing so it lands as a flourish.
+    // Chained behind the restore race (same gate as the DB load) with a
+    // 12s absolute cap so a hung restore can never silence the flourish.
     bridge?.appReadyToShow?.();
+    const paintReady = new Promise<void>((resolve) => {
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+            window.setTimeout(() => resolve(), 1200);
+        }));
+    });
+    const soundCap = new Promise<void>((resolve) => {
+        window.setTimeout(() => resolve(), 12000);
+    });
+    void Promise.race([
+        Promise.race([restoreWait, restoreTimeout]).then(() => paintReady),
+        soundCap,
+    ]).then(() => {
+        try { playStartupSound(); } catch { /* ignore */ }
+    });
 
     // Initialize crash recovery (auto-save)
     initCrashRecovery();
     // NOTE: checkAndRestore() already ran above (gated before initPlaylist).
-    // Do NOT call it again here — two concurrent prompts fight over
-    // confirmModal and double-restore/clear snapshots.
+    // Do NOT call it again here — two concurrent restores fight over
+    // state and double-restore/clear snapshots.
 
     // === GURU CRASH PROTECTION (RENDERER) ===
     // addEventListener (not assignment) so earlier handlers aren't clobbered.

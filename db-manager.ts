@@ -28,6 +28,119 @@ export function canonicalizeTrackPath(p: string): string {
     return resolved;
 }
 
+// ==================== AUDIO CONSENT ALLOWLIST ====================
+// Relocated VERBATIM from sonetra-bridge.ts (bridge deleted; local DSP
+// engine is the mixer now). These gates back main.ts isReadPathAllowed and
+// the upsert consent check below — behavior is identical: deleting the
+// bridge must NOT silently widen the DB gate to extension-only.
+const AUDIO_EXTENSIONS = new Set(['wav', 'mp3', 'ogg', 'flac', 'm4a', 'aac', 'webm']);
+
+// ==================== PATH WHITELISTING ====================
+// List of allowed directories for audio file access.
+// Prevents path traversal attacks accessing arbitrary system files.
+const ALLOWED_AUDIO_DIRS: string[] = [
+    // App data recordings directory (resolved at runtime)
+    process.env.APPDATA ? path.join(process.env.APPDATA, 'GangstaPlayer', 'recordings') : null,
+    // User's standard music folders
+    process.env.USERPROFILE ? path.join(process.env.USERPROFILE, 'Music') : null,
+    process.env.HOME ? path.join(process.env.HOME, 'Music') : null,
+].filter(Boolean) as string[];
+
+// Per-file user consent store (drag-and-drop / dialog picks).
+// DnD files live in arbitrary folders (Downloads/Desktop) that can never be
+// allowlisted by directory without opening drive roots — so the renderer
+// registers the EXACT dropped file path via fs:consent-file and the bridge
+// honors only that file, never its parent directory.
+const ALLOWED_AUDIO_FILES = new Map<string, number>();
+const CONSENT_TTL_MS = 24 * 60 * 60 * 1000;
+const MAX_CONSENTED_FILES = 256;
+
+function canonicalAudioKey(p: string): string {
+    try {
+        const r = path.resolve(p);
+        return (process.platform === 'win32' || process.platform === 'darwin') ? r.toLowerCase() : r;
+    } catch { return p; }
+}
+
+/** True when the resolved path sits inside one of the allowed directories. */
+export function isAllowedAudioDirForPath(filePath: string): boolean {
+    try {
+        // Case-insensitive only where the FS is (Windows/macOS); Linux stays exact.
+        const insensitive = process.platform === 'win32' || process.platform === 'darwin';
+        const resolved = path.resolve(filePath);
+        const insideDir = (dir: string): boolean => {
+            const d = path.resolve(dir);
+            const dc = insensitive ? d.toLowerCase() : d;
+            const fc = insensitive ? resolved.toLowerCase() : resolved;
+            return fc === dc || fc.startsWith(dc + path.sep);
+        };
+        if (ALLOWED_AUDIO_DIRS.some(allowed => allowed && insideDir(allowed))) return true;
+        const devDir = path.join(__dirname, '..', 'recordings');
+        if (insideDir(devDir)) return true;
+        return false;
+    } catch { return false; }
+}
+
+/**
+ * Register a single user-consented audio file (DnD drop or dialog pick).
+ * Validates existence, audio extension, and size before storing — a renderer
+ * string alone never grants access. Returns true when consent was recorded.
+ */
+export function addAllowedAudioFile(filePath: string): boolean {
+    if (!filePath || typeof filePath !== 'string') return false;
+    if (filePath.includes('\0')) return false;
+    if (filePath.length > 32760) return false;
+    if (/(^|[\\/])\.\.([\\/]|$)/.test(filePath)) return false;
+    if (filePath.includes(':') && !/^[a-zA-Z]:[\\/]/.test(filePath)) return false;
+    if (filePath.startsWith('\\\\') || filePath.startsWith('//')) return false;
+    let resolved: string;
+    try { resolved = path.resolve(path.normalize(filePath)); } catch { return false; }
+    const ext = path.extname(resolved).replace('.', '').toLowerCase();
+    if (!AUDIO_EXTENSIONS.has(ext)) return false;
+    try {
+        let real = resolved;
+        try { real = fs.realpathSync.native(resolved); } catch { /* use resolved */ }
+        const st = fs.statSync(real);
+        if (!st.isFile()) return false;
+        if (st.size > 100 * 1024 * 1024) return false;
+        const now = Date.now();
+        for (const [k, t] of Array.from(ALLOWED_AUDIO_FILES)) {
+            if (now - t > CONSENT_TTL_MS) ALLOWED_AUDIO_FILES.delete(k);
+        }
+        ALLOWED_AUDIO_FILES.set(canonicalAudioKey(resolved), now);
+        const realKey = canonicalAudioKey(real);
+        if (realKey !== canonicalAudioKey(resolved)) ALLOWED_AUDIO_FILES.set(realKey, now);
+        while (ALLOWED_AUDIO_FILES.size > MAX_CONSENTED_FILES) {
+            const oldest = ALLOWED_AUDIO_FILES.keys().next().value;
+            if (!oldest) break;
+            ALLOWED_AUDIO_FILES.delete(oldest);
+        }
+        return true;
+    } catch { return false; }
+}
+
+/** True when the path (or its symlink target) was explicitly consented. */
+export function isAllowedAudioFile(filePath: string): boolean {
+    try {
+        const key = canonicalAudioKey(path.resolve(filePath));
+        const t = ALLOWED_AUDIO_FILES.get(key);
+        if (t !== undefined) {
+            if (Date.now() - t > CONSENT_TTL_MS) { ALLOWED_AUDIO_FILES.delete(key); }
+            else return true;
+        }
+        try {
+            const real = fs.realpathSync.native(path.resolve(filePath));
+            const rk = canonicalAudioKey(real);
+            const rt = ALLOWED_AUDIO_FILES.get(rk);
+            if (rt !== undefined) {
+                if (Date.now() - rt > CONSENT_TTL_MS) { ALLOWED_AUDIO_FILES.delete(rk); }
+                else return true;
+            }
+        } catch { /* dangling — not consented */ }
+        return false;
+    } catch { return false; }
+}
+
 export class DatabaseManager {
     private db: Database.Database;
 
@@ -98,12 +211,10 @@ export class DatabaseManager {
         if (track.path.startsWith('\\\\') || track.path.startsWith('//')) throw new Error('upsertTrack: UNC path rejected');
         // Consent gate (best-effort in main without IPC round-trip): allow
         // only consented files, dialog approvals, recordings, or allowlisted
-        // audio dirs. Direct DB import avoids circular main imports by lazy
-        // require — failures closed (deny) only when the bridge is loadable.
+        // audio dirs. Helpers live in this module (relocated from the deleted
+        // sonetra-bridge) — fail closed on any unexpected error.
         try {
-            // eslint-disable-next-line @typescript-eslint/no-var-requires
-            const bridge = require('./sonetra-bridge') as typeof import('./sonetra-bridge');
-            const consented = bridge.isAllowedAudioFile(track.path) || bridge.isAllowedAudioDirForPath(track.path);
+            const consented = isAllowedAudioFile(track.path) || isAllowedAudioDirForPath(track.path);
             if (!consented) {
                 // Recordings + dialog paths are also legit; check lexically.
                 let inRecordings = false;
@@ -119,7 +230,7 @@ export class DatabaseManager {
             }
         } catch (e: any) {
             if (String(e?.message ?? '').includes('not consented')) throw e;
-            // Bridge unavailable (tests) — ext gate above still applies.
+            throw new Error('upsertTrack: file not consented');
         }
         let metadataJson = '{}';
         try {

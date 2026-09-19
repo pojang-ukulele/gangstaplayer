@@ -100,33 +100,6 @@ contextBridge.exposeInMainWorld('fileSystem', {
   getLogPath: () => ipcRenderer.invoke('fs:get-log-path')
 });
 
-// Sonetra AI Mixer Bridge (only live handlers are exposed — H4)
-contextBridge.exposeInMainWorld('sonetra', {
-  // For pre-computed transitions cache
-  getCachedTransition: (track1Path: string, track2Path: string) => {
-    const a = cleanPath(track1Path);
-    const b = cleanPath(track2Path);
-    if (!a || !b) return Promise.resolve({ success: false, error: 'Bad paths' });
-    return ipcRenderer.invoke('sonetra:get-cached-transition', a, b);
-  },
-  precomputeTransition: (track1Path: string, track2Path: string) => {
-    const a = cleanPath(track1Path);
-    const b = cleanPath(track2Path);
-    if (!a || !b) return Promise.resolve({ success: false, error: 'Bad paths' });
-    return ipcRenderer.invoke('sonetra:precompute-transition', a, b);
-  },
-  // Listen for restart/status events from main process.
-  // Returns an unsubscribe function so callers don't leak listeners.
-  onRestartStatus: (callback: (status: unknown) => void) => {
-    const handler = (_event: Electron.IpcRendererEvent, status: unknown) => {
-      try { callback(status); } catch { /* never let renderer callback break IPC */ }
-    };
-    ipcRenderer.on('sonetra:restart-status', handler);
-    return () => {
-      ipcRenderer.removeListener('sonetra:restart-status', handler);
-    };
-  }
-});
 // Persistent decoded-audio (PCM) disk cache (narrow IPC: hex key + ≤100MB data)
 contextBridge.exposeInMainWorld('pcmCache', {
   get: (key: string) => {

@@ -9,7 +9,7 @@ module.exports = {
   testPathIgnorePatterns: ['/node_modules/', '/app-build/', '/dist/', '/dist_source/', 'smoke\\.test\\.js$'],
   verbose: true,
   collectCoverage: true,
-  collectCoverageFrom: ['js/**/*.ts', 'main.ts', 'preload.ts', 'sonetra-bridge.ts', 'db-manager.ts', 'log-manager.ts'],
+  collectCoverageFrom: ['js/**/*.ts', 'main.ts', 'preload.ts', 'db-manager.ts', 'log-manager.ts'],
   coveragePathIgnorePatterns: ['/node_modules/', '/tests/'],
   // NOTE: no coverageThreshold — Jest 29's threshold check crashes on V8
   // coverage maps (TypeError reading 'sync' in CoverageReporter).

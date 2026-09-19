@@ -53,21 +53,6 @@ async function build() {
         external: ['electron']
     });
 
-    console.log('Building Sonetra Bridge...');
-    // 4. Bundle Sonetra Bridge
-    const sonetraEntry = resolveEntry('sonetra-bridge.js');
-    if (fs.existsSync(sonetraEntry)) {
-        await esbuild.build({
-            entryPoints: [sonetraEntry],
-            bundle: true,
-            platform: 'node',
-            outfile: path.join(BUILD_DIR, 'sonetra-bridge.js'),
-            minify: MINIFY,
-            sourcemap: SOURCEMAP,
-            external: ['electron', 'form-data', 'better-sqlite3']
-        });
-    }
-
     console.log('Building Renderer Process...');
     // 5. Bundle Renderer
     await esbuild.build({
@@ -177,8 +162,7 @@ async function build() {
         'styles.css',
         'icon.png',
         'package.json',
-        'README.md',
-        'sonetra-requirements.txt'
+        'README.md'
     ];
 
     if (!fs.existsSync(path.join(BUILD_DIR, 'assets'))) {
@@ -244,7 +228,7 @@ async function build() {
         }
     }
 
-    // 8. Bundle portable Python + AI deps if present (Sonetra)
+    // 8. Bundle portable Python if present (optional local tooling)
     const embedDir = 'python-embed';
     const embedDest = path.join(BUILD_DIR, embedDir);
     if (fs.existsSync(embedDir) && !fs.existsSync(embedDest)) {
@@ -254,11 +238,11 @@ async function build() {
     } else if (fs.existsSync(embedDest)) {
         console.log('Portable Python already present in build.');
     } else {
-        console.log('Portable Python not found — Sonetra AI will auto-setup on first use.');
+        console.log('Portable Python not found — skipping.');
     }
 
     // 9. Stage external native/runtime deps into the bundle.
-    // Main/Sonetra keep better-sqlite3 + form-data external (native binding
+    // Main keeps better-sqlite3 + form-data external (native binding
     // can't be bundled), and electron-builder only packs what's inside
     // app-build — so copy them here or getDbManager() dies packaged.
     stageExternalDeps();

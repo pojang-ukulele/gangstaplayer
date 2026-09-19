@@ -46,7 +46,7 @@
 - **Auto-Cruise:** Just hit "MIX" and let it flow using proper crossfades.
 - **Fast Mix:** Hit Next/Prev buttons (`>|` or `|<`) for a fast 4-second DJ cut.
 - **Transport Lock:** Progress/seek/tempo/Next/Prev lock during crossfade blending for stability — STOP (and ENTER) always stays armed and aborts the blend.
-- **Sonetra AI (pre-warm only):** When enabled, blends trigger background AI-transition generation for future mixes; live AI-stem playback is not implemented. The cache is checked before generating (no duplicate uploads), 5xx errors retry with backoff, the circuit breaker counts one logical operation (not per-attempt), and mixer status surfaces as toasts.
+- **Local DSP Auto-Mix:** All blends are rendered by the built-in local DSP engine (EQ crossfade, filter sweeps, BPM sync). The former Sonetra AI Python backend was removed — no server, no uploads, mixing works fully offline.
 - **Customizable:** Open Settings (`⚙️`) to toggle effects and customize fade durations.
 
 ### 🎙️ STUDIO RECORDING
@@ -163,7 +163,7 @@
 
 - **Sandboxed File I/O**: The renderer process can only write files to paths returned by native OS save dialogs or to the app's `userData` directory. All file paths are validated for traversal attacks, null-byte injection, size limits, and media file types.
 - **Audio Validation**: Incoming audio files are checked for valid magic-number signatures (WAV, MP3, OGG, FLAC, M4A, WebM) before decoding, preventing non-audio files from crashing the pipeline.
-- **AutoMix Crash Recovery**: The AI mixer server auto-restarts on failure with backoff (max 3 attempts). Python dependencies are installed manually (`npm run setup:sonetra` / `setup:sonetra:win`) — the app never auto-runs pip.
+- **AutoMix Crash Recovery**: Crossfades are generation-guarded with track-ID pinning, so abort/delete/reorder during async load can never promote the wrong deck.
 - **Memory Safety**: Blob URLs are revoked with a delayed "graveyard" mechanism to prevent race conditions during rapid track skipping, and reclaimed on app exit.
 - **Test Coverage**: 150 automated tests across 20 suites covering audio engine, player logic, settings persistence, state management, and utility functions, plus a Playwright smoke test. Run `npm run typecheck` before committing.
 
@@ -174,19 +174,12 @@
 ### Prerequisites
 
 - **Node.js**: v22.12+ Recommended
-- **Python**: v3.12+ (Required for Sonetra AI bridge functionality)
-
-> **Note**: Sonetra AI mixing requires a running/local Python FastAPI server (setup in `sonetra-bridge.js`). If not using AI features, you can skip the Python dependency.
 
 ### Setup
 
 ```bash
 git clone https://github.com/coreyshearwater/ug-gangsta-player-pro-3.git
 npm install
-
-# (Optional) Setup Sonetra AI dependencies:
-npm run setup:sonetra      # macOS/Linux
-npm run setup:sonetra:win  # Windows
 ```
 
 ### Start Development

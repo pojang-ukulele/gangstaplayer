@@ -16,6 +16,6 @@
     "noEmit": true,
     "resolveJsonModule": true
   },
-  "include": ["js/**/*", "main.ts", "preload.ts", "sonetra-bridge.ts", "db-manager.ts", "log-manager.ts"],
+  "include": ["js/**/*", "main.ts", "preload.ts", "db-manager.ts", "log-manager.ts"],
   "exclude": ["node_modules", "dist", "app-build", "dist_source", "build-prod.js", "tests"]
 }

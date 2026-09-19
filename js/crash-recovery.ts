@@ -17,7 +17,6 @@ import {
     padLoopStart, padLoopEnd, padWaveforms,
     loadSampleFromPath, recomputePadBeatGrid
 } from './sampler';
-import { showConfirm } from './modals';
 import { AUTO_SAVE_INTERVAL_MS, MAX_SNAPSHOTS, MIN_SAVE_INTERVAL_MS, NUM_PADS } from './constants';
 
 // === Constants ===
@@ -792,7 +791,7 @@ export function initCrashRecovery(): void {
 }
 
 /**
- * Check if there is a saved snapshot and prompt user to restore.
+ * Check if there is a saved snapshot and auto-restore it (no prompt).
  * Returns true if a snapshot was restored.
  */
 let _restorePromptOpen = false;
@@ -819,28 +818,17 @@ export function checkAndRestore(): Promise<boolean> {
 
         _restorePromptOpen = true;
         const done = (v: boolean) => { _restorePromptOpen = false; resolve(v); };
-        // Queued confirm — concurrent showConfirm callers no longer clobber it.
-        showConfirm(
-            'CRASH RECOVERY',
-            `We detected an unsaved session from ${ageStr}.\nRestore it?`,
-            () => {
-                // Reject-proof: restoreSnapshot() rejecting previously left
-                // `done` uncalled, wedging checkAndRestore (and the DB load
-                // gated behind it) forever.
-                try {
-                    restoreSnapshot().then(
-                        (ok) => done(!!ok),
-                        () => done(false)
-                    );
-                } catch {
-                    done(false);
-                }
-            },
-            () => {
-                clearSnapshots();
-                toast.info("Crash session discarded.");
-                done(false);
-            }
-        );
+        // Auto-restore — no modal: the last session always comes back.
+        // Reject-proof: restoreSnapshot() rejecting previously left
+        // `done` uncalled, wedging checkAndRestore (and the DB load
+        // gated behind it) forever.
+        try {
+            restoreSnapshot().then(
+                (ok) => done(!!ok),
+                () => done(false)
+            );
+        } catch {
+            done(false);
+        }
     });
 }

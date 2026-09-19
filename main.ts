@@ -1,52 +1,12 @@
 import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron';
 import * as path from 'path';
 import * as fs from 'fs';
-import { createHash } from 'crypto';
 
-import sonetraBridge, { addAllowedAudioFile, isAllowedAudioDirForPath, isAllowedAudioFile } from './sonetra-bridge';
-import { getDbManager, initDbManager } from './db-manager';
+import { getDbManager, initDbManager, addAllowedAudioFile, isAllowedAudioDirForPath, isAllowedAudioFile } from './db-manager';
 import { logManager, LogLevel } from './log-manager';
 import { MAX_FILE_SIZE_BYTES, MAX_PLAYLIST_SEARCH_RESULTS, VALID_AUDIO_EXTENSIONS } from './js/constants';
 
 const READABLE_EXTENSIONS = new Set([...VALID_AUDIO_EXTENSIONS, 'json']);
-
-// Transition cache for pre-computed transitions (byte-budgeted).
-// Keys are 64-char SHA-256 hex from normalizeCacheKey (fixed length,
-// poison-resistant: an unvalidated/giant renderer string can never become a
-// Map key or evict legit entries). Byte cap 200MB + 50-entry cap enforced
-// here via oldest-first (LRU-insertion) eviction.
-const MAX_CACHE_ENTRIES = 50;
-const MAX_CACHE_BYTES = 200 * 1024 * 1024;
-const transitionCache = new Map<string, { buffer: Buffer; bytes: number }>();
-let transitionCacheBytes = 0;
-
-function addToCache(key: string, value: Buffer) {
-  // Poison resistance: only hashed keys enter the cache. Anything else
-  // (raw paths, oversized strings) is rejected before it can evict legit
-  // entries via LRU pressure.
-  if (typeof key !== 'string' || !/^[0-9a-f]{64}$/.test(key)) return;
-  if (!value || !(value instanceof Buffer)) return;
-  const bytes = value.byteLength;
-  if (!Number.isFinite(bytes) || bytes <= 0) return;
-  if (bytes > MAX_CACHE_BYTES) return;
-  // Overwrite accounting: re-caching the same key must not double-count.
-  const existing = transitionCache.get(key);
-  if (existing) {
-    transitionCacheBytes -= existing.bytes;
-    transitionCache.delete(key);
-  }
-  while (
-    (transitionCache.size >= MAX_CACHE_ENTRIES || transitionCacheBytes + bytes > MAX_CACHE_BYTES) &&
-    transitionCache.size > 0
-  ) {
-    const firstKey = transitionCache.keys().next().value;
-    if (!firstKey) break;
-    transitionCacheBytes -= transitionCache.get(firstKey)!.bytes;
-    transitionCache.delete(firstKey);
-  }
-  transitionCache.set(key, { buffer: value, bytes });
-  transitionCacheBytes += bytes;
-}
 
 /**
  * Tracks paths returned by native save dialogs so fs:save-file
@@ -120,8 +80,8 @@ function isAdsOrUncPath(p: string): boolean {
 }
 
 const SAVE_ALLOWED_EXTS = new Set(['json', 'wav']);
-// config.json controls the Sonetra pythonPath (C3 chain) and gangsta.db-journal
-// is live DB state — neither may ever be a save target.
+// config.json is app config and gangsta.db-journal is live DB state —
+// neither may ever be a save target.
 const SAVE_BLOCKED_BASENAMES = new Set(['gangsta.db', 'gangsta.db-wal', 'gangsta.db-shm', 'gangsta.db-journal', 'gangsta_log.txt', 'config.json']);
 /**
  * Blocked-basename check, OS-canonicalized: Windows silently strips trailing
@@ -278,7 +238,7 @@ function isReadPathAllowed(p: string): boolean {
     const real = fs.realpathSync.native(p);
     if (real !== p && isConsentedReadFile(real)) return true;
   } catch { /* dangling — fall through */ }
-  // 2) Sonetra per-file consent (audio picks forwarded from fs:consent-file).
+  // 2) Per-file audio consent (audio picks forwarded from fs:consent-file).
   try { if (isAllowedAudioFile(p)) return true; } catch { /* ignore */ }
   // 3) Native dialog approvals (save/load-kit, save-audio, save-session).
   if (hasDialogPath(p)) return true;
@@ -317,7 +277,7 @@ function logToDisk(level: string, message: string) {
 // FORCE AUTOPLAY
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 
-// Single instance: two processes would fight over SQLite WAL and the Sonetra port
+// Single instance: two processes would fight over SQLite WAL
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
@@ -456,7 +416,7 @@ function registerIpcHandlers(): void {
     });
     if (canceled || !filePaths || !filePaths.length) return null;
     // Per-file consent only — never whitelist the whole directory (H3: one
-    // kit pick must not expose every file in the folder to Sonetra/reads).
+    // kit pick must not expose every file in the folder to later reads).
     try { addConsentedReadFile(filePaths[0]); } catch { /* ignore */ }
     return filePaths[0];
   });
@@ -483,32 +443,6 @@ function registerIpcHandlers(): void {
   });
 
   // Secure File System Handlers
-  const inFlightPrecompute = new Set<string>();
-  const normalizeCacheKey = (a: string, b: string): string | null => {
-    // Length-bound + validated: non-strings, empties, null bytes, and
-    // overlong inputs never become keys. The normalized pair is hashed to a
-    // fixed 64-char key so giant paths can't bloat the Map and crafted keys
-    // can't collide with / evict legit entries (poison resistance).
-    if (typeof a !== 'string' || typeof b !== 'string') return null;
-    if (!a || !b || a.length > 32760 || b.length > 32760) return null;
-    if (a.includes('\0') || b.includes('\0')) return null;
-    const sa = a.slice(0, 32760);
-    const sb = b.slice(0, 32760);
-    const norm = (s: string): string => {
-      const r = path.resolve(s);
-      return process.platform === 'win32' || process.platform === 'darwin' ? r.toLowerCase() : r;
-    };
-    const raw = `${norm(sa)}||${norm(sb)}`;
-    try {
-      return createHash('sha256').update(raw).digest('hex');
-    } catch {
-      return null;
-    }
-  };
-  function checkCacheKeyArgs(a: unknown, b: unknown): boolean {
-    return typeof a === 'string' && typeof b === 'string'
-      && a.length > 0 && b.length > 0 && a.length <= 32760 && b.length <= 32760;
-  }
   ipcMain.handle('fs:save-file', async (_event, pathStr: string, data: Uint8Array) => {
     if (rateLimited('fs:save-file', 100)) return false;
     const validated = validatePath(pathStr);
@@ -655,8 +589,8 @@ function registerIpcHandlers(): void {
     // disk right now, look like media/kit, and fit the size bound.
     const ok = addConsentedReadFile(validated);
     if (!ok) return false;
-    // Forward audio picks to the Sonetra bridge so AI transitions/analysis
-    // can read the same consented file from disk.
+    // Forward audio picks to the consent store so later disk reads
+    // (playback, analysis) can read the same consented file from disk.
     try {
       const ext = path.extname(validated).replace('.', '').toLowerCase();
       if (ext !== 'json') addAllowedAudioFile(validated);
@@ -958,82 +892,6 @@ function registerIpcHandlers(): void {
     return filePaths[0];
   });
 
-  // ==================== SONETRA AI MIXER HANDLERS ====================
-  // H4: start/stop/restart/get-status/create-transition/analyze-track
-  // removed — zero renderer call sites (only get-cached/precompute are
-  // live). Server lifecycle is main-process owned; orphaned handlers only
-  // widened renderer reach into Python execution.
-
-  ipcMain.handle('sonetra:get-cached-transition', async (_event, track1Path: string, track2Path: string) => {
-    if (!checkCacheKeyArgs(track1Path, track2Path)) {
-      return { success: false, error: 'Bad paths' };
-    }
-    if (rateLimited('sonetra:get-cached-transition', 250)) {
-      return { success: false, error: 'Rate limited' };
-    }
-    const cacheKey = normalizeCacheKey(track1Path, track2Path);
-    if (!cacheKey) {
-      return { success: false, error: 'Bad paths' };
-    }
-    const cached = transitionCache.get(cacheKey);
-    if (cached) {
-      // 50MB IPC cap (documented): Electron structured-clones the Buffer
-      // across IPC — a 200MB cached transition would freeze/OOM the
-      // renderer. Cache may hold up to 200MB total, but single IPC replies
-      // are capped at 50MB; larger entries require re-streaming.
-      if (cached.bytes > 50 * 1024 * 1024) {
-        return { success: false, error: 'Cached transition too large for IPC' };
-      }
-      return { success: true, audioBuffer: cached.buffer };
-    }
-    return { success: false, error: 'No cached transition found' };
-  });
-
-  ipcMain.handle('sonetra:precompute-transition', async (_event, track1Path: string, track2Path: string) => {
-    if (!checkCacheKeyArgs(track1Path, track2Path)) {
-      return { success: false, error: 'Bad paths' };
-    }
-    if (rateLimited('sonetra:precompute-transition', 1000)) {
-      return { success: false, error: 'Rate limited' };
-    }
-    const cacheKey = normalizeCacheKey(track1Path, track2Path);
-    if (!cacheKey) {
-      return { success: false, error: 'Bad paths' };
-    }
-    if (transitionCache.has(cacheKey)) {
-      return { success: true, cached: true };
-    }
-    // Dedupe concurrent precomputes for the same key — previously N parallel
-    // invokes all missed and fired N duplicate 100MB uploads.
-    // Concurrency cap: max 2 in-flight precomputes, rest rejected 429 so a
-    // burst cannot queue unbounded 100MB uploads (DoS).
-    if (inFlightPrecompute.has(cacheKey)) {
-      return { success: false, error: 'Precompute already in flight' };
-    }
-    if (inFlightPrecompute.size >= 2) {
-      return { success: false, error: '429 Too Many Requests (precompute queue full)' };
-    }
-    inFlightPrecompute.add(cacheKey);
-    try {
-      const result = await sonetraBridge.createTransition(track1Path, track2Path, 'smooth');
-      if (result.success && result.audioBuffer) {
-        addToCache(cacheKey, result.audioBuffer);
-        return { success: true, cached: false };
-      }
-      return result;
-    } finally {
-      inFlightPrecompute.delete(cacheKey);
-    }
-  });
-
-  // Forward bridge status events to the renderer
-  sonetraBridge.onStatusChange((status) => {
-    const win = getMainWindow();
-    if (win) {
-      win.webContents.send('sonetra:restart-status', status);
-    }
-  });
-
   // ==================== DATABASE HANDLERS ====================
 
   ipcMain.handle('db:upsert-track', async (_event, track) => {
@@ -1171,7 +1029,7 @@ function createWindow() {
   }, 8000).unref?.();
 
   win.on('close', () => {
-    // Window-scoped cleanup only. Full process teardown (DB/logger/sonetra)
+    // Window-scoped cleanup only. Full process teardown (DB/logger)
     // lives on quit paths below — doing it here kills the logger timer and
     // orphans state on macOS where close != quit and activate re-creates
     // a window in the same process.
@@ -1182,9 +1040,8 @@ function createWindow() {
 }
 
 // Idempotent full cleanup (C1): previously only win 'close' cleaned up, so
-// Cmd+Q / dock quit / taskkill / macOS close-then-quit leaked a dirty WAL and
-// orphaned uvicorn. Every quit path funnels through here. Awaits stopServer()
-// so the Python child is reaped before exit; before-quit holds the quit with
+// Cmd+Q / dock quit / taskkill / macOS close-then-quit leaked a dirty WAL.
+// Every quit path funnels through here. before-quit holds the quit with
 // preventDefault until done.
 let shuttingDown = false;
 let shutdownPromise: Promise<void> | null = null;
@@ -1193,16 +1050,6 @@ function shutdownMain(reason: string): Promise<void> {
   shuttingDown = true;
   shutdownPromise = (async () => {
     try { dialogReturnedPaths.clear(); } catch { /* ignore */ }
-    // A { success:false } stop leaves a live uvicorn behind (port zombie)
-    // that blocks the next launch — log it loudly instead of exiting silent.
-    let sonetraStopped = false;
-    try {
-      const res = await sonetraBridge.stopServer().catch(() => null);
-      sonetraStopped = !!res && (res as { success?: boolean }).success === true;
-    } catch { sonetraStopped = false; }
-    if (!sonetraStopped) {
-      try { logToDisk('ERROR', `Shutdown (${reason}): Sonetra stopServer failed — uvicorn may still be running (zombie); port 8765 may stay bound`); } catch { /* ignore */ }
-    }
     try {
       getDbManager()?.close();
     } catch (e) {
@@ -1270,11 +1117,10 @@ process.on('uncaughtException', (error) => {
   try {
     logToDisk('ERROR', `UNCAUGHT EXCEPTION: ${(error as Error)?.stack || error}`);
   } catch { /* ignore */ }
-  // Crash path must also reap the Python child and checkpoint the DB —
-  // otherwise an exception leaves an orphaned uvicorn + dirty WAL.
-  void sonetraBridge.stopServer().catch(() => undefined).finally(() => {
-    try { getDbManager()?.close(); } catch { /* ignore */ }
-    logManager.generatePostMortem({ type: 'CRASH_UNCAUGHT_EXCEPTION' })
+  // Crash path must also checkpoint the DB — otherwise an exception
+  // leaves a dirty WAL behind.
+  try { getDbManager()?.close(); } catch { /* ignore */ }
+  logManager.generatePostMortem({ type: 'CRASH_UNCAUGHT_EXCEPTION' })
     .then((report) => console.error(`GURU ERROR: Crash report generated at ${report}`))
     .catch((e) => console.error(`GURU ERROR: Failed to write crash report: ${e}`))
     .finally(() => {
@@ -1282,7 +1128,6 @@ process.on('uncaughtException', (error) => {
       try { logManager.close(); } catch { /* ignore */ }
       try { app.exit(1); } catch { try { process.exit(1); } catch { /* ignore */ } }
     });
-  });
 });
 // Burst-tracked so a rejecting loop can't silently accumulate handles.
 // Rejections are counted per-minute-window; a sustained burst flushes a

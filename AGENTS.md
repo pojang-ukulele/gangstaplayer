@@ -18,7 +18,7 @@ Electron-based desktop ghetto-tech sampler, tape deck, and DJ mixing application
 | Testing | Jest (77 tests), Playwright (smoke) |
 | Audio | Web Audio API, WebMIDI |
 | Storage | better-sqlite3 (track metadata) |
-| AI Mixer | Python FastAPI (Sonetra bridge) |
+| AI Mixer | Local DSP engine (EQ crossfade, filter sweeps, BPM sync — Sonetra Python backend removed) |
 | Packaging | electron-builder (NSIS for Win, DMG for Mac) |
 
 ## Project Structure
@@ -26,7 +26,6 @@ Electron-based desktop ghetto-tech sampler, tape deck, and DJ mixing application
 ```
 ├── main.ts                     # Electron main process (322 lines)
 ├── preload.ts                  # Context bridge (52 lines)
-├── sonetra-requirements.txt    # Python deps for Sonetra AI (10 lines)
 ├── js/main.ts                  # Renderer entry, UI init, event wiring (589 lines)
 ├── js/audio.ts                 # Web Audio context, master gain, analyser, worklets (96 lines)
 ├── js/modals.ts                # Unified modal open/close with focus mgmt (80 lines)
@@ -51,7 +50,6 @@ Electron-based desktop ghetto-tech sampler, tape deck, and DJ mixing application
 ├── js/workers/audio-worker.ts  # Web Worker: BPM detection + WAV encoding (116 lines)
 ├── js/workers/gangsta-processor.ts # AudioWorkletProcessor: gangsta effects (108 lines)
 ├── js/workers/recorder-processor.ts # AudioWorkletProcessor: capture (43 lines)
-├── sonetra-bridge.ts           # Python/Sonetra AI subprocess management (653 lines)
 ├── db-manager.ts               # SQLite database manager (108 lines)
 ├── log-manager.ts              # Logging system with ring buffer + crash reports (93 lines)
 ├── scripts/build.js            # esbuild bundler script (137 lines)
@@ -78,7 +76,7 @@ Electron-based desktop ghetto-tech sampler, tape deck, and DJ mixing application
 |---------|-----------|---------|
 | `app:minimize` | Render→Main | Minimize window |
 | `app:maximize` | Render→Main | Toggle maximize/unmaximize |
-| `app:close` | Render→Main | Close window (also closes DB + Sonetra) |
+| `app:close` | Render→Main | Close window (also closes DB) |
 | `app:set-fullscreen` | Render→Main | Full screen toggle |
 | `app:ready-to-show` | Render→Main | Show window when ready |
 | `app:open-external` | Render→Main | Open README in Notepad (win32 only) |
@@ -93,14 +91,6 @@ Electron-based desktop ghetto-tech sampler, tape deck, and DJ mixing application
 | `fs:save-recording` | Render→Main | Save recording buffer to userData/recordings |
 | `fs:append-log` | Render→Main | Persist log entry to disk |
 | `fs:get-log-path` | Render→Main | Return current log file path |
-| `sonetra:start-server` | Render→Main | Start Python FastAPI server |
-| `sonetra:stop-server` | Render→Main | Stop Python server |
-| `sonetra:restart-server` | Render→Main | Restart Python server |
-| `sonetra:get-status` | Render→Main | Check if Sonetra is running |
-| `sonetra:create-transition` | Render→Main | Generate AI transition between tracks |
-| `sonetra:analyze-track` | Render→Main | Send track to Sonetra for analysis |
-| `sonetra:get-cached-transition` | Render→Main | Get from LRU cache (max 50 entries) |
-| `sonetra:precompute-transition` | Render→Main | Pre-generate + cache transition |
 | `db:upsert-track` | Render→Main | Insert/update track metadata |
 | `db:get-track` | Render→Main | Get track by path |
 | `db:search-tracks` | Render→Main | Search tracks by name/path (LIKE %) |
@@ -116,8 +106,8 @@ Four context bridges exposed via `contextBridge.exposeInMainWorld`:
 
 - `window.electronAPI` — minimize, maximize, close, setFullScreen, saveKit, loadKit, saveAudioDialog, **getPathForFile** (via `webUtils.getPathForFile`), openSampleDialog, appReadyToShow, openExternal, generateCrashReport
 - `window.fileSystem` — saveFile, readFile, ensureRecordingsDir, saveRecording, appendLog, getLogPath
-- `window.sonetra` — startServer, stopServer, **restartServer**, getStatus, createTransition, analyzeTrack, getCachedTransition, precomputeTransition, **onRestartStatus** (event listener)
 - `window.database` — upsertTrack, getTrack, searchTracks, getAllTracks
+- `window.pcmCache` — decoded-audio PCM disk cache (get/put, hex-keyed)
 
 ## Renderer Entry (`js/main.ts`)
 
@@ -361,22 +351,9 @@ Contains shared pure functions used across the renderer:
 | `isValidAudio(arrayBuffer)` | Convenience boolean wrapper around `validateAudioSignature`. |
 | `Disposable` class | Manages cleanup callbacks with `add()` and `on(el, event, handler)` methods. Calling `dispose()` tears down all registered listeners/timers. Used by `VirtualScroller` to prevent listener leaks. |
 
-## Sonetra Bridge (`sonetra-bridge.ts`)
+## AI Mixer (local DSP — Sonetra removed)
 
-Manages Python FastAPI server for AI-powered transitions.
-
-| Method | Purpose |
-|--------|---------|
-| `startServer()` | Find Sonetra directory, resolve Python (config > venv > portable > system), auto-install deps via `_ensureDependencies()`, spawn uvicorn, health check |
-| `stopServer()` | Kill process (taskkill on Windows, SIGTERM on Unix) |
-| `restartServer()` | Stop then start the server, emit restart-status events |
-| `createTransition(path1, path2, style)` | Send both files as multipart form-data to /transition/create |
-| `analyzeTrack(path)` | Send file to /analyze/track, return JSON analysis |
-| `getStatus()` | Return isRunning, port, sonetraPath |
-
-**Python resolution order:** config.pythonPath → Sonetra venv/Scripts/python.exe → portable python-embed/python.exe → system `py` (Windows) / `python3` (Unix).
-
-**Auto-dependency installation:** `_ensureDependencies()` runs `pip install -r sonetra-requirements.txt` on server start if deps are missing.
+Mixing is handled entirely by the local DSP engine (EQ crossfade, filter sweeps, BPM sync), fully offline. The former Sonetra Python FastAPI backend (`sonetra-bridge.ts`, `sonetra:*` IPC, preload `sonetra` bridge) was removed; the audio-consent allowlist it owned now lives in `db-manager.ts` (`isAllowedAudioFile`/`isAllowedAudioDirForPath`/`addAllowedAudioFile`).
 
 ## DB Manager (`db-manager.ts`)
 
@@ -411,10 +388,9 @@ SQLite via better-sqlite3, WAL mode + NORMAL sync.
 esbuild bundles:
 - Main process → `app-build/main.js` (node, external: electron/fsevents/better-sqlite3)
 - Preload → `app-build/preload.js` (node, external: electron)
-- Sonetra Bridge → `app-build/sonetra-bridge.js` (node, external: electron/form-data)
 - Renderer `js/main.ts` → `app-build/js/main.js` (browser, ESM)
 - Workers → `app-build/js/workers/audio-worker.js`, `gangsta-processor.js`, `recorder-processor.js`
-- Assets copied: `index.html`, `styles.css`, `icon.png`, `package.json` (minimal), `README.md`, `sonetra-requirements.txt`, `assets/*`
+- Assets copied: `index.html`, `styles.css`, `icon.png`, `package.json` (minimal), `README.md`, `assets/*`
 
 ## IPC Communication
 
@@ -423,7 +399,6 @@ All communication via `contextBridge` in `preload.ts`. Four bridges:
 ```
 electronAPI  →  window controls, dialogs, crash reports, getPathForFile
 fileSystem   →  file read/write, recording, logging
-sonetra      →  AI mixer control (start/stop/restart/status/transitions)
 database     →  track metadata CRUD
 ```
 
@@ -443,8 +418,6 @@ database     →  track metadata CRUD
 | `npm test` | Run Jest test suite (77 tests) |
 | `npm run build:prod` | Minified obfuscated production build |
 | `npm run dist` | Package into installer (electron-builder) |
-| `npm run setup:sonetra` | Install Python deps for Sonetra AI (macOS/Linux) |
-| `npm run setup:sonetra:win` | Install Python deps for Sonetra AI (Windows) |
 | `npm run audit` | Run npm audit at high severity level |
 | `npm run audit:fix` | Fix npm audit issues |
 
@@ -481,7 +454,7 @@ Six test files: `audio-engine.test.ts` (13 tests), `player.test.ts`, `settings.t
 - Custom scrollbars, no external UI framework
 - Drag-and-drop uses native HTML5 DnD API
 - Multi-select uses SHIFT/CTRL + click pattern
-- IPC returns raw values (Buffer for file data, Track objects for DB, etc.) — call sites check for null/undefined. Sonetra bridge methods return `{ success, error }` shape.
+- IPC returns raw values (Buffer for file data, Track objects for DB, etc.) — call sites check for null/undefined.
 - State management: ReactiveStore with property-specific subscriptions
 - AudioContext singleton with worklet registration protection
 - Blob URL lifecycle: created on track load, revoked after delay

@@ -16,9 +16,7 @@
     "test:unit": "jest --coverage",
     "test:smoke": "node scripts/build.js && jest tests/smoke.test.js --coverage=false --testPathIgnorePatterns=/node_modules/ /app-build/ /dist/ /dist_source/",
     "audit": "npm audit --audit-level=high",
-    "audit:fix": "npm audit fix",
-    "setup:sonetra": "pip install -r sonetra-requirements.txt",
-    "setup:sonetra:win": "py -m pip install -r sonetra-requirements.txt"
+    "audit:fix": "npm audit fix"
   },
   "dependencies": {
     "better-sqlite3": "^13.0.3",
@@ -76,13 +74,11 @@
     "files": [
       "main.js",
       "preload.js",
-      "sonetra-bridge.js",
       "index.html",
       "styles.css",
       "icon.png",
       "package.json",
       "README.md",
-      "sonetra-requirements.txt",
       "assets/**/*",
       "js/**/*",
       "node_modules/better-sqlite3/**/*",
@@ -119,10 +115,6 @@
       {
         "from": "README.md",
         "to": "README.md"
-      },
-      {
-        "from": "sonetra-requirements.txt",
-        "to": "sonetra-requirements.txt"
       },
       {
         "from": "python-embed",
