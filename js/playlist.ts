@@ -66,6 +66,25 @@ let _filteredView: Track[] | null = null;
 let _filterQuery = '';
 const ITEM_HEIGHT = 26; // Pixels — compact single-line row
 
+/**
+ * TEST-ONLY affordance (durable): drives filter/focus/nav state that is
+ * otherwise reachable only through DOM gestures. No production caller uses
+ * this — runtime behavior is identical with or without it.
+ */
+export const __playlistTestHooks = {
+    setFilter(view: Track[] | null): void {
+        _filteredView = view;
+        _isFiltering = view !== null;
+        _filterQuery = view ? 'test' : '';
+    },
+    resetNav(): void {
+        anchorIndex = -1;
+        pivotIndex = -1;
+        playlistFocused = false;
+    },
+    setFocus(v: boolean): void { playlistFocused = !!v; },
+};
+
 let _playlistInit = false;
 export function initPlaylist(deps: PlaylistDeps): void {
     if (_playlistInit) {
@@ -1178,7 +1197,8 @@ async function loadTrackToPad(trackIdx: number, padIdx: number): Promise<void> {
  * If `insertAfter` is true, the item is placed after `toIndex` instead of before it.
  * Updates selection indices to follow the moved item.
  */
-function reorderPlaylist(fromIndex: number, toIndex: number, insertAfter: boolean): void {
+/** Exported for unit tests: pure state transition, no DOM of its own. */
+export function reorderPlaylist(fromIndex: number, toIndex: number, insertAfter: boolean): void {
     // Reordering under an armed finishCrossfade(nextIdx) promotes the wrong track.
     // Abort the blend first so the timer can't fire with a stale index.
     if (state.isCrossfadeInProgress) {
