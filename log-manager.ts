@@ -22,12 +22,15 @@ class LogManager {
         const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         const addEntry = (dir: string, replacement: string) => {
             if (!dir) return;
-            // Normalize to both / and \\ for Windows paths
-            const normalizedDir = path.normalize(dir);
-            const escapedDir = escapeRegExp(normalizedDir);
+            const normalized = path.normalize(dir);
+            const variants = [...new Set([dir, normalized, dir.replace(/\\/g, '/'), normalized.replace(/\\/g, '/')])]
+                .filter(Boolean)
+                .sort((a, b) => b.length - a.length);
+            const alternatives = variants.map(escapeRegExp).join('|');
+            const flags = `${platform === 'win32' || platform === 'darwin' ? 'i' : ''}g`;
             this.redactionEntries.push({
-                pattern: new RegExp(`^${escapedDir.replace(/\\\\/g, '[\\\\/]')}`, platform === 'win32' || platform === 'darwin' ? 'i' : ''),
-                replacement: replacement
+                pattern: new RegExp(`(?:${alternatives})(?=$|[\\\\/])`, flags),
+                replacement
             });
         };
 

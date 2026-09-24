@@ -53,7 +53,8 @@ const ALLOWED_AUDIO_DIRS: string[] = [
 // honors only that file, never its parent directory.
 const ALLOWED_AUDIO_FILES = new Map<string, number>();
 const CONSENT_TTL_MS = 24 * 60 * 60 * 1000;
-const MAX_CONSENTED_FILES = 256;
+const MAX_CONSENTED_FILES = 5000;
+const MAX_PERSISTED_CONSENT_FILES = 5000;
 
 function canonicalAudioKey(p: string): string {
     try {
@@ -86,55 +87,75 @@ export function isAllowedAudioDirForPath(filePath: string): boolean {
  * Validates existence, audio extension, and size before storing — a renderer
  * string alone never grants access. Returns true when consent was recorded.
  */
-export function addAllowedAudioFile(filePath: string): boolean {
-    if (!filePath || typeof filePath !== 'string') return false;
-    if (filePath.includes('\0')) return false;
-    if (filePath.length > 32760) return false;
-    if (/(^|[\\/])\.\.([\\/]|$)/.test(filePath)) return false;
-    if (filePath.includes(':') && !/^[a-zA-Z]:[\\/]/.test(filePath)) return false;
-    if (filePath.startsWith('\\\\') || filePath.startsWith('//')) return false;
-    let resolved: string;
-    try { resolved = path.resolve(path.normalize(filePath)); } catch { return false; }
-    const ext = path.extname(resolved).replace('.', '').toLowerCase();
-    if (!AUDIO_EXTENSIONS.has(ext)) return false;
-    try {
-        let real = resolved;
-        try { real = fs.realpathSync.native(resolved); } catch { /* use resolved */ }
-        const st = fs.statSync(real);
-        if (!st.isFile()) return false;
-        if (st.size > 100 * 1024 * 1024) return false;
-        const now = Date.now();
-        for (const [k, t] of Array.from(ALLOWED_AUDIO_FILES)) {
-            if (now - t > CONSENT_TTL_MS) ALLOWED_AUDIO_FILES.delete(k);
-        }
-        ALLOWED_AUDIO_FILES.set(canonicalAudioKey(resolved), now);
-        const realKey = canonicalAudioKey(real);
-        if (realKey !== canonicalAudioKey(resolved)) ALLOWED_AUDIO_FILES.set(realKey, now);
-        while (ALLOWED_AUDIO_FILES.size > MAX_CONSENTED_FILES) {
-            const oldest = ALLOWED_AUDIO_FILES.keys().next().value;
-            if (!oldest) break;
-            ALLOWED_AUDIO_FILES.delete(oldest);
-        }
-        return true;
-    } catch { return false; }
+interface ValidatedAudioPath {
+    resolved: string;
+    real: string;
 }
 
-/** True when the path (or its symlink target) was explicitly consented. */
+function validateAudioPath(filePath: string): ValidatedAudioPath | null {
+    if (!filePath || typeof filePath !== 'string') return null;
+    if (filePath.includes('\0') || filePath.length > 32760) return null;
+    if (/(^|[\\/])\.\.([\\/]|$)/.test(filePath)) return null;
+    if (filePath.startsWith('\\\\') || filePath.startsWith('//')) return null;
+    if (!path.isAbsolute(filePath)) return null;
+    if (filePath.includes(':') && !/^[a-zA-Z]:[\\/]/.test(filePath)) return null;
+    let resolved: string;
+    try { resolved = path.resolve(path.normalize(filePath)); } catch { return null; }
+    const ext = path.extname(resolved).replace('.', '').toLowerCase();
+    if (!AUDIO_EXTENSIONS.has(ext)) return null;
+    try {
+        let real = resolved;
+        try { real = fs.realpathSync.native(resolved); } catch { return null; }
+        const st = fs.statSync(real);
+        if (!st.isFile() || st.size > 100 * 1024 * 1024) return null;
+        return { resolved, real };
+    } catch { return null; }
+}
+
+function registerAllowedAudioFile(filePath: string, persist: boolean, expectedReal?: string): boolean {
+    const validated = validateAudioPath(filePath);
+    if (!validated) return false;
+    if (expectedReal && canonicalAudioKey(validated.real) !== canonicalAudioKey(expectedReal)) return false;
+    let persistent = false;
+    if (persist) {
+        try { persistent = getDbManager()?.saveAllowedAudioFile(validated.resolved, validated.real) === true; } catch { /* best effort */ }
+    }
+    const stamp = persistent || !persist ? 0 : Date.now();
+    const now = Date.now();
+    for (const [k, t] of Array.from(ALLOWED_AUDIO_FILES)) {
+        if (t !== 0 && now - t > CONSENT_TTL_MS) ALLOWED_AUDIO_FILES.delete(k);
+    }
+    const resolvedKey = canonicalAudioKey(validated.resolved);
+    ALLOWED_AUDIO_FILES.set(resolvedKey, stamp);
+    const realKey = canonicalAudioKey(validated.real);
+    if (realKey !== resolvedKey) ALLOWED_AUDIO_FILES.set(realKey, stamp);
+    while (ALLOWED_AUDIO_FILES.size > MAX_CONSENTED_FILES) {
+        const oldest = ALLOWED_AUDIO_FILES.keys().next().value;
+        if (!oldest) break;
+        ALLOWED_AUDIO_FILES.delete(oldest);
+    }
+    return true;
+}
+
+export function addAllowedAudioFile(filePath: string): boolean {
+    return registerAllowedAudioFile(filePath, true);
+}
+
 export function isAllowedAudioFile(filePath: string): boolean {
     try {
         const key = canonicalAudioKey(path.resolve(filePath));
         const t = ALLOWED_AUDIO_FILES.get(key);
         if (t !== undefined) {
-            if (Date.now() - t > CONSENT_TTL_MS) { ALLOWED_AUDIO_FILES.delete(key); }
-            else return true;
+            if (t === 0 || Date.now() - t <= CONSENT_TTL_MS) return true;
+            ALLOWED_AUDIO_FILES.delete(key);
         }
         try {
             const real = fs.realpathSync.native(path.resolve(filePath));
             const rk = canonicalAudioKey(real);
             const rt = ALLOWED_AUDIO_FILES.get(rk);
             if (rt !== undefined) {
-                if (Date.now() - rt > CONSENT_TTL_MS) { ALLOWED_AUDIO_FILES.delete(rk); }
-                else return true;
+                if (rt === 0 || Date.now() - rt <= CONSENT_TTL_MS) return true;
+                ALLOWED_AUDIO_FILES.delete(rk);
             }
         } catch { /* dangling — not consented */ }
         return false;
@@ -183,6 +204,13 @@ export class DatabaseManager {
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS allowed_audio_files (
+                path TEXT PRIMARY KEY,
+                real_path TEXT NOT NULL,
+                consented_at INTEGER NOT NULL,
+                last_used_at INTEGER NOT NULL
             );
 
             CREATE INDEX IF NOT EXISTS idx_tracks_path ON tracks(path);
@@ -246,10 +274,10 @@ export class DatabaseManager {
             INSERT INTO tracks (id, path, name, duration, bpm, metadata)
             VALUES (@id, @path, @name, @duration, @bpm, @metadata)
             ON CONFLICT(path) DO UPDATE SET
-                name = excluded.name,
-                duration = excluded.duration,
-                bpm = excluded.bpm,
-                metadata = excluded.metadata,
+                name = CASE WHEN excluded.name <> '' THEN excluded.name ELSE tracks.name END,
+                duration = CASE WHEN excluded.duration > 0 THEN excluded.duration ELSE tracks.duration END,
+                bpm = CASE WHEN excluded.bpm > 0 THEN excluded.bpm ELSE tracks.bpm END,
+                metadata = CASE WHEN excluded.metadata <> '{}' THEN excluded.metadata ELSE tracks.metadata END,
                 last_analyzed = CURRENT_TIMESTAMP
         `);
         return stmt.run({
@@ -295,11 +323,51 @@ export class DatabaseManager {
         return stmt.all(wildcard, wildcard);
     }
 
+    public saveAllowedAudioFile(filePath: string, realPath: string): boolean {
+        try {
+            const key = canonicalAudioKey(filePath);
+            const realKey = canonicalAudioKey(realPath);
+            if (!key || !realKey) return false;
+            const now = Date.now();
+            this.db.prepare(`
+                INSERT INTO allowed_audio_files (path, real_path, consented_at, last_used_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(path) DO UPDATE SET
+                    real_path = excluded.real_path,
+                    last_used_at = excluded.last_used_at
+            `).run(key, realKey, now, now);
+            this.db.prepare(`
+                DELETE FROM allowed_audio_files
+                WHERE path NOT IN (
+                    SELECT path FROM allowed_audio_files
+                    ORDER BY last_used_at DESC LIMIT ?
+                )
+            `).run(MAX_PERSISTED_CONSENT_FILES);
+            return true;
+        } catch {
+            return false;
+        }
+    }
+
+    public getAllowedAudioFiles(): Array<{ path: string; realPath: string }> {
+        try {
+            return this.db.prepare('SELECT path, real_path FROM allowed_audio_files ORDER BY last_used_at DESC')
+                .all()
+                .map((row: any) => ({ path: String(row.path ?? ''), realPath: String(row.real_path ?? '') }))
+                .filter((row: { path: string; realPath: string }) => row.path && row.realPath);
+        } catch {
+            return [];
+        }
+    }
+
     public close() {
         try {
             try { this.db.pragma('wal_checkpoint(TRUNCATE)'); } catch { /* ignore */ }
             this.db.close();
-        } finally { _instance = null; }
+        } finally {
+            _instance = null;
+            ALLOWED_AUDIO_FILES.clear();
+        }
     }
 }
 
@@ -329,4 +397,14 @@ export function getDbManager(): DatabaseManager | null {
 /** Eager init, safe to call once from app.whenReady(). Returns null on failure. */
 export function initDbManager(): DatabaseManager | null {
     return getDbManager();
+}
+
+export function loadAllowedAudioFiles(): number {
+    const db = getDbManager();
+    if (!db) return 0;
+    let loaded = 0;
+    for (const row of db.getAllowedAudioFiles()) {
+        if (registerAllowedAudioFile(row.path, false, row.realPath)) loaded++;
+    }
+    return loaded;
 }

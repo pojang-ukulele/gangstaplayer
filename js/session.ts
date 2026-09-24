@@ -30,6 +30,10 @@ import {
     padWaveforms,
     padLoopStart,
     padLoopEnd,
+    padSelections,
+    padSnappedEdges,
+    padArmedBeats,
+    stopPad,
 } from './sampler';
 
 // ==================== SESSION INTEGRITY ====================
@@ -46,7 +50,9 @@ export function purgeLegacySessionKey(): void {
 function canonicalize(value: unknown): string {
     if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null';
     if (Array.isArray(value)) return `[${value.map(canonicalize).join(',')}]`;
-    const keys = Object.keys(value as Record<string, unknown>).filter(k => k !== 'signature').sort();
+    const keys = Object.keys(value as Record<string, unknown>)
+        .filter(k => k !== 'signature' && (value as Record<string, unknown>)[k] !== undefined)
+        .sort();
     return `{${keys.map(k => `${JSON.stringify(k)}:${canonicalize((value as Record<string, unknown>)[k])}`).join(',')}}`;
 }
 /** FNV-1a fallback for file:// / non-secure contexts without crypto.subtle. */
@@ -86,6 +92,8 @@ async function sha256Hex(data: string): Promise<string> {
 }
 // FNV fallback is corruption-evidence only (weak:true) — not collision
 // resistant. Saved sessions mark signatureWeak so verify can warn.
+export const __sessionTestHooks = { canonicalize, sha256Hex };
+
 async function verifyChecksum(data: string, expected: string, wasWeak?: boolean): Promise<boolean> {
     try {
         if (!/^[0-9a-f]{64}$/i.test(expected)) return false;
@@ -138,6 +146,9 @@ interface SessionData {
         pads: SessionPad[];
     };
     playlist: Track[];
+    currentTrackIndex?: number;
+    selectedIndices?: number[];
+    masterBPM?: number;
     settings: {
         autoMix: {
             eqCrossfade: boolean;
@@ -194,8 +205,13 @@ export async function saveSession(): Promise<void> {
 
         // Collect pad data (incl. loop points — previously dropped on every save)
         const pads: SessionPad[] = [];
+        let skippedRecordings = 0;
         for (let i = 0; i < NUM_PADS; i++) {
             if (padPaths[i]) {
+                if (padPaths[i].startsWith('REC_')) {
+                    skippedRecordings++;
+                    continue;
+                }
                 const ls = padLoopStart[i];
                 const le = padLoopEnd[i];
                 pads.push({
@@ -217,6 +233,9 @@ export async function saveSession(): Promise<void> {
             signature: undefined, // Will be set after HMAC computation
             kit: { pads },
             playlist: state.playlist,
+            currentTrackIndex: state.currentTrackIndex,
+            selectedIndices: [...state.selectedIndices],
+            masterBPM: state.masterBPM,
             settings: {
                 autoMix: {
                     eqCrossfade: settings.autoMix.eqCrossfade,
@@ -253,6 +272,7 @@ export async function saveSession(): Promise<void> {
             // previously this was ignored and "SESSION SAVED" was shown regardless.
             if (ok) {
                 toast.success("SESSION SAVED");
+                if (skippedRecordings > 0) toast.info(`${skippedRecordings} RECORDED PAD(S) NOT SAVED (NO SOURCE FILE)`);
                 logger.info(`[Session] Saved to ${filePath}`);
             } else {
                 toast.error("SESSION SAVE FAILED (WRITE REJECTED)");
@@ -298,9 +318,15 @@ export async function loadSession(): Promise<void> {
     // background (no abort). Without this their late resolve overwrites the
     // pad — or the rollback — minutes later (ghost sample).
     const loadGen = ++sessionLoadGen;
-    const restoreRollback = () => {
-        if (!rollback) return;
-        // Invalidate in-flight per-pad loads so their late resolves skip
+     let restoreRollbackRequested = false;
+     const restoreRollback = () => {
+         if (!rollback) return;
+         restoreRollbackRequested = true;
+         for (let i = 0; i < NUM_PADS; i++) {
+             try { stopPad(i); } catch { /* ignore */ }
+         }
+         // Invalidate in-flight per-pad loads so their late resolves skip
+
         // post-await writes (ghost samples over the restored kit).
         sessionLoadGen++;
         try {
@@ -428,6 +454,9 @@ export async function loadSession(): Promise<void> {
             toast.error('UNSUPPORTED SESSION VERSION — LOAD ABORTED');
             return;
         }
+        if (!Array.isArray(session.playlist) || !session.kit || !Array.isArray(session.kit.pads)) {
+            throw new Error('session schema is incomplete');
+        }
 
         // 1. Snapshot current state first — a failed kit restore must not
         // destroy the working kit with no rollback.
@@ -490,6 +519,10 @@ export async function loadSession(): Promise<void> {
 
         // 2. Load playlist (validated, bounded — crafted files must not OOM).
         // Ext + slice gate: playlist paths must be audio with bounded length.
+         let restoredCurrentTrackIndex = -1;
+
+        let restoredSelectedIndices: number[] = [];
+        let restoredMasterBPM = 0;
         if (Array.isArray(session.playlist)) {
             const clean = session.playlist.filter(isValidTrack).filter(t => {
                 const p = String(t.path).slice(0, 32760);
@@ -502,7 +535,21 @@ export async function loadSession(): Promise<void> {
                 duration: clampNum(t.duration, 0, 86400, 0),
                 bpm: t.bpm === undefined ? undefined : clampNum(t.bpm, 0, 300, 0),
             }));
-            state.update({ playlist: clean });
+             const requestedIndex = Number.isInteger(session.currentTrackIndex) ? Number(session.currentTrackIndex) : -1;
+
+            restoredCurrentTrackIndex = requestedIndex >= 0 && requestedIndex < clean.length ? requestedIndex : -1;
+            restoredSelectedIndices = Array.isArray(session.selectedIndices)
+                ? [...new Set(session.selectedIndices
+                    .map((value) => Number(value))
+                    .filter((value) => Number.isInteger(value) && value >= 0 && value < clean.length))]
+                : [];
+            restoredMasterBPM = clampNum(session.masterBPM, 0, 300, 0);
+            state.update({
+                playlist: clean,
+                currentTrackIndex: restoredCurrentTrackIndex,
+                selectedIndices: restoredSelectedIndices,
+                masterBPM: restoredMasterBPM,
+            });
             // BPM-less tracks get no analysis otherwise — the queue was
             // cleared above and nothing re-enqueues on this path (C18).
             try {
@@ -516,9 +563,15 @@ export async function loadSession(): Promise<void> {
         }
 
         // 3. Load kit
+         let padRestoreFailed = false;
+         let restoreSuperseded = false;
+         const padRestoreTokens = new Map<number, number>();
+
+        let nextPadRestoreToken = 0;
         if (session.kit?.pads && Array.isArray(session.kit.pads)) {
             // Clear existing pads (incl. loop points — stale loops must not survive)
             for (let i = 0; i < NUM_PADS; i++) {
+                try { stopPad(i); } catch { /* ignore */ }
                 padBuffers[i] = undefined!;
                 padPaths[i] = '';
                 padWaveforms[i] = undefined!;
@@ -529,30 +582,51 @@ export async function loadSession(): Promise<void> {
                 try { delete padBpmEstimated[i]; } catch { /* ignore */ }
                 padLoopStart[i] = -1;
                 padLoopEnd[i] = -1;
+                padSelections[i] = null;
+                padSnappedEdges[i] = null;
+                padArmedBeats[i] = null;
             }
 
             // Sequential loads: 16 parallel decodeAudioData of arbitrary files OOMs.
             // Per-pad timeout so one huge/missing file can't stall the restore.
             const withTimeout = <T>(p: Promise<T>, ms: number): Promise<T> =>
                 Promise.race([p, new Promise<T>((_, rej) => setTimeout(() => rej(new Error('pad load timeout')), ms))]);
+            const seenPadIndices = new Set<number>();
             for (const p of session.kit.pads.slice(0, NUM_PADS)) {
                 const idx = Number((p as SessionPad)?.index);
                 const ppath = typeof (p as SessionPad)?.path === 'string' ? (p as SessionPad).path.slice(0, 32760) : '';
-                if (!ppath || !Number.isInteger(idx) || idx < 0 || idx >= NUM_PADS) continue;
-                // Ext gate: pad samples must be audio (slice already bounded).
-                const pext = ppath.split('.').pop()?.toLowerCase() ?? '';
-                if (!(VALID_AUDIO_EXTENSIONS as readonly string[]).includes(pext)) {
-                    logger.warn(`[Session] Pad ${idx} skipped (non-audio ext .${pext})`);
+                if (!ppath || !Number.isInteger(idx) || idx < 0 || idx >= NUM_PADS) {
+                    padRestoreFailed = true;
                     continue;
                 }
-                if (loadGen !== sessionLoadGen) break; // rolled back mid-loop — stop writing
+                if (seenPadIndices.has(idx)) {
+                    padRestoreFailed = true;
+                    continue;
+                }
+                seenPadIndices.add(idx);
+                if (ppath.startsWith('REC_')) {
+                    logger.warn(`[Session] Pad ${idx} recorded sample skipped (no source file)`);
+                    continue;
+                }
+                const pext = ppath.split('.').pop()?.toLowerCase() ?? '';
+                if (!(VALID_AUDIO_EXTENSIONS as readonly string[]).includes(pext)) {
+                    padRestoreFailed = true;
+                    logger.warn(`[Session] Pad ${idx} rejected (non-audio ext .${pext})`);
+                    continue;
+                }
+                 if (loadGen !== sessionLoadGen) {
+                     padRestoreFailed = true;
+                     restoreSuperseded = true;
+                     break;
+                 }
+
+                const token = ++nextPadRestoreToken;
+                padRestoreTokens.set(idx, token);
                 const sessBpm = typeof (p as SessionPad)?.bpm === 'number' ? (p as SessionPad).bpm : undefined;
                 const orig = loadSampleFromPath(ppath, idx, sessBpm);
-                // Late-resolve guard: the timed-out load keeps decoding in the
-                // background; if it lands after a rollback/newer load, undo the
-                // ghost commit for this pad.
                 void orig.then(() => {
-                    if (loadGen !== sessionLoadGen && rollback) {
+                    if (padRestoreTokens.get(idx) !== token) return;
+                    if (restoreRollbackRequested && loadGen !== sessionLoadGen && rollback) {
                         try {
                             const snap = rollback.pads[idx];
                             if (snap) {
@@ -575,14 +649,22 @@ export async function loadSession(): Promise<void> {
                     }
                 }).catch(() => undefined);
                 try {
-                    await withTimeout(orig, 20000);
-                    if (loadGen !== sessionLoadGen) break; // stale — skip post-await writes
+                    const loaded = await withTimeout(orig, 20000);
+                     if (loadGen !== sessionLoadGen) {
+                         padRestoreFailed = true;
+                         restoreSuperseded = true;
+                         break;
+                     }
+
+                    if (!loaded || !padBuffers[idx] || padPaths[idx] !== ppath) {
+                        throw new Error('pad did not commit');
+                    }
+                    padRestoreTokens.delete(idx);
                     const vol = (p as SessionPad).vol;
                     if (typeof vol === 'number' && Number.isFinite(vol)) padVolumes[idx] = Math.min(1, Math.max(0, vol));
                     const bpm = (p as SessionPad).bpm;
                     if (typeof bpm === 'number' && Number.isFinite(bpm)) {
                         padBPMs[idx] = Math.min(300, Math.max(0, bpm));
-                        // Session BPM overwrites fresh analysis — rebuild grid.
                         recomputePadBeatGrid(idx);
                     }
                     if (typeof (p as SessionPad).sync === 'boolean') padSyncState[idx] = (p as SessionPad).sync as boolean;
@@ -593,13 +675,8 @@ export async function loadSession(): Promise<void> {
                     if (typeof ls === 'number' && Number.isFinite(ls) && ls >= 0) padLoopStart[idx] = ls;
                     if (typeof le === 'number' && Number.isFinite(le) && le > 0) padLoopEnd[idx] = le;
 
-                    // Update the volume slider UI
                     const grid = document.getElementById('padGrid');
-                    if (!grid) {
-                        // Load-before-grid previously desync'd padVolumes from
-                        // sliders with zero signal.
-                        logger.warn(`[Session] Pad ${idx} slider skipped (pad grid not built)`);
-                    }
+                    if (!grid) logger.warn(`[Session] Pad ${idx} slider skipped (pad grid not built)`);
                     const slider = grid?.children[idx]?.querySelector('.pad-slider') as HTMLInputElement;
                     if (slider) slider.value = padVolumes[idx].toString();
                     try {
@@ -607,12 +684,22 @@ export async function loadSession(): Promise<void> {
                         renderWaveform(idx);
                     } catch { /* ignore */ }
                 } catch (e) {
-                    // Per-pad failure is non-fatal for the loop, but silent
-                    // before — 16 missing files printed SUCCESS on an empty kit.
+                    padRestoreTokens.delete(idx);
+                    padRestoreFailed = true;
                     logger.warn(`[Session] Pad ${idx} restore failed (${ppath})`, e);
                 }
             }
         }
+         if (padRestoreFailed) {
+             if (restoreSuperseded) {
+                 rollback = null;
+                 return;
+             }
+             restoreRollback();
+             rollback = null;
+             throw new Error('session pad restore incomplete');
+         }
+
 
         // 4. Restore settings.
         // applySettingsToUI() MUST run before saveSettings() — saveSettings
@@ -674,6 +761,14 @@ export async function loadSession(): Promise<void> {
             const { renderPlaylist } = await import('./playlist');
             renderPlaylist();
         } catch { /* playlist UI refresh is best-effort */ }
+        if (restoredCurrentTrackIndex >= 0) {
+            try {
+                const { loadTrack } = await import('./player');
+                await loadTrack(restoredCurrentTrackIndex);
+            } catch (e) {
+                logger.warn('[Session] Current track audio could not be restored', e);
+            }
+        }
         // A manual load supersedes the auto-snapshot: leaving it behind
         // previously re-prompted "Restore unsaved session?" on the next boot
         // for pre-load state, inviting a double-restore clobber.
@@ -681,6 +776,7 @@ export async function loadSession(): Promise<void> {
             const { clearSnapshots } = await import('./crash-recovery');
             clearSnapshots();
         } catch { /* ignore */ }
+        rollback = null;
         toast.success("SESSION LOADED");
         logger.info(`[Session] Loaded from ${filePath}`);
     } catch (err) {

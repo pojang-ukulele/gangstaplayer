@@ -176,6 +176,8 @@ export function initMIDI(deps: MidiDeps): void {
     stopPadFn = deps.stopPad;
     activeVoicesRef = deps.activeVoices;
     padVolumesRef = deps.padVolumes;
+    if (_midiInit) return;
+    _midiInit = true;
     
     midiDeviceSelect = document.getElementById('midiDeviceSelect') as HTMLSelectElement;
     midiStatusEl = document.getElementById('midiStatus');

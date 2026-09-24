@@ -101,8 +101,12 @@ export function openModal(modal: HTMLElement): void {
     // Escape handler — two owners double-answer No on queued confirms.
 }
 
-/** Topmost open modal in DOM order (last .active wins, not first). */
+/** Topmost open modal in focus-stack order, with a DOM fallback. */
 export function getTopModal(): HTMLElement | null {
+    for (let i = _focusStack.length - 1; i >= 0; i--) {
+        const modal = _focusStack[i].modal;
+        if (modal.classList.contains('active')) return modal;
+    }
     const actives = Array.from(document.querySelectorAll<HTMLElement>('.modal.active'));
     return actives.length ? actives[actives.length - 1] : null;
 }

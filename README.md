@@ -58,14 +58,15 @@
 
 ### 🛡️ SECURITY & RELIABILITY
 
-- **Path Validation:** All file I/O hardened against directory traversal, null-byte injection, symlink swaps, ADS/UNC tricks, and oversized payloads. Reads are restricted to media/kit file types (`wav/mp3/ogg/flac/m4a/aac/webm/json`); writes are limited to `.json`/`.wav` via dialog-approved paths (1h TTL) or the app `recordings/` directory (database and log files are never writable from the renderer). Hot IPC channels are rate-limited and transition cache keys are length-checked.
+- **Path Validation:** All file I/O hardened against directory traversal, null-byte injection, symlink swaps, ADS/UNC tricks, and oversized payloads. Reads are restricted to media/kit file types (`wav/mp3/ogg/flac/m4a/aac/webm/json`); native `File` consent is persisted per audio file, and the renderer cannot authorize an arbitrary path string. Writes are limited to `.json`/`.wav` via dialog-approved paths (1h TTL) or the app `recordings/` directory (database and log files are never writable from the renderer). Hot IPC channels are rate-limited and transition cache keys are length-checked.
+- **Navigation and Permissions:** The renderer is locked to the bundled `index.html`; frame/page redirects, new windows, unlisted permissions, video capture, and IPC from untrusted documents are denied.
 - **Lazy Audio Engine:** The AudioContext and sampler/deck signal chains build on first use and rebuild after a closed-context reset — a pre-gesture failure no longer bricks audio permanently. Crossfades are generation-guarded with track-ID pinning, so abort/delete/reorder during async load can never promote the wrong deck.
-- **Session Integrity:** Session files carry a canonical SHA-256 corruption-evidence checksum (key-sorted, whitespace-insensitive; not attacker-proof by design — no secret is stored); corrupt/edited files abort load.
+- **Session Integrity:** Session files carry a canonical SHA-256 corruption-evidence checksum (key-sorted, whitespace-insensitive; not attacker-proof by design — no secret is stored); corrupt/edited files abort load. Sessions also restore the current track, selection, master BPM, playback modes, and pad loop state atomically; mic-only `REC_*` pads are skipped instead of writing invalid paths.
 - **Single Instance Lock:** Only one app instance can run at a time (protects the track database).
 - **Crash Recovery:** Persistent auto-save snapshots every 30s with post-mortem diagnostic reports.
 - **Audio Signature Validation:** Magic-number verification ensures only valid WAV/MP3/OGG/FLAC/M4A/WebM files are loaded.
 - **Worklet Race Protection:** Retry logic for AudioWorklet initialization prevents silent engine startup failures.
-- **Recoverable Audio Worker:** BPM/WAV worker crashes reject pending work with clear errors and respawn on demand — no permanent hangs.
+- **Recoverable Audio Worker:** BPM/WAV worker crashes and timeouts reject pending work, terminate the hung worker, and respawn on demand — no permanent hangs. Decoded-cache limits count decoded PCM rather than compressed bytes.
 - **Modal Safety:** Dialogs trap Tab focus and Escape on confirmations routes through the proper dismiss path, so stacked prompts can never wedge the app.
 
 ---
@@ -154,18 +155,20 @@
 ### Save Your Session
 
 - **Save Kit / Load Kit:** Click `SAVE KIT` / `LOAD KIT` to save or restore your sampler pad configuration (samples by path + volumes). Mic-recorded pads have no source file and are not included in kits.
-- **Save Session / Load Session:** Click `SAVE SESSION` to capture everything — pads, playlist, AutoMix settings, volume/tempo/loop/mode — into a single integrity-checked `.session.json` file. `LOAD SESSION` restores it all.
+- **Save Session / Load Session:** Click `SAVE SESSION` to capture everything — pads, playlist, current track, selection, AutoMix settings, volume/tempo/loop/mode — into a single integrity-checked `.session.json` file. `LOAD SESSION` restores it all; recorded pads without a source file are reported and skipped.
 - **Master Record:** Click the big `REC` button to record your entire output to WAV.
 
 ---
 
 ## 🛡️ Security & Reliability
 
-- **Sandboxed File I/O**: The renderer process can only write files to paths returned by native OS save dialogs or to the app's `userData` directory. All file paths are validated for traversal attacks, null-byte injection, size limits, and media file types.
+- **Sandboxed File I/O**: The renderer process can only write files to paths returned by native OS save dialogs or to the app's `userData` directory. All file paths are validated for traversal attacks, null-byte injection, size limits, and media file types. Native audio-file consent is persisted so restart-safe libraries do not require re-picking every file.
+- **Navigation and Permissions**: Only the bundled document can retain the preload bridge; arbitrary `file:` navigation, redirects, new windows, and unlisted permissions are denied.
 - **Audio Validation**: Incoming audio files are checked for valid magic-number signatures (WAV, MP3, OGG, FLAC, M4A, WebM) before decoding, preventing non-audio files from crashing the pipeline.
+- **Atomic Recovery**: Session and crash-recovery pad restores stop active voices, verify each load, and roll back rather than committing partial kits. Newest staging snapshots win over older live snapshots.
 - **AutoMix Crash Recovery**: Crossfades are generation-guarded with track-ID pinning, so abort/delete/reorder during async load can never promote the wrong deck.
-- **Memory Safety**: Blob URLs are revoked with a delayed "graveyard" mechanism to prevent race conditions during rapid track skipping, and reclaimed on app exit.
-- **Test Coverage**: 150 automated tests across 20 suites covering audio engine, player logic, settings persistence, state management, and utility functions, plus a Playwright smoke test. Run `npm run typecheck` before committing.
+- **Memory Safety**: Blob URLs are revoked with a delayed "graveyard" mechanism to prevent race conditions during rapid track skipping, and reclaimed on app exit. Decoded-cache limits include decoded PCM size.
+- **Test Coverage**: 189 automated tests across 25 suites covering audio engine, player logic, security boundaries, settings persistence, state management, and utility functions, plus a 12-test Playwright smoke suite. Run `npm run typecheck` before committing.
 
 ---
 
@@ -205,8 +208,9 @@ npm run dist
 ### Testing & Typecheck
 
 ```bash
-npm test        # Jest suite (150 tests across 20 suites, incl. Playwright smoke)
-npm run typecheck  # tsc --noEmit — esbuild does NOT typecheck; run this before committing
+npm test              # Jest suite (189 tests across 25 suites)
+npm run test:smoke    # Playwright Electron smoke suite (12 tests)
+npm run typecheck     # tsc --noEmit — esbuild does NOT typecheck; run this before committing
 ```
 
 ---
@@ -217,14 +221,6 @@ npm run typecheck  # tsc --noEmit — esbuild does NOT typecheck; run this befor
 
 ### Third-Party Software
 
-This software uses components from **Sonetra AI** (Sonetra-AI-Mixer), which is also licensed under the **MIT License**.
-
-> Copyright (c) Sonetra AI Contributors
->
-> Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
->
-> The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
->
-> THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+Auto-Mix runs entirely in the local Web Audio/DSP engine. The former Sonetra AI backend is not bundled or contacted by the desktop app.
 
 ---

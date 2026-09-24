@@ -1,6 +1,6 @@
 // === PLAYER MODULE ===
 import { audioCtx, resumeAudioContext, masterGain, ensureAudio } from './audio';
-import { settings } from './settings';
+import { settings, setAutoMixPreference } from './settings';
 import { state, Track, PlaybackMode, LoopMode, replaceTrackInPlaylist } from './state';
 import { detectBPMResilient, resolveBpmPersist } from './worker-client';
 import { getDecoded } from './decoded-cache';
@@ -199,7 +199,7 @@ function revokeLater(url: string, delay = BLOB_REVOKE_DELAY_MS): void {
         }
     }
     pendingRevokes.push(url);
-    setTimeout(() => {
+    const timer = setTimeout(() => {
         const i = pendingRevokes.indexOf(url);
         if (i >= 0) pendingRevokes.splice(i, 1);
         try {
@@ -209,6 +209,7 @@ function revokeLater(url: string, delay = BLOB_REVOKE_DELAY_MS): void {
             // URL might already be revoked
         }
     }, delay);
+    (timer as unknown as { unref?: () => void }).unref?.();
 }
 
 function trackBlobUrl(url: string, isMain: boolean): string {
@@ -336,6 +337,7 @@ export function initPlayer(deps: PlayerDeps): void {
         }
         const cb = document.getElementById('mixOptEnableAI') as HTMLInputElement | null;
         if (cb && cb.checked !== enabled) cb.checked = enabled;
+        if (settings.autoMix.enableAI !== enabled) setAutoMixPreference(enabled);
     });
 
     state.subscribe('loopMode', (mode) => {
@@ -399,8 +401,10 @@ export async function loadTrack(index: number): Promise<void> {
     // Index commits only after the file proves loadable (C10) — failures
     // leave highlight + index on the previous live track.
     const loadId = ++_loadTrackId;
-    
-    engine.main.reset();
+    const previousSrc = engine.main.audio?.src || '';
+    const previousTime = engine.main.audio?.currentTime || 0;
+    const previousPaused = engine.main.audio?.paused !== false;
+
     logger.info(`[Player] Loading track: ${track.name} [ID: ${track.id}]`);
     // Single IPC read shared by playback blob + decode/BPM. Previously this
     // read the file twice (2x I/O, 2x RAM, TOCTOU). decodeAudioData detaches
@@ -506,13 +510,46 @@ export async function loadTrack(index: number): Promise<void> {
     if (index < 0 || index >= live.length || live[index]?.id !== track.id) { logger.debug(`[Player] loadId=${loadId} cancelled: playlist changed`); hideSpinnerIfCurrent(loadId); return; }
     // Blob wraps the ORIGINAL sharedBuffer (C11) — the old slice(0) kept a
     // third full-size copy alive next to the read buffer + verify copy.
-    const safeUrl = trackBlobUrl(URL.createObjectURL(new Blob([sharedBuffer], { type: 'audio/mpeg' })), true);
-    // Handshake before trusting the deck (C13): bare src assignment while a
-    // previous load is buffering aborts it with a media error.
-    const loadOk = await engine.main.loadAsync(safeUrl);
-    if (loadId !== _loadTrackId) { logger.debug(`[Player] loadId=${loadId} superseded during handshake`); return; }
-    if (!loadOk) {
-        logger.warn(`[Player] Load handshake failed for ${track.path}`);
+    let candidateUrl = '';
+    const restorePreviousSource = (): void => {
+        try {
+            if (engine.main.audio.src !== candidateUrl && candidateUrl) return;
+            if (previousSrc) {
+                engine.main.audio.src = previousSrc;
+                engine.main.audio.load();
+                try { engine.main.audio.currentTime = previousTime; } catch { /* not seekable */ }
+                if (!previousPaused) void engine.main.audio.play().catch(() => undefined);
+            } else {
+                engine.main.audio.removeAttribute('src');
+                engine.main.audio.load();
+            }
+        } catch { /* best-effort restoration */ }
+    };
+    try {
+        candidateUrl = URL.createObjectURL(new Blob([sharedBuffer], { type: 'audio/mpeg' }));
+        // Handshake before trusting the deck (C13): bare src assignment while a
+        // previous load is buffering aborts it with a media error.
+        const loadOk = await engine.main.loadAsync(candidateUrl);
+        if (loadId !== _loadTrackId) {
+            logger.debug(`[Player] loadId=${loadId} superseded during handshake`);
+            restorePreviousSource();
+            try { URL.revokeObjectURL(candidateUrl); } catch { /* ignore */ }
+            return;
+        }
+        if (!loadOk) {
+            logger.warn(`[Player] Load handshake failed for ${track.path}`);
+            restorePreviousSource();
+            try { URL.revokeObjectURL(candidateUrl); } catch { /* ignore */ }
+            toast.error("TRACK FAILED TO LOAD — KEPT PREVIOUS TRACK");
+            hideSpinnerIfCurrent(loadId);
+            return;
+        }
+        trackBlobUrl(candidateUrl, true);
+        try { engine.main.reset(); } catch (e) { logger.warn('[Player] Post-load channel reset failed', e); }
+    } catch (e) {
+        restorePreviousSource();
+        try { if (candidateUrl) URL.revokeObjectURL(candidateUrl); } catch { /* ignore */ }
+        logger.warn(`[Player] Load source setup failed for ${track.path}`, e);
         toast.error("TRACK FAILED TO LOAD — KEPT PREVIOUS TRACK");
         hideSpinnerIfCurrent(loadId);
         return;

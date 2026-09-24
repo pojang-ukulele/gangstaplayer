@@ -7,6 +7,7 @@ interface DecodedEntry {
     bytes: ArrayBuffer;
     buffer: AudioBuffer;
     duration: number;
+    memoryBytes: number;
 }
 
 const _cache = new Map<string, DecodedEntry>();
@@ -14,11 +15,18 @@ let _totalBytes = 0;
 const MAX_ENTRIES = 3;
 const MAX_BYTES = 100 * 1024 * 1024;
 
+function decodedMemoryBytes(buffer: AudioBuffer): number {
+    const channels = Number.isInteger(buffer?.numberOfChannels) ? buffer.numberOfChannels : 0;
+    const length = Number.isInteger(buffer?.length) ? buffer.length : 0;
+    const bytes = channels * length * 4;
+    return Number.isSafeInteger(bytes) && bytes > 0 ? bytes : 0;
+}
+
 function evictOldest(): void {
     const oldest = _cache.keys().next().value;
     if (oldest === undefined) return;
     const e = _cache.get(oldest);
-    if (e) _totalBytes -= e.bytes.byteLength || 0;
+    if (e) _totalBytes -= e.memoryBytes;
     _cache.delete(oldest);
     if (_cache.size === 0) _totalBytes = 0;
     if (_totalBytes < 0) _totalBytes = 0;
@@ -36,11 +44,13 @@ export function storeDecoded(trackId: string, bytes: ArrayBuffer, buffer: AudioB
         if (!trackId || !bytes || !buffer) return;
         const prev = _cache.get(trackId);
         if (prev) {
-            _totalBytes -= prev.bytes.byteLength || 0;
+            _totalBytes -= prev.memoryBytes;
             _cache.delete(trackId);
         }
-        _cache.set(trackId, { bytes, buffer, duration });
-        _totalBytes += bytes.byteLength || 0;
+        const memoryBytes = (bytes.byteLength || 0) + decodedMemoryBytes(buffer);
+        if (!Number.isSafeInteger(memoryBytes) || memoryBytes <= 0) return;
+        _cache.set(trackId, { bytes, buffer, duration, memoryBytes });
+        _totalBytes += memoryBytes;
         while ((_cache.size > MAX_ENTRIES || _totalBytes > MAX_BYTES) && _cache.size > 0) evictOldest();
     } catch { /* ignore */ }
 }
@@ -48,7 +58,7 @@ export function storeDecoded(trackId: string, bytes: ArrayBuffer, buffer: AudioB
 export function evictDecoded(trackId: string): void {
     try {
         const e = _cache.get(trackId);
-        if (e) _totalBytes -= e.bytes.byteLength || 0;
+        if (e) _totalBytes -= e.memoryBytes;
         _cache.delete(trackId);
         if (_totalBytes < 0) _totalBytes = 0;
     } catch { /* ignore */ }

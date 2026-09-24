@@ -624,8 +624,7 @@ async function initApp() {
         return;
     }
     purgeLegacySessionKey();
-    applyPlatformStyles();
-    
+
     // Initialize Worklets first
     await initWorklets();
     engine.initWorklets();
@@ -964,16 +963,6 @@ async function initApp() {
             })).catch((e) => { try { logger.error('[Renderer Rejection] Crash report write failed — ring copy is the only evidence', e); } catch { /* ignore */ } }).finally(() => { rejectionReporting = false; });
         } catch { rejectionReporting = false; }
     });
-}
-
-function applyPlatformStyles() {
-    const style = document.createElement('style');
-    style.textContent = `
-        .title-bar { -webkit-app-region: drag; }
-        .window-controls, .kit-controls { -webkit-app-region: no-drag; }
-        * { -webkit-user-drag: none; }
-    `;
-    document.head.appendChild(style);
 }
 
 if (document.readyState === 'loading') {

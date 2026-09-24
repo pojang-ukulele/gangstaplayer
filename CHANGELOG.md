@@ -1,5 +1,33 @@
 # Changelog
 
+## [Unreleased] — "Desktop audit remediation (2026-09-24)"
+
+### Security and persistence
+
+- Restricted the renderer to the bundled document, blocked frame/page redirects and new windows, denied unlisted permissions, and validated IPC senders.
+- Replaced renderer path-string consent with native `File` consent persisted in SQLite, including real-target identity checks across restarts.
+- Hardened write sequencing so existing files are validated before truncation; PCM cache filesystem work is asynchronous.
+- Preserved known track metadata when zero-valued BPM/duration reindexing occurs.
+
+### Sessions, recovery, and audio lifecycle
+
+- Fixed session checksum canonicalization, persisted current-track/selection/master-BPM state, and made failed pad restores roll back atomically.
+- Crash recovery now selects the newest snapshot across staging/history, stops active pad voices, verifies load commits, and skips recorded pads without source files.
+- Added generation guards for pad loads/recordings, transactional deck source handshakes, worker timeout recycling, and decoded-PCM-aware cache accounting.
+- Fixed nested sampler submenu clipping under the playlist context menu.
+
+### UI and reliability
+
+- Moved app-region styles into the CSP-safe stylesheet, synchronized AutoMix settings/state, made MIDI initialization idempotent, removed Ctrl+A/pad-recording collision, and redacted paths anywhere in log messages.
+- Added regression coverage for consent persistence, checksum canonicalization, worker recycling, decoded-cache limits, log redaction, and IPC/navigation boundaries.
+
+### Verification
+
+- `npm run typecheck` passed.
+- `npm test -- --runInBand --coverage=false` passed: 25 suites, 189 tests.
+- `npm run build:prod` passed.
+- `npm run test:smoke` passed: 12 Electron smoke tests.
+
 ## [Unreleased] — "Remove Sonetra AI backend (2026-09-17)"
 
 ### 🗑️ Remove Sonetra AI backend (verified: `tsc --noEmit` clean, Jest green, dev build green)

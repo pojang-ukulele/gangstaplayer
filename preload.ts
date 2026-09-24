@@ -22,6 +22,17 @@ function cleanPcmKey(k: unknown): string | null {
   return k;
 }
 
+function getNativeFilePath(file: unknown): string {
+  try {
+    if (!file || typeof file !== 'object') return '';
+    const candidate = file as File;
+    if (typeof candidate.name !== 'string' || !candidate.name) return '';
+    return webUtils.getPathForFile(candidate);
+  } catch {
+    return '';
+  }
+}
+
 contextBridge.exposeInMainWorld('electronAPI', {
   minimize: () => ipcRenderer.send('app:minimize'),
   maximize: () => ipcRenderer.send('app:maximize'),
@@ -34,16 +45,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
   // dialog/DnD (Electron File with a real disk path). Never call with
   // renderer-crafted strings — returns '' for anything else so the bridge
   // cannot be used as an unbounded path oracle.
-  getPathForFile: (file: File) => {
-    try {
-      if (!file || typeof file !== 'object') return '';
-      // Must look like a user-picked File (name + size + Electron path).
-      const f = file as File & { path?: unknown };
-      if (typeof f.name !== 'string' || !f.name) return '';
-      return webUtils.getPathForFile(file);
-    } catch {
-      return '';
-    }
+  getPathForFile: (file: File) => getNativeFilePath(file),
+  consentFile: (file: File) => {
+    const p = getNativeFilePath(file);
+    return p ? ipcRenderer.invoke('fs:consent-file', p) : Promise.resolve(false);
   },
   setFullScreen: (flag: boolean) => ipcRenderer.send('app:set-fullscreen', flag),
   openSampleDialog: () => ipcRenderer.invoke('dialog:open-sample'),
@@ -81,11 +86,6 @@ contextBridge.exposeInMainWorld('fileSystem', {
     const p = cleanPath(path);
     if (!p) return Promise.resolve(null);
     return ipcRenderer.invoke('fs:stat-file', p);
-  },
-  consentFile: (path: string) => {
-    const p = cleanPath(path);
-    if (!p) return Promise.resolve(false);
-    return ipcRenderer.invoke('fs:consent-file', p);
   },
   showItemInFolder: (path: string) => {
     const p = cleanPath(path);

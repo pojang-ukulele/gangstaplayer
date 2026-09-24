@@ -1368,6 +1368,10 @@ export async function loadSampleFile(file: File, index: number): Promise<void> {
     let slot = false;
     try {
         logger.info(`[Sampler] Loading file to pad ${index}: ${file.name}`);
+        try {
+            const consent = window.electronAPI?.consentFile?.(file);
+            if (consent && typeof consent.catch === 'function') consent.catch(() => undefined);
+        } catch { /* consent is best-effort for the current File-backed load */ }
         if (file.size > MAX_FILE_SIZE_BYTES) {
             logger.error(`[Sampler] Pad ${index} rejected: file too large (${file.size} bytes)`);
             toast.error("FILE TOO LARGE (MAX 100MB)");
@@ -1398,9 +1402,15 @@ export async function loadSampleFile(file: File, index: number): Promise<void> {
             return;
         }
         if (gen !== _padLoadGen[index]) return;
-
+        try { stopPad(index); } catch { /* ignore */ }
+        try { if (activeRecorders[index]) stopRecording(index); } catch { /* ignore */ }
+        padBPMs[index] = 0;
+        padBeatPositions[index] = [];
+        try { delete padBpmEstimated[index]; } catch { /* ignore */ }
         padBuffers[index] = audioBuffer;
-        padPaths[index] = file.name;
+        let nativePath = '';
+        try { nativePath = window.electronAPI?.getPathForFile?.(file) || ''; } catch { nativePath = ''; }
+        padPaths[index] = nativePath || file.name;
         padWaveforms[index] = computeWaveform(audioBuffer);
         // Fresh sample: stale selections/loops belong to the old buffer.
         // Snap toggle survives (in-memory preference); edge glow resets.
@@ -1466,7 +1476,7 @@ export async function loadSampleFromPath(path: string, index: number, callerBpm?
         logger.info(`[Sampler] Loading path to pad ${index}: ${path}`);
         await acquirePadDecodeSlot();
         slot = true;
-        if (gen !== _padLoadGen[index]) return true; // superseded while queued
+        if (gen !== _padLoadGen[index]) return false; // superseded while queued
         const rawData = await fsBridgeRef.readFile(path);
         if (!rawData) {
             logger.error(`[Sampler] Read failed for path: ${path}`);
@@ -1488,7 +1498,7 @@ export async function loadSampleFromPath(path: string, index: number, callerBpm?
             toast.error("INVALID AUDIO FILE IN KIT");
             return false;
         }
-        if (gen !== _padLoadGen[index]) return true;
+        if (gen !== _padLoadGen[index]) return false;
 
         logger.info(`[Sampler] Pad ${index}: Got ${arrayBuffer.byteLength} bytes, decoding...`);
 
@@ -1504,10 +1514,16 @@ export async function loadSampleFromPath(path: string, index: number, callerBpm?
             toast.error("KIT SAMPLE UNDECODABLE");
             return false;
         }
-        if (gen !== _padLoadGen[index]) return true;
-
+        if (gen !== _padLoadGen[index]) return false;
+        try { stopPad(index); } catch { /* ignore */ }
+        try { if (activeRecorders[index]) stopRecording(index); } catch { /* ignore */ }
+        padBPMs[index] = 0;
+        padBeatPositions[index] = [];
+        try { delete padBpmEstimated[index]; } catch { /* ignore */ }
         padBuffers[index] = audioBuffer;
+
         padPaths[index] = path;
+
         padWaveforms[index] = computeWaveform(audioBuffer);
         // Fresh sample: stale selections/loops belong to the old buffer.
         // Snap toggle survives (in-memory preference); edge glow resets.
@@ -1523,7 +1539,7 @@ export async function loadSampleFromPath(path: string, index: number, callerBpm?
         if (detectBPMFn) {
             try {
                 const raw = await detectBPMFn(audioBuffer);
-                if (gen !== _padLoadGen[index]) return true;
+                if (gen !== _padLoadGen[index]) return false;
                 const decision = resolveBpmPersist(raw, padBPMs[index]);
                 if (!decision.persisted || decision.bpm === undefined) {
                     const fb = applyBpmFallback(index, audioBuffer.duration, callerBpm);
@@ -2327,6 +2343,7 @@ export function setupPadKeyboardHandlers(): void {
         const index = state.padKeyMap.indexOf(e.key.toLowerCase());
         if (index !== -1) {
             if (e.ctrlKey) {
+                if (e.key.toLowerCase() === 'a' && !e.shiftKey) return;
                 startRecording(index);
             } else if (!e.altKey && padBuffers[index]) {
                 startPad(index);
@@ -2360,6 +2377,7 @@ let activeRecorders: Record<number, MediaRecorder> = {};
 
 async function startRecording(index: number): Promise<void> {
     if (activeRecorders[index]) return;
+    const recGen = ++_padLoadGen[index];
     // Claim the slot synchronously — the async mic-permission gap previously
     // let keyup fire first, stranding an unstoppable open mic stream.
     const PENDING = '__pending__';
@@ -2419,15 +2437,32 @@ async function startRecording(index: number): Promise<void> {
         }
         const mediaRecorder = new MediaRecorder(stream);
         const chunks: Blob[] = [];
+        const clearRecorder = (): void => {
+            if (activeRecorders[index] === mediaRecorder) {
+                delete activeRecorders[index];
+                updateRecVisuals(index, false);
+            }
+        };
 
         mediaRecorder.ondataavailable = (e) => chunks.push(e.data);
         mediaRecorder.onstop = async () => {
+            if (recGen !== _padLoadGen[index]) {
+                if (stream) stream.getTracks().forEach(track => track.stop());
+                clearRecorder();
+                return;
+            }
             const blob = new Blob(chunks, { type: 'audio/webm' });
             const arrayBuffer = await blob.arrayBuffer();
 
              try {
-                if (!ensureAudio() || !audioCtx) { toast.error("AUDIO NOT READY"); return; }
-                const decodedBuffer = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
+                 if (!ensureAudio() || !audioCtx) { toast.error("AUDIO NOT READY"); clearRecorder(); return; }
+                 const decodedBuffer = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
+                 if (recGen !== _padLoadGen[index]) { clearRecorder(); return; }
+
+                try { stopPad(index); } catch { /* ignore */ }
+                padBPMs[index] = 0;
+                padBeatPositions[index] = [];
+                try { delete padBpmEstimated[index]; } catch { /* ignore */ }
                 padBuffers[index] = decodedBuffer;
                 padPaths[index] = `REC_${Date.now()}`;
                 padWaveforms[index] = computeWaveform(decodedBuffer);
@@ -2439,9 +2474,11 @@ async function startRecording(index: number): Promise<void> {
                 // Recorded pads previously kept stale waveform/BPM — SYNC stayed dead.
                 // needsReview falls back to an estimated grid; repaint every branch.
                 if (detectBPMFn) {
-                    try {
-                        const raw = await detectBPMFn(decodedBuffer);
-                        const decision = resolveBpmPersist(raw, padBPMs[index]);
+                     try {
+                         const raw = await detectBPMFn(decodedBuffer);
+                         if (recGen !== _padLoadGen[index]) { clearRecorder(); return; }
+                         const decision = resolveBpmPersist(raw, padBPMs[index]);
+
                         if (!decision.persisted || decision.bpm === undefined) {
                             const fb = applyBpmFallback(index, decodedBuffer.duration);
                             logger.warn(`[Sampler] Pad ${index} BPM needs review — estimated grid @${fb}bpm`);
@@ -2476,8 +2513,7 @@ async function startRecording(index: number): Promise<void> {
                 }
              }
 
-            delete activeRecorders[index];
-            updateRecVisuals(index, false);
+            clearRecorder();
         };
 
         mediaRecorder.start();

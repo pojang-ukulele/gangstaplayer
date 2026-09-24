@@ -71,8 +71,11 @@ const mockMainAudio = {
     src: '',
     currentTime: 0,
     duration: 100,
+    paused: true,
     play: jest.fn().mockResolvedValue(undefined),
     pause: jest.fn(),
+    load: jest.fn(),
+    removeAttribute: jest.fn(),
 };
 
 const mockCrossfadeAudio = {
@@ -391,6 +394,27 @@ describe('Player — guarded functions (no DOM, no crash)', () => {
         expect(mockEngine.main.reset).toHaveBeenCalledTimes(1);
         expect(mockEngine.main.loadAsync).toHaveBeenCalled();
         expect(state.currentTrackIndex).toBe(0);
+    });
+
+    test('failed source handshake restores the previous deck', async () => {
+        mockMainAudio.src = 'blob:previous';
+        mockMainAudio.currentTime = 12;
+        mockFileSystem.readFile.mockResolvedValueOnce(new ArrayBuffer(1024));
+        mockAudioCtx.decodeAudioData.mockResolvedValueOnce({
+            numberOfChannels: 2,
+            sampleRate: 44100,
+            length: 44100,
+            duration: 1,
+            getChannelData: jest.fn().mockReturnValue(new Float32Array(44100)),
+        });
+        mockEngine.main.loadAsync.mockResolvedValueOnce(false);
+
+        await loadTrack(0);
+
+        expect(state.currentTrackIndex).toBe(0);
+        expect(mockMainAudio.src).toBe('blob:previous');
+        expect(mockMainAudio.currentTime).toBe(12);
+        expect(mockEngine.main.reset).not.toHaveBeenCalled();
     });
 
     test('loadTrack with missing BPM + needs-review keeps prior (no 0 write)', async () => {

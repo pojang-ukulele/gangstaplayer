@@ -5,7 +5,7 @@
  * in sessions and crash snapshots, checksum validation before rollback.
  */
 
-import { saveSession, loadSession } from '../js/session';
+import { saveSession, loadSession, __sessionTestHooks } from '../js/session';
 import { state } from '../js/state';
 
 // --- Mock session dialogs + file bridges (real saveSession/loadSession API) ---
@@ -95,6 +95,22 @@ describe('Session — atomic rollback on load failure', () => {
 
         // loopMode should persist as 'one' through the update
         expect(state.loopMode).toBe('one');
+    });
+});
+
+describe('Session — checksum canonicalization', () => {
+    test('undefined optional fields do not change the signed form after JSON round-trip', async () => {
+        const value = {
+            version: 1,
+            signature: 'a'.repeat(64),
+            signatureWeak: undefined,
+            nested: { b: 2, a: 1 },
+        };
+        const before = __sessionTestHooks.canonicalize(value);
+        const after = __sessionTestHooks.canonicalize(JSON.parse(JSON.stringify(value)));
+        expect(before).toBe(after);
+        const digest = await __sessionTestHooks.sha256Hex(before);
+        expect(digest).toMatch(/^[0-9a-f]{64}$/);
     });
 });
 

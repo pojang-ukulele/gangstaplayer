@@ -15,9 +15,9 @@ import {
     padBuffers, padPaths, padVolumes, padBPMs, padSyncState,
     padSnapToBeat, padBeatPositions, padBpmEstimated,
     padLoopStart, padLoopEnd, padWaveforms,
-    loadSampleFromPath, recomputePadBeatGrid
+    loadSampleFromPath, recomputePadBeatGrid, stopPad, padSelections, padSnappedEdges, padArmedBeats
 } from './sampler';
-import { AUTO_SAVE_INTERVAL_MS, MAX_SNAPSHOTS, MIN_SAVE_INTERVAL_MS, NUM_PADS } from './constants';
+import { AUTO_SAVE_INTERVAL_MS, MAX_SNAPSHOTS, MIN_SAVE_INTERVAL_MS, NUM_PADS, VALID_AUDIO_EXTENSIONS } from './constants';
 
 // === Constants ===
 
@@ -41,6 +41,7 @@ interface CrashSnapshot {
     timestamp: number;
     reason?: string;
     playlist: Track[];
+    selectedIndices?: number[];
     currentTrackIndex: number;
     masterBPM: number;
     pads: Record<number, SnapshotPad>;
@@ -193,7 +194,7 @@ export function pruneSnapshotArchives(now = Date.now()): void {
 function collectSnapshot(reason?: string): CrashSnapshot {
     const pads: Record<number, SnapshotPad> = {};
     for (let i = 0; i < NUM_PADS; i++) {
-        if (padBuffers[i] || padPaths[i]) {
+        if ((padBuffers[i] || padPaths[i]) && !padPaths[i]?.startsWith('REC_')) {
             const ls = padLoopStart[i];
             const le = padLoopEnd[i];
             pads[i] = {
@@ -216,6 +217,7 @@ function collectSnapshot(reason?: string): CrashSnapshot {
         timestamp: Date.now(),
         reason,
         playlist: state.playlist.map(t => ({ ...t })),
+        selectedIndices: [...state.selectedIndices],
         currentTrackIndex: state.currentTrackIndex,
         masterBPM: state.masterBPM,
         pads,
@@ -332,10 +334,20 @@ export function getLatestSnapshot(): CrashSnapshot | null {
     // accumulate when restores never run.
     try { pruneSnapshotArchives(); } catch { /* ignore */ }
     // Rotation: newest is STORAGE_KEY, older copy in _1 (single backup).
-    // Staging holds a newest that failed to promote (quota) — prefer live,
-    // fall back to staging before history so it is never lost.
-    // M27: _2 retired (see saveSnapshot) — still checked last for legacy builds.
-    const snap = loadFromStorage(STORAGE_KEY) || loadFromStorage(`${STORAGE_KEY}_staging`) || loadFromStorage(getSnapshotKey(1)) || loadFromStorage(getSnapshotKey(2));
+    // Staging can contain a newer snapshot when promotion hit quota. Select by
+    // timestamp across every slot, with live winning only on an exact tie.
+    const candidates = [
+        { value: loadFromStorage(STORAGE_KEY), priority: 0 },
+        { value: loadFromStorage(`${STORAGE_KEY}_staging`), priority: 1 },
+        { value: loadFromStorage(getSnapshotKey(1)), priority: 2 },
+        { value: loadFromStorage(getSnapshotKey(2)), priority: 3 },
+    ].filter((entry): entry is { value: CrashSnapshot; priority: number } => !!entry.value);
+    candidates.sort((a, b) => {
+        const at = typeof a.value.timestamp === 'number' && Number.isFinite(a.value.timestamp) ? a.value.timestamp : 0;
+        const bt = typeof b.value.timestamp === 'number' && Number.isFinite(b.value.timestamp) ? b.value.timestamp : 0;
+        return bt - at || a.priority - b.priority;
+    });
+    const snap = candidates[0]?.value ?? null;
     // Expiry: an ancient snapshot (weeks old) is almost never what the user
     // wants — previously a 6-month-old crash still prompted "Restore?", and
     // YES clobbered current work. 14 days is generous for crash recovery.
@@ -410,6 +422,9 @@ export async function restoreSnapshot(): Promise<boolean> {
     };
     const restoreLive = () => {
         try {
+            for (let i = 0; i < NUM_PADS; i++) {
+                try { stopPad(i); } catch { /* ignore */ }
+            }
             state.update({
                 playlist: liveBackup.playlist,
                 selectedIndices: liveBackup.selectedIndices,
@@ -494,8 +509,7 @@ export async function restoreSnapshot(): Promise<boolean> {
     };
     const archiveSnapshot = () => {
         try {
-            const raw = localStorage.getItem(STORAGE_KEY);
-            if (!raw) return;
+            const raw = JSON.stringify(snapshot);
             const key = `${STORAGE_KEY}_archive_${Date.now()}`;
             try { localStorage.setItem(key, raw); } catch { /* quota — skip archiving */ }
             // Track index for environments without length/key enumeration (tests).
@@ -600,16 +614,21 @@ export async function restoreSnapshot(): Promise<boolean> {
         // Clear live pads for the attempt (ghost-audio fix): restored on
         // failure via restoreLive() below.
         for (let i = 0; i < NUM_PADS; i++) {
+            try { stopPad(i); } catch { /* ignore */ }
             try { (padBuffers as any)[i] = undefined; } catch { /* ignore */ }
             try { padPaths[i] = ''; } catch { /* ignore */ }
             try { (padWaveforms as any)[i] = undefined; } catch { /* ignore */ }
             try { padBPMs[i] = 0; } catch { /* ignore */ }
-            try { (padBeatPositions as unknown as Record<number, number[]> | undefined)?.[i] !== undefined && ((padBeatPositions as unknown as Record<number, number[]>)[i] = []); } catch { /* ignore */ }
+            try { padBeatPositions[i] = []; } catch { /* ignore */ }
+            try { padVolumes[i] = 0.75; } catch { /* ignore */ }
             try { delete (padBpmEstimated as unknown as Record<number, boolean> | undefined)?.[i]; } catch { /* ignore */ }
             try { padSyncState[i] = false; } catch { /* ignore */ }
             try { delete (padSnapToBeat as unknown as Record<number, boolean> | undefined)?.[i]; } catch { /* ignore */ }
             try { padLoopStart[i] = -1; } catch { /* ignore */ }
             try { padLoopEnd[i] = -1; } catch { /* ignore */ }
+            try { padSelections[i] = null; } catch { /* ignore */ }
+            try { padSnappedEdges[i] = null; } catch { /* ignore */ }
+            try { padArmedBeats[i] = null; } catch { /* ignore */ }
         }
         // Pause live state swap until pads prove loadable.
         state.update({ isPlaying: false, isCrossfadeInProgress: false, blendingIndex: -1 });
@@ -635,11 +654,22 @@ export async function restoreSnapshot(): Promise<boolean> {
                     hadFailure = true;
                     continue;
                 }
+                if (p.path.startsWith('REC_')) {
+                    logger.warn(`[CrashRecovery] Pad ${idx} recorded sample skipped (no source file)`);
+                    continue;
+                }
+                const ext = p.path.split('.').pop()?.toLowerCase() ?? '';
+                if (!(VALID_AUDIO_EXTENSIONS as readonly string[]).includes(ext)) {
+                    logger.warn(`[CrashRecovery] Pad ${idx} rejected (non-audio extension)`);
+                    hadFailure = true;
+                    continue;
+                }
                 // Don't claim padPaths before the file proves loadable —
                 // otherwise failures leave ghost paths with no buffer.
                 try {
                     const remaining = Math.max(1000, OVERALL_RESTORE_BUDGET_MS - (Date.now() - restoreStart));
-                    await withTimeout(loadSampleFromPath(p.path, idx, typeof p.bpm === 'number' ? p.bpm : undefined), Math.min(PER_PAD_RESTORE_MS, remaining));
+                    const loaded = await withTimeout(loadSampleFromPath(p.path, idx, typeof p.bpm === 'number' ? p.bpm : undefined), Math.min(PER_PAD_RESTORE_MS, remaining));
+                    if (!loaded || !padBuffers[idx] || padPaths[idx] !== p.path) throw new Error('pad did not commit');
                     padVolumes[idx] = (typeof p.vol === 'number' && Number.isFinite(p.vol)) ? Math.min(1, Math.max(0, p.vol)) : 0.75;
                     padBPMs[idx] = (typeof p.bpm === 'number' && Number.isFinite(p.bpm)) ? Math.min(300, Math.max(0, p.bpm)) : 0;
                     // Snapshot BPM overwrites fresh analysis — rebuild grid.
@@ -683,13 +713,19 @@ export async function restoreSnapshot(): Promise<boolean> {
         // Slider actuation lives here (not pre-pad-loop) so a failure path
         // never leaves volume/tempo mutated.
         if (stagedPlaylist) {
+            const stagedSelection = Array.isArray(snapshot.selectedIndices)
+                ? [...new Set(snapshot.selectedIndices
+                    .map((value) => Number(value))
+                    .filter((value) => Number.isInteger(value) && value >= 0 && value < stagedPlaylist.length))]
+                : [];
             state.update({
                 playlist: stagedPlaylist,
+                selectedIndices: stagedSelection,
                 currentTrackIndex: stagedIndex,
                 masterBPM: stagedBPM,
             });
         } else {
-            state.update({ isPlaying: false, isCrossfadeInProgress: false, blendingIndex: -1, masterBPM: 0 });
+            state.update({ selectedIndices: [], isPlaying: false, isCrossfadeInProgress: false, blendingIndex: -1, masterBPM: 0 });
         }
         if (stagedUiUpdates) state.update(stagedUiUpdates);
         try {

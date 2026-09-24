@@ -532,9 +532,6 @@ export function addTracksToPlaylist(files: File[]): void {
         try {
             fullPath = window.electronAPI.getPathForFile(file);
         } catch { fullPath = ''; }
-        if (!fullPath) {
-            try { fullPath = (file as unknown as { path?: unknown }).path as string || ''; } catch { fullPath = ''; }
-        }
         if (!fullPath) { rejected++; return; }
         if (fullPath.length > 32760) { rejected++; return; }
         const ext = fullPath.split('.').pop()?.toLowerCase() ?? '';
@@ -554,26 +551,28 @@ export function addTracksToPlaylist(files: File[]): void {
         // Keyed by canonical path AND track.id so later lookups hit even
         // when the stored path string differs in case/separators.
         try { cacheDroppedAudio(fullPath, file, track.id); } catch { /* ignore */ }
-        try {
-            const fsApi = window.fileSystem as unknown as { consentFile?: (p: string) => Promise<boolean> };
-            if (fsApi && typeof fsApi.consentFile === 'function') {
-                fsApi.consentFile(fullPath).catch(() => undefined);
+        let consentCall: Promise<boolean> | undefined;
+        try { consentCall = window.electronAPI?.consentFile?.(file); } catch { consentCall = undefined; }
+        void (async () => {
+            let consented = false;
+            try { consented = (await consentCall) === true; } catch { consented = false; }
+            if (!consented) {
+                logger.warn(`[Playlist] Native file consent denied for ${track.path}`);
+                return;
             }
-        } catch { /* consent is best-effort; cached bytes still play */ }
+            try {
+                await window.database?.upsertTrack({
+                    id: track.id,
+                    path: track.path,
+                    name: track.name,
+                    duration: 0,
+                    bpm: 0
+                });
+            } catch (e) {
+                logger.warn(`[Playlist] Initial DB index failed for ${track.name}`, e);
+            }
+        })();
         added.push(track);
-
-        // Instant DB Indexing (metadata comes later via analysis)
-        const db = window.database;
-        if (db) {
-            db.upsertTrack({
-                id: track.id,
-                path: track.path,
-                name: track.name,
-                duration: 0,
-                bpm: 0
-            }).catch(() => { /* indexing is best-effort */ });
-        }
-
         enqueueAnalysis(track);
     });
 
@@ -599,30 +598,7 @@ export function addTracksToPlaylist(files: File[]): void {
         // positions between the merge and the async consent handshake.
         const firstId = first.id;
         const autoLoad = loadTrackFn;
-        // Await per-file consent before the first auto-load so an
-        // allowlisted re-read can't silently fail and stall the deck
-        // with no toast/error. Cached DnD bytes still play regardless.
         void (async () => {
-            try {
-                // Bounded consent: a hung main process previously stalled the
-                // first-track auto-load forever. 5s cap, then load anyway
-                // (cached DnD bytes play regardless of consent).
-                const consentCall = typeof window.fileSystem?.consentFile === 'function'
-                    ? window.fileSystem.consentFile(first.path)
-                    : Promise.resolve(true);
-                const consent = await Promise.race([
-                    consentCall,
-                    new Promise<boolean>((resolve) => {
-                        const t = setTimeout(() => resolve(true), 5000);
-                        (t as any)?.unref?.();
-                    }),
-                ]);
-                if (consent === false) {
-                    logger.warn(`[Playlist] consent denied for auto-load: ${first.path}`);
-                }
-            } catch (e) {
-                logger.warn(`[Playlist] consent check failed for auto-load: ${first.path}`, e);
-            }
             try {
                 const atFire = state.playlist.findIndex(t => t.id === firstId);
                 if (atFire >= 0) await autoLoad(atFire);
@@ -1086,6 +1062,7 @@ export function hideSamplerSubmenu(): void {
         sub.classList.add('hidden');
         sub.setAttribute('aria-hidden', 'true');
     }
+    try { document.getElementById('contextMenu')?.classList.remove('submenu-open'); } catch { /* ignore */ }
     const parent = document.getElementById('ctxLoadToSampler');
     if (parent) parent.setAttribute('aria-expanded', 'false');
 }
@@ -1105,7 +1082,12 @@ export function hidePlaylistContextMenu(): void {
             if (m) { m.classList.add('hidden'); m.setAttribute('aria-hidden', 'true'); }
         }
         const menu = document.getElementById('contextMenu');
-        if (menu) { try { delete menu.dataset.ctxIndex; } catch { /* ignore */ } }
+        if (menu) {
+            menu.classList.remove('submenu-open');
+            try { delete menu.dataset.ctxIndex; } catch { /* ignore */ }
+        }
+
+
         const parent = document.getElementById('ctxLoadToSampler');
         if (parent) parent.setAttribute('aria-expanded', 'false');
     } catch { /* ignore */ }
@@ -1122,6 +1104,7 @@ function showSamplerSubmenu(): void {
     sub.classList.remove('hidden');
     sub.setAttribute('aria-hidden', 'false');
     parent.setAttribute('aria-expanded', 'true');
+    menu.classList.add('submenu-open');
     const subWidth = sub.offsetWidth || 170;
     if (menuRect.right + subWidth > window.innerWidth) {
         sub.style.left = 'auto';
@@ -1172,7 +1155,10 @@ async function buildSamplerSubmenu(trackIdx: number): Promise<void> {
 
 async function loadTrackToPad(trackIdx: number, padIdx: number): Promise<void> {
     const track = state.playlist[trackIdx];
-    if (!track) return;
+    if (!track) {
+        logger.warn(`[Playlist] Pad load target missing: track=${trackIdx} pad=${padIdx}`);
+        return;
+    }
     try {
         const sampler = await import('./sampler');
         // Dropped/imported files often have no on-disk consent path — IPC-only
@@ -1180,11 +1166,14 @@ async function loadTrackToPad(trackIdx: number, padIdx: number): Promise<void> {
         // Prefer the cached File bytes when available.
         let dropped: File | undefined;
         try { dropped = getDroppedAudioFile(track.path, track.id); } catch { dropped = undefined; }
+        let loaded = false;
         if (dropped) {
             await sampler.loadSampleFile(dropped, padIdx);
+            loaded = !!sampler.padBuffers[padIdx];
         } else {
-            await sampler.loadSampleFromPath(track.path, padIdx);
+            loaded = await sampler.loadSampleFromPath(track.path, padIdx);
         }
+        if (!loaded) throw new Error('sample did not commit');
         try { toast.success(`LOADED TO PAD ${padIdx + 1}`); } catch { /* ignore */ }
     } catch (e) {
         logger.warn(`[Playlist] Load to pad ${padIdx} failed`, e);

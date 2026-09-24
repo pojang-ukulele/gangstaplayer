@@ -107,6 +107,8 @@ export class AudioChannel {
         // dead context and createMediaElementSource() cannot be called twice
         // on the same <audio> element. Recreate the element and rebuild.
         if (this._owningCtx && this._owningCtx !== audioCtx) {
+            try { this._pendingFinish?.(false); } catch { /* ignore */ }
+            this._pendingFinish = null;
             const oldAudio = this.audio;
             try { oldAudio.pause(); } catch { /* ignore */ }
             const newAudio = createAudioElement();
@@ -168,6 +170,8 @@ export class AudioChannel {
             this.source = audioCtx.createMediaElementSource(this.audio);
         } catch {
             try {
+                try { this._pendingFinish?.(false); } catch { /* ignore */ }
+                this._pendingFinish = null;
                 const oldAudio = this.audio;
                 try { oldAudio.pause(); } catch { /* ignore */ }
                 const fresh = createAudioElement();
@@ -317,6 +321,7 @@ export class AudioChannel {
             const finish = (ok: boolean): void => {
                 if (done) return;
                 done = true;
+                if (this.audio !== el) ok = false;
                 if (this._pendingFinish === finish) this._pendingFinish = null;
                 try { clearTimeout(timer); } catch { /* ignore */ }
                 try { el.removeEventListener('loadedmetadata', onOk); } catch { /* ignore */ }

@@ -23,6 +23,7 @@ export interface ElectronAPI {
     loadKit(): Promise<string | null | undefined>;
     // Bounded path disclosure only for user-picked File objects (dialog/DnD).
     getPathForFile(file: File): string;
+    consentFile(file: File): Promise<boolean>;
     saveAudioDialog(): Promise<string | null | undefined>;
     openSampleDialog(): Promise<string | null | undefined>;
     generateCrashReport(snapshot: unknown): Promise<string | null | undefined>;
@@ -33,7 +34,6 @@ export interface FileSystemAPI {
     readFile(filePath: string): Promise<Uint8Array | null>;
     // Metadata-only (SAME gates as readFile); null on reject/rate-limit.
     statFile(filePath: string): Promise<{ size: number; mtimeMs: number } | null>;
-    consentFile(filePath: string): Promise<boolean>;
     // main returns boolean success (false on reject/rate-limit).
     saveFile(filePath: string, data: Uint8Array): Promise<boolean>;
     showItemInFolder(filePath: string): Promise<boolean>;

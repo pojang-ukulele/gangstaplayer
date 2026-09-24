@@ -64,6 +64,16 @@
     align-items: center;
     padding: 0 10px;
     z-index: 1000;
+    -webkit-app-region: drag;
+}
+
+.window-controls,
+.kit-controls {
+    -webkit-app-region: no-drag;
+}
+
+* {
+    -webkit-user-drag: none;
 }
 
 .title-icon {
@@ -1130,6 +1140,10 @@ input[type=range].progress-slider:hover::-webkit-slider-thumb {
 
 .context-menu.hidden {
     display: none;
+}
+
+#contextMenu.submenu-open {
+    overflow: visible;
 }
 
 .context-item {

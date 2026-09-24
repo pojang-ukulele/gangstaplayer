@@ -1,8 +1,9 @@
 import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron';
 import * as path from 'path';
 import * as fs from 'fs';
+import { fileURLToPath, pathToFileURL } from 'url';
 
-import { getDbManager, initDbManager, addAllowedAudioFile, isAllowedAudioDirForPath, isAllowedAudioFile } from './db-manager';
+import { getDbManager, initDbManager, addAllowedAudioFile, isAllowedAudioDirForPath, isAllowedAudioFile, loadAllowedAudioFiles } from './db-manager';
 import { logManager, LogLevel } from './log-manager';
 import { MAX_FILE_SIZE_BYTES, MAX_PLAYLIST_SEARCH_RESULTS, VALID_AUDIO_EXTENSIONS } from './js/constants';
 
@@ -223,6 +224,25 @@ function isConsentedReadFile(p: string): boolean {
   } catch { return false; }
 }
 
+function isTrustedAssetPath(p: string): boolean {
+    const roots = [path.resolve(__dirname, 'assets')];
+    if (!app.isPackaged) {
+        roots.push(path.resolve(__dirname, '..', 'assets'));
+        try { roots.push(path.resolve(app.getAppPath(), 'assets')); } catch { /* ignore */ }
+        roots.push(path.resolve(process.cwd(), 'assets'));
+    }
+    const insensitive = process.platform === 'win32' || process.platform === 'darwin';
+    let realPath: string;
+    try { realPath = fs.realpathSync.native(path.resolve(p)); } catch { realPath = path.resolve(p); }
+    return roots.some((root) => {
+        let realRoot = root;
+        try { realRoot = fs.realpathSync.native(root); } catch { /* use lexical */ }
+        const rel = path.relative(realRoot, realPath);
+        const relCmp = insensitive ? rel.toLowerCase() : rel;
+        return !!rel && !relCmp.startsWith('..') && !path.isAbsolute(rel);
+    });
+}
+
 /**
  * Restricts reads to plausibly-media/kit files. Prevents a compromised
  * renderer from exfiltrating arbitrary secrets (keys, wallets, docs).
@@ -246,8 +266,11 @@ function isReadPathAllowed(p: string): boolean {
     const real = fs.realpathSync.native(p);
     if (real !== p && hasDialogPath(real)) return true;
   } catch { /* ignore */ }
-  // 4) Files inside known-good locations: userData/recordings, standard
-  // Music folders, dev recordings, and dialog-approved directories.
+  // 4) Files inside known-good locations: bundled assets, userData/recordings,
+  // standard Music folders, dev recordings, and dialog-approved directories.
+  try {
+    if (isTrustedAssetPath(p)) return true;
+  } catch { /* ignore */ }
   try {
     const userDataPath = app.getPath('userData');
     const recDir = path.resolve(path.join(userDataPath, 'recordings'));
@@ -268,6 +291,37 @@ function isReadPathAllowed(p: string): boolean {
 function getMainWindow(): BrowserWindow | null {
   const [win] = BrowserWindow.getAllWindows();
   return win && !win.isDestroyed() ? win : null;
+}
+
+const TRUSTED_INDEX_PATH = path.resolve(__dirname, 'index.html');
+const TRUSTED_INDEX_URL = pathToFileURL(TRUSTED_INDEX_PATH).toString();
+const TRUSTED_PERMISSIONS = new Set(['clipboard-sanitized-write', 'fullscreen', 'media', 'midi']);
+
+function isTrustedDocumentUrl(url: string): boolean {
+  if (url === TRUSTED_INDEX_URL) return true;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'file:' || parsed.search || parsed.hash) return false;
+    const filePath = path.resolve(fileURLToPath(parsed));
+    const expected = path.resolve(TRUSTED_INDEX_PATH);
+    const insensitive = process.platform === 'win32' || process.platform === 'darwin';
+    return insensitive ? filePath.toLowerCase() === expected.toLowerCase() : filePath === expected;
+  } catch {
+    return false;
+  }
+}
+
+function isTrustedIpcSender(event: Electron.IpcMainInvokeEvent | Electron.IpcMainEvent): boolean {
+  const win = getMainWindow();
+  return !!win && event.sender === win.webContents && isTrustedDocumentUrl(event.sender.getURL());
+}
+
+function permissionAllowed(contents: Electron.WebContents | null, permission: string, mediaType?: 'video' | 'audio' | 'unknown'): boolean {
+  const win = getMainWindow();
+  if (!win || !contents || contents !== win.webContents || !isTrustedDocumentUrl(contents.getURL())) return false;
+  if (!TRUSTED_PERMISSIONS.has(permission)) return false;
+  if (permission === 'media') return mediaType !== 'video';
+  return true;
 }
 
 function logToDisk(level: string, message: string) {
@@ -308,22 +362,25 @@ function registerIpcHandlers(): void {
     return false;
   };
   // ==================== WINDOW CONTROL HANDLERS ====================
-  ipcMain.on('app:minimize', () => { if (!rateLimited('app:minimize', 100)) getMainWindow()?.minimize(); });
-  ipcMain.on('app:maximize', () => {
+  ipcMain.on('app:minimize', (event) => { if (isTrustedIpcSender(event) && !rateLimited('app:minimize', 100)) getMainWindow()?.minimize(); });
+  ipcMain.on('app:maximize', (event) => {
+    if (!isTrustedIpcSender(event)) return;
     if (rateLimited('app:maximize', 100)) return;
     const win = getMainWindow();
     if (!win) return;
     if (win.isMaximized()) win.unmaximize();
     else win.maximize();
   });
-  ipcMain.on('app:close', () => { getMainWindow()?.close(); });
-  ipcMain.on('app:set-fullscreen', (_event, flag) => {
+  ipcMain.on('app:close', (event) => { if (isTrustedIpcSender(event)) getMainWindow()?.close(); });
+  ipcMain.on('app:set-fullscreen', (event, flag) => {
+    if (!isTrustedIpcSender(event)) return;
     if (rateLimited('app:set-fullscreen', 100)) return;
     getMainWindow()?.setFullScreen(flag === true);
   });
-  ipcMain.on('app:ready-to-show', () => { getMainWindow()?.show(); });
+  ipcMain.on('app:ready-to-show', (event) => { if (isTrustedIpcSender(event)) getMainWindow()?.show(); });
 
-  ipcMain.handle('app:open-external', async (_event, relativePath) => {
+  ipcMain.handle('app:open-external', async (event, relativePath) => {
+    if (!isTrustedIpcSender(event)) return;
     // Whitelist: only the exact bundled README may be opened externally.
     // Reject any traversal, separators, or UNC — basename check alone is bypassable.
     if (typeof relativePath !== 'string' || relativePath !== 'README.md') {
@@ -357,7 +414,8 @@ function registerIpcHandlers(): void {
   // Dialog throttle sentinel: a rate-limited open returns '__THROTTLED__'
   // (NOT null) so the renderer can tell "spam the button again" apart from
   // a real user-cancel. Real cancel / missing window still return null.
-  ipcMain.handle('dialog:save-kit', async () => {
+  ipcMain.handle('dialog:save-kit', async (event) => {
+    if (!isTrustedIpcSender(event)) return null;
     if (rateLimited('dialog:save-kit', 500)) return '__THROTTLED__';
     const win = getMainWindow();
     if (!win) return null;
@@ -384,7 +442,8 @@ function registerIpcHandlers(): void {
   // renderer never has to mutate the dialog-returned path (which would
   // desync it from the write allowlist).
   // Throttle sentinel '__THROTTLED__' (see dialog:save-kit) — real cancel stays null.
-  ipcMain.handle('dialog:save-session', async () => {
+  ipcMain.handle('dialog:save-session', async (event) => {
+    if (!isTrustedIpcSender(event)) return null;
     if (rateLimited('dialog:save-session', 500)) return '__THROTTLED__';
     const win = getMainWindow();
     if (!win) return null;
@@ -405,7 +464,8 @@ function registerIpcHandlers(): void {
   });
 
   // Throttle sentinel '__THROTTLED__' (see dialog:save-kit) — real cancel stays null.
-  ipcMain.handle('dialog:load-kit', async () => {
+  ipcMain.handle('dialog:load-kit', async (event) => {
+    if (!isTrustedIpcSender(event)) return null;
     if (rateLimited('dialog:load-kit', 500)) return '__THROTTLED__';
     const win = getMainWindow();
     if (!win) return null;
@@ -422,7 +482,8 @@ function registerIpcHandlers(): void {
   });
 
   // Throttle sentinel '__THROTTLED__' (see dialog:save-kit) — real cancel stays null.
-  ipcMain.handle('dialog:save-audio', async () => {
+  ipcMain.handle('dialog:save-audio', async (event) => {
+    if (!isTrustedIpcSender(event)) return null;
     if (rateLimited('dialog:save-audio', 500)) return '__THROTTLED__';
     const win = getMainWindow();
     if (!win) return null;
@@ -443,7 +504,8 @@ function registerIpcHandlers(): void {
   });
 
   // Secure File System Handlers
-  ipcMain.handle('fs:save-file', async (_event, pathStr: string, data: Uint8Array) => {
+  ipcMain.handle('fs:save-file', async (event, pathStr: string, data: Uint8Array) => {
+    if (!isTrustedIpcSender(event)) return false;
     if (rateLimited('fs:save-file', 100)) return false;
     const validated = validatePath(pathStr);
     if (!validated) {
@@ -466,7 +528,11 @@ function registerIpcHandlers(): void {
       try {
         const lst = fs.lstatSync(validated);
         if (lst.isSymbolicLink()) {
-          const real = fs.realpathSync.native(validated);
+          let real: string;
+          try { real = fs.realpathSync.native(validated); } catch {
+            logToDisk('ERROR', `Security: Blocked dangling symlink write ${validated}`);
+            return false;
+          }
           if (!isSavePathAllowed(real) || isBlockedSaveBasename(real)) {
             logToDisk('ERROR', `Security: Blocked symlink write ${validated} -> ${real}`);
             return false;
@@ -515,22 +581,26 @@ function registerIpcHandlers(): void {
       // fstat re-verifies target: regular file, non-internal basename, and
       // realpath containment in dialog set or recordings dir. fsync before
       // close for WAL-adjacent durability.
+      let targetExists = false;
+      try {
+        fs.lstatSync(validated);
+        targetExists = true;
+      } catch { /* target may not exist yet */ }
+      let createdTarget = false;
+      let writeCommitted = false;
       let fd: number | undefined;
       try {
-        const c = fs.constants as unknown as { O_WRONLY?: number; O_CREAT?: number; O_TRUNC?: number; O_NOFOLLOW?: number };
+        const c = fs.constants as unknown as { O_WRONLY?: number; O_CREAT?: number; O_EXCL?: number };
         const flags = (c.O_WRONLY ?? fs.constants.O_WRONLY)
           | (c.O_CREAT ?? fs.constants.O_CREAT)
-          | (c.O_TRUNC ?? fs.constants.O_TRUNC)
-          | (c.O_NOFOLLOW ?? 0);
+          | (targetExists ? 0 : (c.O_EXCL ?? fs.constants.O_EXCL));
         fd = fs.openSync(validated, flags, 0o666);
+        createdTarget = !targetExists;
         const fst = fs.fstatSync(fd);
         if (!fst.isFile()) {
           logToDisk('ERROR', `Security: Blocked write to non-file ${validated}`);
           return false;
         }
-        // Realpath-via-path after open (fd location check): the open fd pins
-        // the target so a swap between open and realpath cannot redirect the
-        // write; fstat above already pinned type. Verify containment.
         let openReal = validated;
         try { openReal = fs.realpathSync.native(validated); } catch { /* use validated */ }
         if (isBlockedSaveBasename(openReal)) {
@@ -541,8 +611,10 @@ function registerIpcHandlers(): void {
           logToDisk('ERROR', `Security: Blocked write with post-open escape ${validated} -> ${openReal}`);
           return false;
         }
+        fs.ftruncateSync(fd, 0);
         fs.writeSync(fd, data, 0, data.byteLength);
         try { fs.fsyncSync(fd); } catch { /* best effort */ }
+        writeCommitted = true;
       } catch (err: unknown) {
         const code = (err as NodeJS.ErrnoException)?.code;
         logToDisk('ERROR', `Security: Write ${code === 'ELOOP' ? 'blocked (symlink)' : 'failed'} for ${validated}: ${err}`);
@@ -550,6 +622,9 @@ function registerIpcHandlers(): void {
       } finally {
         if (fd !== undefined) {
           try { fs.closeSync(fd); } catch { /* ignore */ }
+        }
+        if (createdTarget && !writeCommitted) {
+          try { fs.unlinkSync(validated); } catch { /* ignore */ }
         }
       }
       // Dialog-approved paths stay writable for the session (cleared on
@@ -566,7 +641,8 @@ function registerIpcHandlers(): void {
   const consentBurst: number[] = [];
   const MAX_CONSENT_BURST = 64;
   const MAX_CONSENT_BURST_TRACKED = 128;
-  ipcMain.handle('fs:consent-file', async (_event, pathStr: string) => {
+  ipcMain.handle('fs:consent-file', async (event, pathStr: string) => {
+    if (!isTrustedIpcSender(event)) return false;
     // Burst-tolerant throttle: a global 100ms gate previously dropped most of
     // a 50-file DnD burst (and let attacker spam starve legit drops). Allow a
     // 64-file burst per second — validation is a statSync + map insert — then
@@ -598,7 +674,8 @@ function registerIpcHandlers(): void {
     return true;
   });
 
-  ipcMain.handle('fs:read-file', async (_event, pathStr: string) => {
+  ipcMain.handle('fs:read-file', async (event, pathStr: string) => {
+    if (!isTrustedIpcSender(event)) return null;
     if (rateLimited('fs:read-file', 50)) return null;
     const validated = validatePath(pathStr);
     if (!validated) {
@@ -680,7 +757,8 @@ function registerIpcHandlers(): void {
   function getPcmCacheDir(): string {
     return path.join(app.getPath('userData'), 'cache-pcm');
   }
-  ipcMain.handle('pcmcache:get', async (_event, key: unknown) => {
+  ipcMain.handle('pcmcache:get', async (event, key: unknown) => {
+    if (!isTrustedIpcSender(event)) return null;
     if (rateLimited('pcmcache:get', 50)) return null;
     if (typeof key !== 'string' || !PCM_CACHE_KEY_RE.test(key)) {
       logToDisk('ERROR', 'Security: Blocked pcmcache:get with invalid key');
@@ -691,19 +769,22 @@ function registerIpcHandlers(): void {
       const fp = path.join(dir, `${key}.pcm`);
       let stat: fs.Stats;
       try {
-        stat = fs.statSync(fp);
+        stat = await fs.promises.stat(fp);
       } catch {
         return null;
       }
       if (!stat.isFile() || stat.size === 0 || stat.size > PCM_CACHE_ENTRY_MAX_BYTES) return null;
-      return fs.readFileSync(fp);
+      const data = await fs.promises.readFile(fp);
+      if (data.byteLength === 0 || data.byteLength > PCM_CACHE_ENTRY_MAX_BYTES) return null;
+      return data;
     } catch (err) {
       logToDisk('ERROR', `pcmcache:get failed: ${err}`);
       return null;
     }
   });
 
-  ipcMain.handle('pcmcache:put', async (_event, key: unknown, data: unknown) => {
+  ipcMain.handle('pcmcache:put', async (event, key: unknown, data: unknown) => {
+    if (!isTrustedIpcSender(event)) return false;
     if (rateLimited('pcmcache:put', 50)) return false;
     if (typeof key !== 'string' || !PCM_CACHE_KEY_RE.test(key)) {
       logToDisk('ERROR', 'Security: Blocked pcmcache:put with invalid key');
@@ -715,18 +796,15 @@ function registerIpcHandlers(): void {
     }
     try {
       const dir = getPcmCacheDir();
-      fs.mkdirSync(dir, { recursive: true });
+      await fs.promises.mkdir(dir, { recursive: true });
       const fp = path.join(dir, `${key}.pcm`);
-      fs.writeFileSync(fp, Buffer.from((data as Uint8Array).buffer, (data as Uint8Array).byteOffset, (data as Uint8Array).byteLength));
-      // Dir total cap 500MB: evict oldest files first (mtime order).
+      await fs.promises.writeFile(fp, Buffer.from((data as Uint8Array).buffer, (data as Uint8Array).byteOffset, (data as Uint8Array).byteLength));
       try {
         const entries: { p: string; mtime: number; size: number }[] = [];
-        for (const name of fs.readdirSync(dir)) {
-          // Only our own hex-named entries count — stray files never protect
-          // cache entries from eviction, nor get evicted by it.
+        for (const name of await fs.promises.readdir(dir)) {
           if (!/^[0-9a-f]{64}\.pcm$/.test(name)) continue;
           try {
-            const st = fs.statSync(path.join(dir, name));
+            const st = await fs.promises.stat(path.join(dir, name));
             if (st.isFile()) entries.push({ p: path.join(dir, name), mtime: st.mtimeMs, size: st.size });
           } catch { /* ignore */ }
         }
@@ -734,7 +812,7 @@ function registerIpcHandlers(): void {
         entries.sort((a, b) => a.mtime - b.mtime);
         for (const e of entries) {
           if (total <= PCM_CACHE_DIR_MAX_BYTES) break;
-          try { fs.unlinkSync(e.p); total -= e.size; } catch { /* ignore */ }
+          try { await fs.promises.unlink(e.p); total -= e.size; } catch { /* ignore */ }
         }
       } catch { /* eviction best effort */ }
       return true;
@@ -747,7 +825,8 @@ function registerIpcHandlers(): void {
   // Metadata-only read: SAME gates as fs:read-file (ext allowlist via
   // isReadPathAllowed + validatePath + realpath + isFile). statSync only,
   // no content crosses IPC.
-  ipcMain.handle('fs:stat-file', async (_event, pathStr: unknown) => {
+  ipcMain.handle('fs:stat-file', async (event, pathStr: unknown) => {
+    if (!isTrustedIpcSender(event)) return null;
     if (rateLimited('fs:stat-file', 50)) return null;
     if (typeof pathStr !== 'string') {
       logToDisk('ERROR', 'Security: Blocked illegal stat attempt');
@@ -792,7 +871,8 @@ function registerIpcHandlers(): void {
     }
   });
 
-  ipcMain.handle('fs:show-item-in-folder', async (_event, pathStr: string) => {
+  ipcMain.handle('fs:show-item-in-folder', async (event, pathStr: string) => {
+    if (!isTrustedIpcSender(event)) return false;
     if (rateLimited('fs:show-item-in-folder', 500)) return false;
     const validated = validatePath(pathStr);
     if (!validated) {
@@ -837,7 +917,8 @@ function registerIpcHandlers(): void {
   });
 
   // Persistent Logging Handlers
-  ipcMain.handle('fs:append-log', async (_event, level: string, message: string) => {
+  ipcMain.handle('fs:append-log', async (event, level: string, message: string) => {
+    if (!isTrustedIpcSender(event)) return false;
     const allowed: ReadonlySet<string> = new Set(['INFO', 'WARN', 'ERROR', 'DEBUG']);
     const lvl = allowed.has(String(level)) ? (level as LogLevel) : 'INFO';
     // ERROR/WARN bypass the IPC-flood gate: disk must hold high-severity
@@ -856,11 +937,13 @@ function registerIpcHandlers(): void {
     return true;
   });
 
-  ipcMain.handle('fs:get-log-path', async () => {
+  ipcMain.handle('fs:get-log-path', async (event) => {
+    if (!isTrustedIpcSender(event)) return '';
     return logManager.getLogPath();
   });
 
-  ipcMain.handle('app:generate-crash-report', async (_event, stateSnapshot) => {
+  ipcMain.handle('app:generate-crash-report', async (event, stateSnapshot) => {
+    if (!isTrustedIpcSender(event)) return null;
     if (rateLimited('app:generate-crash-report', 5000)) return null;
     // Bound snapshot size — unbounded renderer payloads previously OOMed/blocked main.
     try {
@@ -876,7 +959,8 @@ function registerIpcHandlers(): void {
   });
 
   // Throttle sentinel '__THROTTLED__' (see dialog:save-kit) — real cancel stays null.
-  ipcMain.handle('dialog:open-sample', async () => {
+  ipcMain.handle('dialog:open-sample', async (event) => {
+    if (!isTrustedIpcSender(event)) return null;
     if (rateLimited('dialog:open-sample', 500)) return '__THROTTLED__';
     const win = getMainWindow();
     if (!win) return null;
@@ -894,7 +978,8 @@ function registerIpcHandlers(): void {
 
   // ==================== DATABASE HANDLERS ====================
 
-  ipcMain.handle('db:upsert-track', async (_event, track) => {
+  ipcMain.handle('db:upsert-track', async (event, track) => {
+    if (!isTrustedIpcSender(event)) return null;
     if (rateLimited('db:upsert-track', 50)) return null;
     try {
       if (!track || typeof track !== 'object') return null;
@@ -926,7 +1011,8 @@ function registerIpcHandlers(): void {
     }
   });
 
-  ipcMain.handle('db:get-track', async (_event, trackPath) => {
+  ipcMain.handle('db:get-track', async (event, trackPath) => {
+    if (!isTrustedIpcSender(event)) return null;
     if (rateLimited('db:get-track', 50)) return null;
     try {
       if (typeof trackPath !== 'string' || !trackPath || trackPath.length > 32760) return null;
@@ -953,7 +1039,8 @@ function registerIpcHandlers(): void {
     }
   });
 
-  ipcMain.handle('db:search-tracks', async (_event, query) => {
+  ipcMain.handle('db:search-tracks', async (event, query) => {
+    if (!isTrustedIpcSender(event)) return [];
     if (rateLimited('db:search-tracks', 100)) return [];
     try {
       const q = String(query ?? '').slice(0, 256);
@@ -969,7 +1056,8 @@ function registerIpcHandlers(): void {
     }
   });
 
-  ipcMain.handle('db:get-all-tracks', async (_event) => {
+  ipcMain.handle('db:get-all-tracks', async (event) => {
+    if (!isTrustedIpcSender(event)) return [];
     if (rateLimited('db:get-all-tracks', 1000)) return [];
     try {
       const db = getDbManager();
@@ -1001,26 +1089,41 @@ function createWindow() {
     show: false,
   });
 
-  win.loadFile(path.join(__dirname, 'index.html'));
-
-  // Navigation lockdown: preload bridges persist across navigations, so any
-  // navigation away from the bundled index.html would hand IPC to an evil
-  // origin. Deny navigations, new windows, and drag-drop navigation.
   try {
-    win.webContents.on('will-navigate', (e, url) => {
-      const allowed = ['about:blank'];
-      try {
-        const u = new URL(url);
-        if (u.protocol === 'file:' || allowed.includes(url)) return;
-      } catch { /* fall through to prevent */ }
-      e.preventDefault();
-      logToDisk('ERROR', `Security: Blocked will-navigate to ${url}`);
+    const blockNavigation = (event: Electron.Event, url: string, source: string): void => {
+      if (isTrustedDocumentUrl(url)) return;
+      event.preventDefault();
+      logToDisk('ERROR', `Security: Blocked ${source} navigation`);
+    };
+    win.webContents.on('will-frame-navigate', (details) => {
+      if (details.isMainFrame) blockNavigation(details, details.url, 'frame');
+      else details.preventDefault();
     });
-    win.webContents.setWindowOpenHandler(({ url }) => {
-      try { logToDisk('ERROR', `Security: Blocked window.open to ${url}`); } catch { /* ignore */ }
+    win.webContents.on('will-navigate', (details) => {
+      blockNavigation(details, details.url, 'page');
+    });
+    win.webContents.on('will-redirect', (details) => {
+      blockNavigation(details, details.url, 'redirect');
+    });
+    win.webContents.setWindowOpenHandler(() => {
+      try { logToDisk('ERROR', 'Security: Blocked window.open'); } catch { /* ignore */ }
       return { action: 'deny' };
     });
-  } catch { /* ignore */ }
+    const rendererSession = win.webContents.session;
+    rendererSession.setPermissionRequestHandler((contents, permission, callback, details) => {
+      const mediaType = 'mediaTypes' in details && details.mediaTypes?.includes('video')
+        ? 'video'
+        : 'mediaTypes' in details && details.mediaTypes?.includes('audio') ? 'audio' : undefined;
+      callback(permissionAllowed(contents, permission, mediaType));
+    });
+    rendererSession.setPermissionCheckHandler((contents, permission, _requestingOrigin, details) => {
+      return permissionAllowed(contents, permission, details.mediaType);
+    });
+  } catch (e) {
+    try { logToDisk('ERROR', `Security: renderer lockdown setup failed: ${e}`); } catch { /* ignore */ }
+  }
+
+  win.loadFile(TRUSTED_INDEX_PATH);
 
   // Fallback: if the renderer crashes before app:ready-to-show, the window
   // would stay hidden forever. Force-show after 8s.
@@ -1066,6 +1169,11 @@ app.whenReady().then(() => {
   registerIpcHandlers();
   try { initDbManager(); } catch (e) {
     try { logToDisk('ERROR', `Eager DB init failed: ${e}`); } catch { /* ignore */ }
+  }
+  try {
+    loadAllowedAudioFiles();
+  } catch (e) {
+    try { logToDisk('WARN', `Audio consent restore failed: ${e}`); } catch { /* ignore */ }
   }
   createWindow();
 });

@@ -170,6 +170,20 @@ describe('P3-H archive cap + expiry', () => {
         expect(store.has(oldKey)).toBe(false);
     });
 
+    test('newer staging snapshot wins over older live slot', () => {
+        const base = {
+            version: 1,
+            playlist: [],
+            currentTrackIndex: -1,
+            masterBPM: 0,
+            pads: {},
+            ui: { masterVolume: 1, tempoValue: 1, loopMode: 'off', playbackMode: 'continuous', isAutoMixEnabled: false, isPlaying: false },
+        };
+        store.set(STORAGE_KEY, JSON.stringify({ ...base, timestamp: Date.now() - 1000, reason: 'live' }));
+        store.set(`${STORAGE_KEY}_staging`, JSON.stringify({ ...base, timestamp: Date.now(), reason: 'staging' }));
+        expect(getLatestSnapshot()?.reason).toBe('staging');
+    });
+
     test('expired live snapshot returns null', () => {
         const snap = {
             version: 1,

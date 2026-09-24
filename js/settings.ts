@@ -45,13 +45,15 @@ const _settings: Settings = {
 /** Settings accessor — read-only reference. Use updateSettings() to make changes. */
 export const settings: Readonly<Settings> = _settings;
 
+type SettingsPatch = Omit<Partial<Settings>, 'autoMix'> & { autoMix?: Partial<AutoMixSettings> };
+
 /**
  * Update settings with partial patch and auto-save to localStorage.
  * This is the ONLY way to mutate settings that guarantees persistence.
  * Fullscreen actuation happens only when the patch explicitly contains
  * fullScreen (user toggle gesture) — slider-drag saves never actuate.
  */
-export function updateSettings(patch: Partial<Settings>): void {
+export function updateSettings(patch: SettingsPatch): void {
     const hadFullscreen = patch && Object.prototype.hasOwnProperty.call(patch, 'fullScreen');
     if (patch.autoMix && typeof patch.autoMix === 'object') {
         const { autoMix, ...rest } = patch;
@@ -143,6 +145,7 @@ export function loadSettings(): void {
         // output/MIDI never synced. Defaults are safe (fullscreen off,
         // default devices), so always apply.
         try { applySettingsToUI(); } catch { /* ignore */ }
+        try { setAutoMixEnabledFn?.(settings.autoMix.enableAI); } catch { /* player not ready */ }
         // Apply Full Screen + persisted output route on load (output was
         // previously reflected in the <select> but never actuated).
         if (bridge && bridge.setFullScreen) bridge.setFullScreen(settings.fullScreen);
@@ -266,6 +269,12 @@ export function isAiEnabled(): boolean {
     return _settings.autoMix.enableAI;
 }
 
+export function setAutoMixPreference(enabled: boolean): void {
+    if (typeof enabled !== 'boolean') return;
+    _settings.autoMix.enableAI = enabled;
+    saveSettings();
+}
+
 function updateSliderUI(sliderId: string, labelId: string, val: number): void {
     const slider = document.getElementById(sliderId) as HTMLInputElement;
     const label = document.getElementById(labelId);
@@ -359,8 +368,10 @@ export function setupSettingsHandlers(): void {
                     btnDuration: DEFAULT_BTN_DURATION_S,
                     enableAI: false
                 };
-                saveSettings();
                 applySettingsToUI();
+                saveSettings();
+                try { setAutoMixEnabledFn?.(false); } catch { /* player not ready */ }
+
                 // M19: defaults must reach the UI selects + actuation, not
                 // just _settings — stale selects/output-route/fullscreen
                 // otherwise survive the "reset".

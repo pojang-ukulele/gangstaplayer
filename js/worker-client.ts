@@ -61,6 +61,7 @@ function spawnWorker(): Worker {
     }
 
     w!.onmessage = (e: MessageEvent) => {
+        if (worker !== w) return;
         // A healthy response: no per-worker crash counter needed — next
         // request will spawn a fresh worker if this one is dead.
         const { type, bpm, confidence, blob, altBpm, id } = e.data || {};
@@ -83,22 +84,15 @@ function spawnWorker(): Worker {
     };
 
     w!.onerror = (err) => {
+        if (worker !== w) return;
         console.error('[WorkerClient] Audio worker error:', err.message, err.filename, err.lineno);
-        failAllPending(new Error(`Audio worker crashed: ${err.message || 'unknown error'}`));
-        // Worker died — ensure next spawn creates a fresh one.
-        worker = null;
+        discardWorker(`Audio worker crashed: ${err.message || 'unknown error'}`);
     };
 
     w!.onmessageerror = (err) => {
+        if (worker !== w) return;
         console.error('[WorkerClient] Audio worker message error:', err);
-        // Structured-clone failure (e.g. neutered buffer) is known instantly —
-        // fail all pending instead of letting them hang until timeout.
-        failAllPending(new Error('Audio worker message error: response could not be deserialized'));
-        // Worker died — ensure next spawn creates a fresh one.
-        if (worker === w) {
-            try { w!.terminate(); } catch { /* ignore */ }
-            worker = null;
-        }
+        discardWorker('Audio worker message error: response could not be deserialized');
     };
 
     return w!;
@@ -111,6 +105,15 @@ function failAllPending(err: Error): void {
             request.reject(err);
         } catch { /* listener error */ }
     }
+}
+
+function discardWorker(reason: string): void {
+    const current = worker;
+    worker = null;
+    if (current) {
+        try { current.terminate(); } catch { /* ignore */ }
+    }
+    failAllPending(new Error(reason));
 }
 
 /**
@@ -138,6 +141,7 @@ function post(kind: RequestKind, buildMessage: (id: number) => { type: string; p
         const timer = setTimeout(() => {
             if (pendingRequests.has(id)) {
                 pendingRequests.delete(id);
+                discardWorker(`Audio worker timed out (${kind}); worker recycled`);
                 reject(new Error(`Audio worker timed out (${kind})`));
             }
         }, timeoutMs);
@@ -150,6 +154,7 @@ function post(kind: RequestKind, buildMessage: (id: number) => { type: string; p
         } catch (e: any) {
             clearTimeout(timer);
             pendingRequests.delete(id);
+            discardWorker(`Failed to post to audio worker: ${e?.message || e}`);
             reject(new Error(`Failed to post to audio worker: ${e?.message || e}`));
         }
     });
