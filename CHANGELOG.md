@@ -21,6 +21,11 @@
 - Moved app-region styles into the CSP-safe stylesheet, synchronized AutoMix settings/state, made MIDI initialization idempotent, removed Ctrl+A/pad-recording collision, and redacted paths anywhere in log messages.
 - Added regression coverage for consent persistence, checksum canonicalization, worker recycling, decoded-cache limits, log redaction, and IPC/navigation boundaries.
 
+### Cleanup
+
+- Removed unused `form-data` runtime dependency and its staged/packaged transitive tree (zero code imports; `better-sqlite3` remains the only staged external).
+- Removed dead `resetAudioFailure()` (`js/audio.ts`, zero callers) and legacy `detectBPMWorker()` wrapper (`js/worker-client.ts`, zero src callers; `detectBPMWithConfidence`/`detectBPMResilient` cover all call sites).
+
 ### Verification
 
 - `npm run typecheck` passed.

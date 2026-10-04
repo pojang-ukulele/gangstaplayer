@@ -249,15 +249,6 @@ export function detectBPMResilient(audioBuffer: AudioBuffer, options?: { thresho
         });
     });
 }
-/**
- * Legacy BPM entry (kept for existing deck/playlist callers): resolves a
- * number, 0 when analysis needs review. New code should prefer
- * detectBPMWithConfidence() and skip caching needs-review results.
- */
-export function detectBPMWorker(audioBuffer: AudioBuffer, options?: { threshold?: number; minStepSeconds?: number }): Promise<number> {
-    return detectBPMWithConfidence(audioBuffer, options).then((r) => (r.needsReview || r.bpm === null ? 0 : r.bpm));
-}
-
 export interface BpmPersistDecision {
     /** BPM to store: the fresh value when usable, otherwise the prior value. */
     bpm: number | undefined;

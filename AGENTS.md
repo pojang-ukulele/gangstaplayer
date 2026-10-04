@@ -193,7 +193,7 @@ Four context bridges exposed via `contextBridge.exposeInMainWorld`:
 
 **Track model:** `{ id, name, path, duration, bpm }`
 
-**BPM analysis:** Background worker per track — check DB cache first, then decode via Web Audio, run `detectBPMWorker`, persist to DB.
+**BPM analysis:** Background worker per track — check DB cache first, then decode via Web Audio, run `detectBPMResilient` (+ `resolveBpmPersist` skip-persist policy), persist to DB.
 
 **Selection:** Multi-select via SHIFT (range) + CTRL (toggle), anchor/pivot pattern.
 
@@ -337,7 +337,8 @@ Single `audio-worker.js` instance with request/response pattern.
 
 | Function | Purpose |
 |----------|---------|
-| `detectBPMWorker(audioBuffer)` | Send channel 0 data to worker, get BPM. Transfers ArrayBuffer for zero-copy |
+| `detectBPMWithConfidence(audioBuffer)` | Send channel 0 data to worker, get BPM + confidence. Transfers ArrayBuffer for zero-copy |
+| `detectBPMResilient(audioBuffer)` | One confident attempt + one relaxed-threshold retry; callers gate persistence via `resolveBpmPersist` |
 | `bufferToWaveWorker(audioBuffer, len)` | Send multi-channel data to worker, get WAV Blob. Transfers all channel buffers |
 
 ## Utilities (`js/utils.ts`)

@@ -38,7 +38,7 @@ async function build() {
         outfile: path.join(BUILD_DIR, 'main.js'),
         minify: MINIFY,
         sourcemap: SOURCEMAP,
-        external: ['electron', 'fsevents', 'better-sqlite3', 'form-data']
+        external: ['electron', 'fsevents', 'better-sqlite3']
     });
 
     console.log('Building Preload...');
@@ -229,9 +229,9 @@ async function build() {
     }
 
     // 8. Stage external native/runtime deps into the bundle.
-    // Main keeps better-sqlite3 + form-data external (native binding
+    // Main keeps better-sqlite3 external (native binding
     // can't be bundled), and electron-builder only packs what's inside
-    // app-build — so copy them here or getDbManager() dies packaged.
+    // app-build — so copy it here or getDbManager() dies packaged.
     stageExternalDeps();
 
     console.log('--- BUILD COMPLETE ---');
@@ -239,8 +239,8 @@ async function build() {
 }
 
 /**
- * Copies external runtime deps (native binding + pure-JS form-data tree)
- * into app-build/node_modules so the packaged app can require() them.
+ * Copies external runtime deps (native binding) into app-build/node_modules
+ * so the packaged app can require() them.
  */
 function stageExternalDeps() {
     const deps = [
@@ -249,31 +249,6 @@ function stageExternalDeps() {
         // kills getDbManager() (require('bindings') throws in main).
         'bindings',
         'file-uri-to-path',
-        'form-data',
-        // form-data transitive tree (bundled copies stay consistent).
-        // form-data v4 requires es-set-tostringtag + hasown at top level,
-        // which pull a deeper es-shims closure — every entry must be
-        // staged or require(form-data) throws packaged-only before
-        // createWindow (7 dirs is NOT enough).
-        'asynckit',
-        'combined-stream',
-        'delayed-stream',
-        'mime-types',
-        'mime-db',
-        'es-set-tostringtag',
-        'hasown',
-        'get-intrinsic',
-        'es-errors',
-        'es-object-atoms',
-        'es-define-property',
-        'gopd',
-        'dunder-proto',
-        'get-proto',
-        'has-symbols',
-        'has-tostringtag',
-        'function-bind',
-        'call-bind-apply-helpers',
-        'math-intrinsics',
     ];
     const destRoot = path.join(BUILD_DIR, 'node_modules');
     let staged = 0;
@@ -379,7 +354,7 @@ function verifyStagedClosure(staged, destRoot) {
             }
         }
     };
-    for (const root of ['better-sqlite3', 'bindings', 'file-uri-to-path', 'form-data']) {
+    for (const root of ['better-sqlite3', 'bindings', 'file-uri-to-path']) {
         const entry = entryOf(root);
         if (entry) walkFile(entry, 0);
     }

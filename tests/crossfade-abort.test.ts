@@ -120,7 +120,6 @@ jest.mock('../js/worker-client', () => {
     const actual = jest.requireActual('../js/worker-client');
     return {
         ...actual,
-        detectBPMWorker: jest.fn().mockResolvedValue(120),
         detectBPMWithConfidence: jest.fn().mockResolvedValue({ bpm: 120, confidence: 'high', needsReview: false }),
         resolveBpmPersist: actual.resolveBpmPersist,
         bufferToWaveWorker: jest.fn(),

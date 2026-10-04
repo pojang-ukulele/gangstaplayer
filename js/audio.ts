@@ -38,11 +38,6 @@ function _fireRebuilt(): void {
     }
 }
 
-/** Reset the failed flag — call when device state changes or user gestures again. */
-export function resetAudioFailure(): void {
-    _failed = false;
-}
-
 /** Create (or recreate) context + master chain. Returns true when usable. */
 export function ensureAudio(): boolean {
     try {
