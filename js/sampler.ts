@@ -1652,7 +1652,7 @@ export function startPad(index: number, opts?: { loop?: boolean }): void {
         if (padSyncState[index] && masterBPMRef.value > 0 && padBPMs[index] > 0) {
             // Adjust playback rate to match master BPM (clamped like the deck).
             rate = (masterBPMRef.value / padBPMs[index]) * rate;
-            rate = Math.min(1.5, Math.max(0.5, rate));
+            rate = Math.min(4, Math.max(0.25, rate));
 
             // Beat-quantized start: snap to nearest beat in the master timeline
             const masterBPS = masterBPMRef.value / 60; // beats per second

@@ -370,6 +370,39 @@ export function getMasterBPMRef(): { value: number } {
 export function getTempoSlider(): HTMLInputElement | null { return tempoSlider; }
 export function getPlayerAudio(): HTMLAudioElement { return engine.main.audio; }
 
+/** Current chopper/screwer rate from the slider (0.5–1.5, snap already applied). */
+function currentTempoVal(): number {
+    try {
+        const v = tempoSlider ? parseFloat(tempoSlider.value) : 1;
+        return Number.isFinite(v) ? Math.min(1.5, Math.max(0.5, v)) : 1;
+    } catch { return 1; }
+}
+
+/**
+ * Main screen title with live tempo: base track name + effective BPM/speed.
+ * Reads base name from the playlist (never parses innerText) so repeated
+ * drags don't stack suffixes. No-op with no track loaded (keeps INSERT TAPE...).
+ */
+function refreshTrackTitle(): void {
+    if (!trackTitle) return;
+    try {
+        const idx = state.currentTrackIndex;
+        const list = state.playlist;
+        if (idx < 0 || idx >= list.length) return;
+        const t = list[idx];
+        const val = currentTempoVal();
+        const pct = Math.round(val * 100);
+        const bpm = state.masterBPM > 0 ? state.masterBPM
+            : (t.bpm && t.bpm > 0 ? t.bpm : 0);
+        if (bpm > 0) {
+            const eff = Math.round(bpm * val);
+            trackTitle.innerText = val === 1 ? `${t.name} [${bpm}bpm]` : `${t.name} [${eff}bpm ${pct}%]`;
+        } else {
+            trackTitle.innerText = val === 1 ? t.name : `${t.name} [${pct}%]`;
+        }
+    } catch { /* title is best-effort */ }
+}
+
 /** Immediately revoke tracked blob URLs (called on app teardown). */
 export function disposePlayerUrls(): void {
     // Detach first: revoking a URL still assigned to a live <audio> src
@@ -568,9 +601,7 @@ export async function loadTrack(index: number): Promise<void> {
     const hasBpm = track.bpm !== null && track.bpm !== undefined && track.bpm > 0;
     state.update({ masterBPM: hasBpm ? (track.bpm as number) : 0 });
 
-    if (trackTitle) {
-        trackTitle.innerText = hasBpm ? `${track.name} [${track.bpm}bpm]` : track.name;
-    }
+    refreshTrackTitle();
 
     // Reuse the verified decode for BPM (no second decode pass)
     const preDecoded: AudioBuffer | null = verifiedBuffer;
@@ -614,17 +645,16 @@ export async function loadTrack(index: number): Promise<void> {
             // Hide spinner now that analysis is done
             hideSpinnerIfCurrent(loadId);
 
-            // 2. Final display update
-            if (trackTitle && state.currentTrackIndex === index) {
-                const bpmTxt = state.masterBPM > 0 ? ` [${state.masterBPM}bpm]` : "";
-                trackTitle.innerText = `${track.name}${bpmTxt}`;
+            // 2. Final display update (tempo-aware so a screwed slider survives analysis)
+            if (state.currentTrackIndex === index) {
+                refreshTrackTitle();
             }
         } catch (e) {
             logger.warn("[Player] Load/Analysis pipeline issue", e);
             hideSpinnerIfCurrent(loadId);
-            // Don't show error to user — just show the track name
-            if (trackTitle && state.currentTrackIndex === index) {
-                trackTitle.innerText = track.name;
+            // Don't show error to user — just show the track name + current speed
+            if (state.currentTrackIndex === index) {
+                refreshTrackTitle();
             }
         }
     })();
@@ -1016,11 +1046,7 @@ function finishCrossfade(nextIndex: number, expectedId?: string): void {
 
 
     if (renderPlaylistFn) renderPlaylistFn();
-    if (trackTitle && state.playlist.length > nextIndex) {
-         const t = state.playlist[nextIndex];
-         const txt = (t.bpm && t.bpm > 0) ? `[${t.bpm} BPM]` : "[BPM: --]";
-         trackTitle.innerText = `${t.name} ${txt}`;
-     }
+    refreshTrackTitle();
     // Incoming channel's loadedmetadata was ignored mid-blend (not main yet) —
     // refresh total time from the promoted element.
     try {
@@ -1303,6 +1329,7 @@ function setupTransportHandlers(): void {
                 const displayBpm = state.masterBPM > 0 ? Math.round(state.masterBPM * val) : "---";
                 tempoVal.innerText = `SPEED: ${Math.round(val * 100)}% (BPM: ${displayBpm})`;
             }
+            refreshTrackTitle();
         };
     }
 

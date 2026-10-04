@@ -41,6 +41,68 @@ function hasDialogPath(p: string): boolean {
 }
 
 /**
+ * Last-used directories for native dialogs (pads + playlist audio picks).
+ * Persisted to userData/last-dirs.json so every audio open starts where the
+ * user last picked — dialog picks, <input type=file> picks and DnD drops all
+ * funnel through here (see fs:consent-file + dialog:open-sample).
+ */
+type LastDirKind = 'audio' | 'kit' | 'session' | 'recording';
+const lastDirs: Record<LastDirKind, string> = { audio: '', kit: '', session: '', recording: '' };
+function getLastDirsPath(): string {
+  try { return path.join(app.getPath('userData'), 'last-dirs.json'); } catch { return ''; }
+}
+function isExistingDir(p: string): boolean {
+  try {
+    const v = validatePath(p);
+    if (!v || isAdsOrUncPath(v)) return false;
+    return fs.statSync(v).isDirectory();
+  } catch { return false; }
+}
+function loadLastDirs(): void {
+  try {
+    const fp = getLastDirsPath();
+    if (!fp || !fs.existsSync(fp)) return;
+    const raw = JSON.parse(fs.readFileSync(fp, 'utf8')) as Partial<Record<LastDirKind, unknown>>;
+    (['audio', 'kit', 'session', 'recording'] as LastDirKind[]).forEach((k) => {
+      const v = raw?.[k];
+      if (typeof v === 'string' && v && v.length < 32760 && isExistingDir(v)) {
+        lastDirs[k] = path.resolve(path.normalize(v));
+      }
+    });
+  } catch { /* corrupt file — start fresh */ }
+}
+function saveLastDirs(): void {
+  try {
+    const fp = getLastDirsPath();
+    if (!fp) return;
+    fs.mkdirSync(path.dirname(fp), { recursive: true });
+    fs.writeFileSync(fp, JSON.stringify(lastDirs), 'utf8');
+  } catch { /* persistence is best-effort */ }
+}
+/** Valid remembered dir for a kind, or undefined (dialog falls back to OS default). */
+function lastDirFor(kind: LastDirKind): string | undefined {
+  const d = lastDirs[kind];
+  return d && isExistingDir(d) ? d : undefined;
+}
+/** Save-dialog default: remembered dir + filename, or bare filename. */
+function defaultSavePath(kind: LastDirKind, fileName: string): string {
+  const d = lastDirFor(kind);
+  return d ? path.join(d, fileName) : fileName;
+}
+function rememberDirForFile(kind: LastDirKind, filePath: string): void {
+  try {
+    const v = validatePath(filePath);
+    if (!v || isAdsOrUncPath(v)) return;
+    const dir = path.dirname(v);
+    if (!isExistingDir(dir)) return;
+    if (lastDirs[kind] !== dir) {
+      lastDirs[kind] = dir;
+      saveLastDirs();
+    }
+  } catch { /* ignore */ }
+}
+
+/**
  * Validates that a path is safe to read/write.
  * - Must be a non-empty string
  * - Must not contain null bytes
@@ -421,10 +483,11 @@ function registerIpcHandlers(): void {
     if (!win) return null;
     const { canceled, filePath } = await dialog.showSaveDialog(win, {
       title: 'Save MPC Kit',
-      defaultPath: 'MyBeatKit.json',
+      defaultPath: defaultSavePath('kit', 'MyBeatKit.json'),
       filters: [{ name: 'JSON Kit File', extensions: ['json'] }]
     });
     if (canceled || !filePath) return null;
+    rememberDirForFile('kit', filePath);
     const v = validatePath(filePath);
     if (v) {
       // Gate allowlist ingress: filters are advisory, the user can type any
@@ -449,10 +512,11 @@ function registerIpcHandlers(): void {
     if (!win) return null;
     const { canceled, filePath } = await dialog.showSaveDialog(win, {
       title: 'Save Session',
-      defaultPath: `GangstaSession_${Date.now()}.session.json`,
+      defaultPath: defaultSavePath('session', `GangstaSession_${Date.now()}.session.json`),
       filters: [{ name: 'Session File', extensions: ['json'] }]
     });
     if (canceled || !filePath) return null;
+    rememberDirForFile('session', filePath);
     const v = validatePath(filePath);
     if (v) {
       const ext = path.extname(v).replace('.', '').toLowerCase();
@@ -471,10 +535,12 @@ function registerIpcHandlers(): void {
     if (!win) return null;
     const { canceled, filePaths } = await dialog.showOpenDialog(win, {
       title: 'Load MPC Kit',
+      defaultPath: lastDirFor('kit'),
       properties: ['openFile'],
       filters: [{ name: 'JSON Kit File', extensions: ['json'] }]
     });
     if (canceled || !filePaths || !filePaths.length) return null;
+    rememberDirForFile('kit', filePaths[0]);
     // Per-file consent only — never whitelist the whole directory (H3: one
     // kit pick must not expose every file in the folder to later reads).
     try { addConsentedReadFile(filePaths[0]); } catch { /* ignore */ }
@@ -489,10 +555,11 @@ function registerIpcHandlers(): void {
     if (!win) return null;
     const { canceled, filePath } = await dialog.showSaveDialog(win, {
       title: 'Save Master Recording',
-      defaultPath: `Master_Rec_${Date.now()}.wav`,
+      defaultPath: defaultSavePath('recording', `Master_Rec_${Date.now()}.wav`),
       filters: [{ name: 'WAV Audio', extensions: ['wav'] }]
     });
     if (canceled || !filePath) return null;
+    rememberDirForFile('recording', filePath);
     const v = validatePath(filePath);
     if (v) {
       const ext = path.extname(v).replace('.', '').toLowerCase();
@@ -665,6 +732,13 @@ function registerIpcHandlers(): void {
     // disk right now, look like media/kit, and fit the size bound.
     const ok = addConsentedReadFile(validated);
     if (!ok) return false;
+    // Remember the pick's folder so the next audio/kit dialog opens here.
+    // Covers playlist <input type=file> picks, pad DnD and playlist DnD —
+    // all of which flow through this channel via consentFile().
+    try {
+      const ext = path.extname(validated).replace('.', '').toLowerCase();
+      rememberDirForFile(ext === 'json' ? 'kit' : 'audio', validated);
+    } catch { /* ignore */ }
     // Forward audio picks to the consent store so later disk reads
     // (playback, analysis) can read the same consented file from disk.
     try {
@@ -966,10 +1040,12 @@ function registerIpcHandlers(): void {
     if (!win) return null;
     const { canceled, filePaths } = await dialog.showOpenDialog(win, {
       title: 'Load Audio Sample',
+      defaultPath: lastDirFor('audio'),
       properties: ['openFile'],
       filters: [{ name: 'Audio Files', extensions: [...VALID_AUDIO_EXTENSIONS] }]
     });
     if (canceled || !filePaths || !filePaths.length) return null;
+    rememberDirForFile('audio', filePaths[0]);
     // Per-file consent only — never whitelist the whole directory (H3).
     try { addConsentedReadFile(filePaths[0]); } catch { /* ignore */ }
     try { addAllowedAudioFile(filePaths[0]); } catch { /* ignore */ }
@@ -1166,6 +1242,7 @@ function shutdownMain(reason: string): Promise<void> {
 app.whenReady().then(() => {
   if (!gotLock) return;
   try { logManager.relocateToUserData(); } catch { /* keep pre-ready path */ }
+  try { loadLastDirs(); } catch { /* dialogs fall back to OS defaults */ }
   registerIpcHandlers();
   try { initDbManager(); } catch (e) {
     try { logToDisk('ERROR', `Eager DB init failed: ${e}`); } catch { /* ignore */ }

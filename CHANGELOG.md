@@ -26,6 +26,12 @@
 - Removed unused `form-data` runtime dependency and its staged/packaged transitive tree (zero code imports; `better-sqlite3` remains the only staged external).
 - Removed dead `resetAudioFailure()` (`js/audio.ts`, zero callers) and legacy `detectBPMWorker()` wrapper (`js/worker-client.ts`, zero src callers; `detectBPMWithConfidence`/`detectBPMResilient` cover all call sites).
 
+### Features
+
+- Native dialogs now remember last-used folders per kind (audio/kit/session/recording, persisted to `userData/last-dirs.json`); dialog, file-input, and DnD picks all funnel through it.
+- Deck title is tempo-aware (effective BPM + speed %) and survives re-analysis without stacking suffixes.
+- Sampler SYNC rate clamp widened to 0.25–4x (was 0.5–1.5x).
+
 ### Verification
 
 - `npm run typecheck` passed.
